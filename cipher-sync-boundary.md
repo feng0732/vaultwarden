@@ -188,6 +188,54 @@ WHERE users_organizations.org_uuid = ?
 | 组织条目改动，用户 W 是组织成员但未确认（status ≠ Confirmed） | ❌ 不刷新 | SQL 过滤了 `status = Confirmed` |
 | 个人条目改动，其他用户通过组织有间接访问 | ❌ 不刷新 | 个人条目只刷新拥有者 |
 
+#### ⚠️ 存在的问题：重复刷新风险
+
+**问题代码位置**：[src/db/models/cipher.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/cipher.rs#L424-L435)
+
+```rust
+let mut collection_users = Membership::find_by_cipher_and_org(&self.uuid, org_uuid, conn).await;
+if CONFIG.org_groups_enabled() {
+    let group_users =
+        Membership::find_by_cipher_and_org_with_group(&self.uuid, org_uuid, conn).await;
+    collection_users.extend(group_users);  // ⚠️ 直接 extend，没有去重！
+}
+for member in collection_users {
+    User::update_uuid_revision(&member.user_uuid, conn).await;  // 同一个用户可能被多次调用
+    user_uuids.push(member.user_uuid.clone());  // 返回列表也可能有重复
+}
+```
+
+**问题场景**：当用户同时通过**两种渠道**获得条目的访问权时，会被重复刷新：
+
+1. **渠道一**：用户被直接分配到条目所在的集合（`find_by_cipher_and_org` 查到）
+2. **渠道二**：用户所在的组被分配到条目所在的集合（`find_by_cipher_and_org_with_group` 查到）
+
+**影响**：
+- 同一个用户的 `User::update_uuid_revision()` 可能被多次调用
+- 数据库执行多次 `UPDATE users SET updated_at = NOW() WHERE uuid = ?`
+- 返回的 `user_uuids` 列表可能包含重复的用户 ID
+- 推送通知系统可能发送重复通知
+
+**但实际上的影响有限**：
+- 数据库更新是幂等的（都是设为当前时间，最终结果一致）
+- 多次更新在同一毫秒内完成，`user.updated_at` 最终值相同
+- 客户端同步只看时间戳是否变化，重复更新不会导致多余的同步
+
+**建议优化**（代码中未实现）：
+```rust
+// 在 extend 后去重
+use std::collections::HashSet;
+let unique_users: HashSet<_> = collection_users.into_iter().collect();
+```
+
+#### 📊 影响成员范围总结
+
+| 条目类型 | 刷新的用户范围 | 可能重复刷新？ |
+|---------|--------------|--------------|
+| 个人条目 | 仅条目拥有者（1 人） | ❌ 不可能 |
+| 组织条目（组功能禁用） | 直接访问集合的用户 + access_all 成员 | ❌ 不可能 |
+| 组织条目（组功能启用） | 直接访问的用户 + 组间接访问的用户 | ✅ 可能（双渠道用户） |
+
 #### ⚠️ 特别注意：用户侧操作（收藏/归档/移文件夹）的修订刷新范围
 
 与组织条目改动的"扩散刷新"不同，用户侧操作只刷新**操作者本人**：
@@ -459,13 +507,34 @@ if sync_type == CipherSyncType::User {
 // Organization 同步时，这些字段根本不出现在 JSON 中
 ```
 
-**完整结果**：组织同步返回的每个 cipher JSON 中：
-- `folderId` — **字段不存在**（不是 null，是字段缺失）
-- `favorite` — **字段不存在**
-- `archivedDate` — **字段不存在**
-- `edit` — **字段不存在**
-- `viewPassword` — **字段不存在**
-- `permissions` — **字段不存在**
+#### 📋 最终结论：用户侧状态是字段缺失，不是默认值
+
+组织同步返回的每个 cipher JSON 中，以下 **6 个字段完全不存在**（不是 null，是字段缺失）：
+- `folderId` — **字段缺失**
+- `favorite` — **字段缺失**
+- `archivedDate` — **字段缺失**
+- `edit` — **字段缺失**
+- `viewPassword` — **字段缺失**
+- `permissions` — **字段缺失**
+
+**重要澄清**：虽然代码第 187 行 `(false, false, false)` 看起来像是默认值：
+```rust
+} else {
+    (false, false, false)  // 组织同步时的默认值
+};
+```
+但这三个变量（`read_only`, `hide_passwords`, `_`）**只在第 392-398 行的 User 同步条件块内使用**：
+```rust
+if sync_type == CipherSyncType::User {
+    json_object["edit"] = json!(!read_only);
+    json_object["viewPassword"] = json!(!hide_passwords);
+    json_object["permissions"] = json!({
+        "delete": !read_only,
+        "restore": !read_only,
+    });
+}
+```
+组织同步时这个 `if` 条件不满足，所以这三个默认值**永远不会被写入 JSON**。这是代码中的"防御性赋值"，不是真正的输出逻辑。
 
 **为什么必须这样做？** 因为组织同步的调用方是 [get_org_details](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/api/core/organizations.rs#L880-L910)，它只返回 cipher 列表，用于 web-vault 的组织管理视图。如果带上用户侧状态，web-vault 会错误地应用这些状态（比如给组织条目标上某个管理员的个人收藏标记）。
 
