@@ -306,9 +306,174 @@ crypto::ct_eq(recovery_code, totp_recover.to_lowercase())
 
 **用户必须输入全小写的恢复码才能通过校验。** 这与 TOTP 密钥的处理方式形成对比——TOTP 在 [authenticator.rs#L83](file:///d:/fz/0601/solo-dogfeeding/code/4-vaultwarden/src/api/core/two_factor/authenticator.rs#L83) 存储时会 `key.to_uppercase()` 统一转大写。
 
+### 2.5 get-recover 接口：显示大写但输入要小写的矛盾
+
+[get_recover()](file:///d:/fz/0601/solo-dogfeeding/code/4-vaultwarden/src/api/core/two_factor/mod.rs#L108-L119) 是用户查看恢复码的接口：
+
+```rust
+#[post("/two-factor/get-recover", data = "<data>")]
+async fn get_recover(...) -> JsonResult {
+    data.validate(&user, true, &conn).await?;  // 需要密码或 OTP 验证
+
+    Ok(Json(json!({
+        "code": user.totp_recover,          // ← 直接返回数据库中的大写
+        "object": "twoFactorRecover"
+    })))
+}
+```
+
+**完整链条**：
+
+```
+用户启用 2FA
+  ↓
+generate_recover_code()
+  ↓ BASE32 编码（大写）
+user.totp_recover = Some("ABCDEFG...")  ← 大写存储
+  ↓
+用户 POST /two-factor/get-recover 查看恢复码
+  ↓
+返回 {"code": "ABCDEFG..."}  ← 显示给用户的是大写
+  ↓
+用户丢失设备，需要用恢复码登录
+  ↓
+用户输入 "ABCDEFG..."（大写）→ ❌ 校验失败
+     （因为 check_valid_recovery_code 只把右边转小写）
+  ↓
+用户输入 "abcdefg..."（小写）→ ✅ 校验成功
+```
+
+**建议修复**：在 `get_recover()` 返回时转成小写，或者在 `check_valid_recovery_code()` 中将两边都转小写：
+
+```rust
+// 方案 A：返回小写（对用户友好）
+"code": user.totp_recover.as_ref().map(|s| s.to_lowercase()),
+
+// 方案 B：两边都转小写（更健壮）
+crypto::ct_eq(
+    recovery_code.to_lowercase().as_bytes(),
+    totp_recover.to_lowercase().as_bytes()
+)
+```
+
 ---
 
-### 2.5 恢复码的设计意图
+### 2.6 为什么 2FA 错误响应中没有 RecoveryCode
+
+当登录需要 2FA 时，服务端返回的 `TwoFactorProviders` 列表中**永远不会包含 RecoveryCode(type=8)**。这是有意为之的设计，有三层原因：
+
+#### 第一层：RecoveryCode 不在 TwoFactor 表中
+
+`twofactor_ids` 的构建在 [identity.rs#L779-L785](file:///d:/fz/0601/solo-dogfeeding/code/4-vaultwarden/src/api/identity.rs#L779-L785)：
+
+```rust
+let twofactor_ids: Vec<_> = twofactors  // twofactors = TwoFactor::find_by_user()
+    .iter()
+    .filter_map(|tf| {
+        let provider_type = TwoFactorType::from_i32(tf.atype)?;
+        (tf.enabled && is_twofactor_provider_usable(&provider_type, Some(&tf.data)))
+            .then_some(tf.atype)
+    })
+    .collect();
+```
+
+RecoveryCode 存在 `User.totp_recover` 字段，不在 `twofactor` 表中，所以自然不会出现在 `twofactor_ids` 里。
+
+#### 第二层：json_err_twofactor 的 match 分支跳过
+
+即使强行把 8 塞进 `twofactor_ids`，[json_err_twofactor()](file:///d:/fz/0601/solo-dogfeeding/code/4-vaultwarden/src/api/identity.rs#L991-L1005) 的 match 也会跳过它：
+
+```rust
+match TwoFactorType::from_i32(*provider) {
+    Some(TwoFactorType::Webauthn) => { ... 生成挑战 ... }
+    Some(TwoFactorType::Duo) => { ... 生成签名 ... }
+    Some(TwoFactorType::YubiKey) => { ... 返回元数据 ... }
+    Some(TwoFactorType::Email) => { ... 发送邮件 ... }
+    Some(
+        TwoFactorType::Authenticator
+        | TwoFactorType::RecoveryCode   // ← 在这里，什么也不做
+        | TwoFactorType::Remember
+        ...
+    ) => { /* Nothing special to do */ }
+}
+```
+
+#### 第三层：设计意图——恢复码是"紧急出口"
+
+恢复码不应该作为常规的 2FA 选项出现在登录界面上，因为：
+1. **不鼓励使用**：恢复码使用后会清除所有 2FA 配置，是破坏性操作
+2. **隐藏更安全**：攻击者不知道还有恢复码这个选项
+3. **需要用户主动发现**：用户只有在真正紧急（丢失所有设备）时才会去查找恢复码的用法
+
+---
+
+### 2.7 登录时 provider=8 + token 的完整配合流程
+
+RecoveryCode 虽然不在提供者列表中，但客户端可以**主动发送** `two_factor_provider=8` 来使用恢复码。完整流程如下：
+
+#### 场景：用户丢失了所有 2FA 设备，只有恢复码
+
+```
+第 1 次 POST /connect/token
+  Body: {
+    username: "user@example.com",
+    password: "xxx",
+    // 没有 two_factor_provider 和 two_factor_token
+  }
+  ↓
+服务端发现需要 2FA
+  ↓
+twofactor_ids = [0, 7]  ← TOTP + WebAuthn，没有 8
+  ↓
+返回 400 + {
+  "error": "invalid_grant",
+  "TwoFactorProviders": ["0", "7"],   // ← 不包含 8
+  "TwoFactorProviders2": { "0": null, "7": {...挑战...} }
+}
+  ↓
+用户知道可以用恢复码，客户端选择"使用恢复码"选项
+  ↓
+第 2 次 POST /connect/token
+  Body: {
+    username: "user@example.com",
+    password: "xxx",
+    two_factor_provider: "8",    // ← 主动指定 type=8
+    two_factor_token: "abcdefg..."  // ← 恢复码（必须小写！）
+  }
+  ↓
+进入 twofactor_auth()
+  ↓
+selected_id = 8  ← 从请求中读取
+  ↓
+第 792-798 行的白名单检查：
+  if ![Remember, RecoveryCode].contains(&selected_id)
+     && !twofactor_ids.contains(&selected_id)
+  → RecoveryCode 在白名单中，跳过检查
+  ↓
+match TwoFactorType::from_i32(8)
+  ↓
+TwoFactorType::RecoveryCode 分支 [identity.rs#L860-L875]
+  ↓
+user.check_valid_recovery_code("abcdefg...")
+  → ct_eq("abcdefg...", "ABCDEFG...".to_lowercase())
+  → ct_eq("abcdefg...", "abcdefg...") → ✅ 通过
+  ↓
+TwoFactor::delete_all_by_user()  ← 清除所有 2FA！
+enforce_2fa_policy()             ← 可能撤销组织成员
+user.totp_recover = None         ← 清除恢复码本身
+user.save()
+  ↓
+登录成功！（但用户下次需要重新设置 2FA）
+```
+
+**关键点**：
+- 第 792 行的白名单检查是 RecoveryCode 的"后门"
+- `selected_twofactor`（第 808 行）对 RecoveryCode 是 `None`，但这个分支不需要它
+- 恢复码验证成功后，**所有 2FA 配置被清空**，用户变成"无 2FA 状态"
+
+---
+
+### 2.8 恢复码的设计意图
 
 | 特性 | 说明 |
 |------|------|
