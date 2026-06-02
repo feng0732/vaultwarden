@@ -6,6 +6,7 @@
 > - 数据库 Schema：[up.sql](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/migrations/sqlite/2021-08-30-193501_create_emergency_access/up.sql)
 > - 邮件通知：[mail.rs](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/mail.rs)
 > - 认证令牌：[auth.rs](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/auth.rs)
+> - 定时任务注册：[main.rs](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/main.rs#L701-L716)
 
 ---
 
@@ -59,6 +60,7 @@ Invited(0) ──accept──▶ Accepted(1) ──confirm──▶ Confirmed(2)
                                reject(授权人) ──▶ 回到 Confirmed(2)
 
 * 任意状态均可通过 delete 操作彻底删除记录
+* Confirmed 状态后 Grantor 可随时通过 update 接口修改 wait_time_days 和 atype
 ```
 
 ---
@@ -128,7 +130,26 @@ Invited(0) ──accept──▶ Accepted(1) ──confirm──▶ Confirmed(2)
   3. 若 `final_recovery_reminder_at <= now` 且距上次通知已超过 1 天（或从未通知），则发送提醒
   4. 发送 `emergency_access_recovery_reminder` 邮件给 Grantor
 
-**关键：timeout_job 运行在 reminder_job 之后**（第 7 分钟 vs 第 3 分钟），确保先发提醒再执行超时。主程序注释也明确说明 timeout_job 应先运行（见 [main.rs#L701-L703](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/main.rs#L701-L703)），但实际 cron 配置的执行顺序相反——这是为了避免在同一次调度中先批准再提醒的竞态问题。
+#### ⚠️ 定时任务注释与默认配置的矛盾点
+
+[main.rs#L701-L703](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/main.rs#L701-L703) 的注释明确说明：
+
+> "This job should run **before** the emergency access reminders job to avoid sending reminders for requests that are about to be granted anyway."
+
+**意图**：timeout_job 应该先执行，这样对于已经满足等待期条件的请求，就不会再发送不必要的提醒。
+
+**实际默认配置**（[config.rs#L551-L557](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/config.rs#L551-L557)）：
+
+| 任务 | cron 表达式 | 执行时间 |
+|------|-------------|----------|
+| `emergency_notification_reminder_schedule` | `0 3 * * * *` | 每小时第 3 分钟 |
+| `emergency_request_timeout_schedule` | `0 7 * * * *` | 每小时第 7 分钟 |
+
+**分析**：
+
+- 实际执行顺序与注释意图**相反**：reminder_job（第 3 分钟）先于 timeout_job（第 7 分钟）执行
+- **后果**：在等待期刚好到期的那个小时内，reminder_job 会先发送"还剩 1 天"的提醒，4 分钟后 timeout_job 才执行批准操作
+- **但影响有限**：因为提醒的触发条件是 `wait_time_days - 1` 天（到期前一天），所以在到期当天 reminder_job 可能会发一次不必要的提醒（除非 `wait_time_days == 1`）
 
 ### 阶段 5：授权生效后的操作（RecoveryApproved）
 
@@ -176,9 +197,88 @@ fn is_valid_request(emergency_access, requesting_user_id, requested_access_type)
 
 ---
 
-## 五、撤销规则
+## 五、更新机制：等待期与访问类型的动态调整
 
-### 5a. 授权人拒绝恢复（Reject）
+### 5a. 更新接口
+
+**API**：
+- `PUT /emergency-access/<emer_id>`
+- `POST /emergency-access/<emer_id>`
+
+两个路由**共用同一逻辑**（见 [put_emergency_access#L122](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L122)），属于 REST API 兼容设计。
+
+### 5b. 更新分支分析
+
+核心更新逻辑（[post_emergency_access#L126-L155](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L126-L155)）：
+
+```rust
+emergency_access.atype = new_type;
+emergency_access.wait_time_days = data.wait_time_days;
+if data.key_encrypted.is_some() {
+    emergency_access.key_encrypted = data.key_encrypted;
+}
+emergency_access.save(&conn).await?;
+```
+
+**关键点**：
+1. **无状态检查**：接口仅验证请求者是 Grantor，但**不检查当前 status**
+2. `atype` 和 `wait_time_days` **无条件覆盖**
+3. `key_encrypted` 采用**补写模式**
+
+### 5c. 等待期动态调整的实际影响
+
+由于更新接口**没有状态限制**，`wait_time_days` 可以在**任何状态下**被修改，包括 `RecoveryInitiated`。
+
+**场景分析**（假设原等待期 7 天）：
+
+| 时间点 | 操作 | `recovery_initiated_at` | `wait_time_days` | 到期时间 |
+|--------|------|------------------------|-----------------|----------|
+| Day 0 10:00 | Grantee initiate 恢复 | Day 0 10:00 | 7 | Day 7 10:00 |
+| Day 5 14:00 | Grantor 修改为 14 天 | Day 0 10:00 (不变) | 14 | Day 14 10:00 |
+| Day 10 09:00 | Grantor 修改为 3 天 | Day 0 10:00 (不变) | 3 | **立即批准**（Day 3 已过） |
+
+**结论**：
+- `recovery_initiated_at` 作为固定起点，`wait_time_days` 作为可变窗口
+- **Grantor 可在恢复等待期内延长或缩短等待时间**
+- 缩短到已过去的时间会导致下一次 timeout_job 运行时**立即批准**
+- 修改不会触发任何邮件通知，受托人不会收到变更提醒
+
+### 5d. 访问类型动态调整
+
+`atype` 同样可以在**任何状态下**修改：
+
+| 状态 | 行为 | 实际影响 |
+|------|------|----------|
+| `Confirmed` | View ↔ Takeover 可互转 | 影响后续 initiate 后可执行的操作 |
+| `RecoveryInitiated` | View ↔ Takeover 可互转 | 动态改变批准后可执行的操作类型 |
+| `RecoveryApproved` | View ↔ Takeover 可互转 | 改变后立即影响 `is_valid_request()` 校验 |
+
+⚠️ **重要**：即使已经批准（RecoveryApproved），Grantor 仍可以将 Takeover 改为 View，从而阻止受托人执行密码重置操作。
+
+### 5e. 共享密钥补写条件
+
+`key_encrypted` 字段的更新逻辑：
+
+```rust
+if data.key_encrypted.is_some() {
+    emergency_access.key_encrypted = data.key_encrypted;
+}
+```
+
+**条件解读**：
+- 只有当请求中**明确提供** `keyEncrypted` 字段（且不为 null）时才更新
+- 如果请求中**不包含**该字段，则**保留数据库现有值不变**
+
+**使用场景**：
+1. **首次确认**：通过 `confirm` 接口设置初始 `key_encrypted`
+2. **后续补写/重写**：通过 `put/post` 接口更新密钥（如 Grantor 轮换主密钥后）
+3. **受托人重新注册**：Grantor 可在不重新邀请的情况下更新加密密钥
+
+---
+
+## 六、撤销规则
+
+### 6a. 授权人拒绝恢复（Reject）
 
 **API**: `POST /emergency-access/<emer_id>/reject`
 
@@ -189,7 +289,7 @@ fn is_valid_request(emergency_access, requesting_user_id, requested_access_type)
 - 发送 `emergency_access_recovery_rejected` 邮件给受托人
 - **注意：即使已经 RecoveryApproved，Grantor 仍然可以 reject，但若受托人已经执行了 Takeover 的 password 步骤则无法挽回**
 
-### 5b. 删除紧急访问关系（Delete）
+### 6b. 删除紧急访问关系（Delete）
 
 **API**: `DELETE /emergency-access/<emer_id>`
 
@@ -197,7 +297,7 @@ fn is_valid_request(emergency_access, requesting_user_id, requested_access_type)
 - 无论当前处于何种状态，均直接从数据库删除记录
 - 同时触发 Grantor 的 `update_uuid_revision`（使客户端同步）
 
-### 5c. 授权人主动批准（Approve）
+### 6c. 授权人主动批准（Approve）
 
 **API**: `POST /emergency-access/<emer_id>/approve`
 
@@ -207,7 +307,7 @@ fn is_valid_request(emergency_access, requesting_user_id, requested_access_type)
 
 ---
 
-## 六、过期规则
+## 七、过期规则
 
 | 场景 | 规则 |
 |------|------|
@@ -218,7 +318,7 @@ fn is_valid_request(emergency_access, requesting_user_id, requested_access_type)
 
 ---
 
-## 七、全局开关
+## 八、全局开关
 
 配置项 `EMERGENCY_ACCESS_ALLOWED`（默认 `true`），定义于 [config.rs#L639](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/config.rs#L639)。
 
@@ -227,7 +327,7 @@ fn is_valid_request(emergency_access, requesting_user_id, requested_access_type)
 
 ---
 
-## 八、数据库字段速查
+## 九、数据库字段速查
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -235,18 +335,18 @@ fn is_valid_request(emergency_access, requesting_user_id, requested_access_type)
 | `grantor_uuid` | TEXT FK→users | 授权人 |
 | `grantee_uuid` | TEXT FK→users (nullable) | 受托人（Invited 阶段为空） |
 | `email` | TEXT (nullable) | 受托人邮箱（Accepted 后被清空） |
-| `key_encrypted` | TEXT (nullable) | 加密密钥（Confirmed 时设置） |
-| `atype` | INTEGER | 0=View, 1=Takeover |
+| `key_encrypted` | TEXT (nullable) | 加密密钥（Confirmed 时设置，可后续补写） |
+| `atype` | INTEGER | 0=View, 1=Takeover（可随时修改） |
 | `status` | INTEGER | 0-4 五种状态 |
-| `wait_time_days` | INTEGER | 等待天数 |
-| `recovery_initiated_at` | DATETIME (nullable) | 恢复发起时间（等待期起点） |
+| `wait_time_days` | INTEGER | 等待天数（可随时修改，包括等待期内） |
+| `recovery_initiated_at` | DATETIME (nullable) | 恢复发起时间（固定起点） |
 | `last_notification_at` | DATETIME (nullable) | 上次通知时间（提醒频率控制） |
 | `updated_at` | DATETIME | 更新时间 |
 | `created_at` | DATETIME | 创建时间 |
 
 ---
 
-## 九、邮件通知汇总
+## 十、邮件通知汇总
 
 | 触发时机 | 收件人 | 邮件模板 |
 |----------|--------|----------|
@@ -259,3 +359,21 @@ fn is_valid_request(emergency_access, requesting_user_id, requested_access_type)
 | 等待期超时自动批准 | Grantee | `emergency_access_recovery_approved` |
 | Grantor 拒绝 | Grantee | `emergency_access_recovery_rejected` |
 | 等待期到期前提醒 | Grantor | `emergency_access_recovery_reminder` |
+| **Grantor 修改 wait_time_days/atype** | 无 | 不会发送任何通知 |
+
+---
+
+## 十一、关键行为总结表
+
+| 操作 | 发起者 | 允许的状态 | 状态变化 | 对恢复生效时间的影响 |
+|------|--------|-----------|----------|---------------------|
+| invite | Grantor | - | → Invited | N/A |
+| accept | Grantee | Invited | → Accepted | N/A |
+| confirm | Grantor | Accepted | → Confirmed | N/A |
+| initiate | Grantee | Confirmed | → RecoveryInitiated | 开始计时：`recovery_initiated_at + wait_time_days` |
+| approve | Grantor | RecoveryInitiated | → RecoveryApproved | 立即生效（跳过等待期） |
+| reject | Grantor | RecoveryInitiated / RecoveryApproved | → Confirmed | 终止等待，下次 initiate 重新计时 |
+| **update atype** | Grantor | 任意 | 不变 | 无，但改变批准后可执行的操作类型 |
+| **update wait_time_days** | Grantor | 任意 | 不变 | **动态调整到期时间**（起点不变，窗口改变） |
+| delete | Grantor / Grantee | 任意 | 记录删除 | 终止 |
+| timeout job | 系统 | RecoveryInitiated | → RecoveryApproved | 等待期到期后自动批准 |
