@@ -324,7 +324,7 @@ fn is_valid_request(emergency_access, requesting_user_id, requested_access_type)
 
 ---
 
-## 五、更新机制：等待期与访问类型的动态调整
+## 五、更新机制：等待期、访问类型与共享密钥
 
 ### 5a. 更新接口
 
@@ -332,59 +332,136 @@ fn is_valid_request(emergency_access, requesting_user_id, requested_access_type)
 - `PUT /emergency-access/<emer_id>`
 - `POST /emergency-access/<emer_id>`
 
-两个路由**共用同一逻辑**（见 [put_emergency_access#L122](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L122)），属于 REST API 兼容设计。
+两个路由**共用同一逻辑**（[put_emergency_access#L115-L123](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L115-L123) 中 PUT 直接调用 POST 函数），属于 REST API 兼容设计。
 
-### 5b. 更新分支分析
+### 5b. 接口可作用的状态范围
 
-核心更新逻辑（[post_emergency_access#L126-L155](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L126-L155)）：
+更新接口的身份校验逻辑（[post_emergency_access#L136-L140](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L136-L140)）：
 
 ```rust
-emergency_access.atype = new_type;
-emergency_access.wait_time_days = data.wait_time_days;
-if data.key_encrypted.is_some() {
-    emergency_access.key_encrypted = data.key_encrypted;
-}
-emergency_access.save(&conn).await?;
+let Some(mut emergency_access) =
+    EmergencyAccess::find_by_uuid_and_grantor_uuid(&emer_id, &headers.user.uuid, &conn).await
+else {
+    err!("Emergency access not valid.")
+};
 ```
 
-**关键点**：
-1. **无状态检查**：接口仅验证请求者是 Grantor，但**不检查当前 status**
-2. `atype` 和 `wait_time_days` **无条件覆盖**
-3. `key_encrypted` 采用**补写模式**
+查询函数 [find_by_uuid_and_grantor_uuid](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/db/models/emergency_access.rs#L276-L289) 的过滤条件仅为 `uuid = ? AND grantor_uuid = ?`，**不包含任何 status 过滤**。
 
-### 5c. 等待期动态调整的实际影响
+**结论**：更新接口可作用于该 Grantor 名下的**任意状态**的紧急访问记录，包括 `Invited(0)`、`Accepted(1)`、`Confirmed(2)`、`RecoveryInitiated(3)`、`RecoveryApproved(4)`。代码中没有对 status 做任何前置检查。
 
-由于更新接口**没有状态限制**，`wait_time_days` 可以在**任何状态下**被修改，包括 `RecoveryInitiated`。
+**对比其他接口的状态限制**：
 
-**场景分析**（假设原等待期 7 天）：
+| 接口 | 代码中的状态检查 | 位置 |
+|------|-----------------|------|
+| confirm | `status != Accepted` 则报错 | [L411](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L411) |
+| initiate | `status != Confirmed` 则报错 | [L456](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L456) |
+| approve | `status != RecoveryInitiated` 则报错 | [L493](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L493) |
+| reject | `status != RecoveryInitiated && status != RecoveryApproved` 则报错 | [L528-L530](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L528-L530) |
+| **update (put/post)** | **无状态检查** | [L136-L140](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L136-L140) |
 
-| 时间点 | 操作 | `recovery_initiated_at` | `wait_time_days` | 到期时间 |
-|--------|------|------------------------|-----------------|----------|
+### 5c. `wait_time_days` 的取值边界
+
+#### 后端无下界校验
+
+代码中对 `wait_time_days` 的处理为直接赋值（[L149](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L149)）：
+
+```rust
+emergency_access.wait_time_days = data.wait_time_days;
+```
+
+类型为 `i32`（[EmergencyAccessUpdateData#L111](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L111)），数据库列为 `INTEGER NOT NULL`（[up.sql#L9](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/migrations/sqlite/2021-08-30-193501_create_emergency_access/up.sql#L9)），均无 CHECK 约束。
+
+**后端不存在任何下界保护**，以下值均可被写入：
+- `0`：`recovery_allowed_at = recovery_initiated_at + 0天`，即下一个 timeout_job 周期立即批准
+- 负数：`TimeDelta::try_days(i64::from(-1))` 会产生负的 `TimeDelta`，导致 `recovery_allowed_at` 早于 `recovery_initiated_at`，同样是立即批准
+- 极小负数（如 `i32::MIN`）：`i64::from(i32::MIN)` 仍为合法 `i64`，`try_days` 不溢出，行为同上
+
+#### `wait_time_days - 1` 在 reminder_job 中的溢出风险
+
+[reminder_job#L795](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L795)：
+
+```rust
+let final_recovery_reminder_at =
+    emer.recovery_initiated_at.unwrap() + TimeDelta::try_days(i64::from(emer.wait_time_days - 1)).unwrap();
+```
+
+当 `wait_time_days = 0` 时，`wait_time_days - 1 = -1`，`try_days(-1)` 产生负偏移，`final_recovery_reminder_at` 早于 `recovery_initiated_at`，条件一 `final_recovery_reminder_at <= now` 在发起后立即满足。但因为条件二（节流）限制，首次提醒仍需等 24 小时，此时 timeout_job 已经批准了恢复，记录不再出现在查询结果中。
+
+当 `wait_time_days = i32::MIN` 时，`wait_time_days - 1` 在 `i32` 上溢出为 `i32::MAX`，然后 `i64::from(i32::MAX)` 传入 `try_days`。虽然不会 panic，但会产生约 58 亿天的偏移，reminder 条件一永远不会满足。
+
+#### invite 接口同样无下界校验
+
+[send_invite#L208](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L208)：
+
+```rust
+let wait_time_days = data.wait_time_days;
+```
+
+创建时直接使用前端传入值，与 update 接口一致，无任何范围检查。
+
+#### 现有结论的代码支持程度
+
+| 结论 | 代码支持 | 备注 |
+|------|----------|------|
+| 后端无 `wait_time_days` 下界校验 | ✅ 直接证据 | update 和 invite 均为直接赋值，无 if/guard |
+| 数据库层无约束 | ✅ 直接证据 | 列定义 `INTEGER NOT NULL`，无 CHECK |
+| `0` 或负数导致立即批准 | ✅ 直接证据 | timeout_job 计算 `recovery_initiated_at + try_days(wait_time_days)`，0/负值使 `recovery_allowed_at ≤ now` |
+| `i32::MIN` 导致 reminder 溢出 | ✅ 推导 | `wait_time_days - 1` 在 i32 上溢出为 `i32::MAX`，代码行为可推导 |
+
+### 5d. 等待期动态调整的实际影响
+
+由于更新接口没有状态限制，`wait_time_days` 可以在任何状态下被修改，包括 `RecoveryInitiated`。
+
+**场景分析**（假设原等待期 7 天，发起时间 Day 0 10:00）：
+
+| 时间点 | 操作 | `recovery_initiated_at` | `wait_time_days` | timeout_job 计算的到期时间 |
+|--------|------|------------------------|-----------------|--------------------------|
 | Day 0 10:00 | Grantee initiate 恢复 | Day 0 10:00 | 7 | Day 7 10:00 |
 | Day 5 14:00 | Grantor 修改为 14 天 | Day 0 10:00 (不变) | 14 | Day 14 10:00 |
 | Day 10 09:00 | Grantor 修改为 3 天 | Day 0 10:00 (不变) | 3 | **立即批准**（Day 3 已过） |
 
+**代码依据**：
+- `recovery_initiated_at` 不受 update 接口影响 — update 只修改 `atype`、`wait_time_days`、`key_encrypted`（[L148-L152](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L148-L152)），`recovery_initiated_at` 仅在 initiate 时设置（[L467](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L467)）
+- timeout_job 每次运行时**实时读取当前 `wait_time_days`**（[L739](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L739)），不是发起时快照
+
 **结论**：
-- `recovery_initiated_at` 作为固定起点，`wait_time_days` 作为可变窗口
-- **Grantor 可在恢复等待期内延长或缩短等待时间**
-- 缩短到已过去的时间会导致下一次 timeout_job 运行时**立即批准**
-- 修改不会触发任何邮件通知，受托人不会收到变更提醒
+- `recovery_initiated_at` 是固定起点，`wait_time_days` 是可变窗口
+- Grantor 可在恢复等待期内延长或缩短等待时间
+- 缩短到已过去的时间会导致下一次 timeout_job 运行时立即批准
+- 修改不会触发任何邮件通知（代码中无发送逻辑）
 
-### 5d. 访问类型动态调整
+### 5e. 访问类型动态调整
 
-`atype` 同样可以在**任何状态下**修改：
+`atype` 同样可以在任意状态下修改（[L148](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L148)），代码仅校验类型值是否合法（[L142-L146](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L142-L146)）。
 
-| 状态 | 行为 | 实际影响 |
-|------|------|----------|
-| `Confirmed` | View ↔ Takeover 可互转 | 影响后续 initiate 后可执行的操作 |
-| `RecoveryInitiated` | View ↔ Takeover 可互转 | 动态改变批准后可执行的操作类型 |
-| `RecoveryApproved` | View ↔ Takeover 可互转 | 改变后立即影响 `is_valid_request()` 校验 |
+| 状态 | 行为 | 影响的代码依据 |
+|------|------|---------------|
+| `Confirmed` | View ↔ Takeover 可互转 | initiate 不检查 atype（[L456](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L456)） |
+| `RecoveryInitiated` | View ↔ Takeover 可互转 | timeout_job 批准时不变更 atype（[L743](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L743)） |
+| `RecoveryApproved` | View ↔ Takeover 可互转 | [is_valid_request()](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L704-L713) 实时读取 `emergency_access.atype` |
 
-⚠️ **重要**：即使已经批准（RecoveryApproved），Grantor 仍可以将 Takeover 改为 View，从而阻止受托人执行密码重置操作。
+⚠️ 即使已经批准（RecoveryApproved），Grantor 仍可以将 Takeover 改为 View。`is_valid_request()` 要求 `atype == requested_access_type`，受托人再发起 Takeover 操作时校验会失败。
 
-### 5e. 共享密钥补写条件
+### 5f. 共享密钥（`key_encrypted`）的写入路径
 
-`key_encrypted` 字段的更新逻辑：
+`key_encrypted` 在代码中有**三条写入路径**：
+
+#### 路径一：confirm 接口
+
+[confirm_emergency_access#L427](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L427)：
+
+```rust
+emergency_access.key_encrypted = Some(key);
+```
+
+- 前提状态：`Accepted(1)`
+- 传入的 `key` 为非空 `String`（[ConfirmData.key](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L389)，类型为 `String` 非 `Option`，反序列化时必须存在）
+- 这是 `key_encrypted` 的**首次写入点**
+
+#### 路径二：update 接口（补写逻辑）
+
+[post_emergency_access#L150-L152](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L150-L152)：
 
 ```rust
 if data.key_encrypted.is_some() {
@@ -392,14 +469,40 @@ if data.key_encrypted.is_some() {
 }
 ```
 
-**条件解读**：
-- 只有当请求中**明确提供** `keyEncrypted` 字段（且不为 null）时才更新
-- 如果请求中**不包含**该字段，则**保留数据库现有值不变**
+- `data.key_encrypted` 类型为 `Option<String>`（[L112](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L112)）
+- 请求中**不包含**该字段或值为 `null` 时：`is_some() == false`，数据库现有值**不变**
+- 请求中**包含**该字段且值非 null 时：覆盖写入
 
-**使用场景**：
-1. **首次确认**：通过 `confirm` 接口设置初始 `key_encrypted`
-2. **后续补写/重写**：通过 `put/post` 接口更新密钥（如 Grantor 轮换主密钥后）
-3. **受托人重新注册**：Grantor 可在不重新邀请的情况下更新加密密钥
+**代码可证明的行为**：
+- ✅ 不会清空：`is_some()` 为 false 时不执行赋值，无法将 `key_encrypted` 从 `Some(...)` 变为 `None`
+- ✅ 可覆盖：`is_some()` 为 true 时直接赋值 `data.key_encrypted`（也是 `Option<String>`），若传入 `Some("...")` 则覆盖
+
+**不可从代码推导的结论**（之前文档中的说法）：
+- ~~"受托人重新注册，Grantor 可在不重新邀请的情况下更新加密密钥"~~ — 代码中无此场景的直接实现，这只是对 update 接口能力的推测，不是代码中显式处理的场景
+
+#### 路径三：密钥轮换接口
+
+[post_rotatekey#L856](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/accounts.rs#L856)：
+
+```rust
+saved_emergency_access.key_encrypted = Some(emergency_access_data.key_encrypted);
+```
+
+- API：`POST /accounts/key-management/rotate-user-account-keys`
+- 触发场景：Grantor 执行账户加密密钥轮换
+- 数据结构 [UpdateEmergencyAccessData](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/accounts.rs#L661-L666) 包含 `id` 和 `key_encrypted`（均为非 Option 类型，必须提供）
+- 该接口要求**必须**为所有已有的紧急访问记录提供新的 `key_encrypted`，否则校验不通过（[validate_keydata](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/accounts.rs#L719) 会检查集合覆盖关系）
+- 这是**主密钥轮换时自动更新**的路径，非手动调用
+
+#### 三条路径的对比
+
+| 维度 | confirm | update (put/post) | rotate-key |
+|------|---------|-------------------|------------|
+| 状态限制 | 必须 Accepted | 无 | 无（但需要当前用户认证） |
+| `key_encrypted` 传参类型 | `String`（必传） | `Option<String>`（可选） | `String`（必传） |
+| 能否清空 | 否（写 Some） | 否（is_some=false 时不写） | 否（写 Some） |
+| 能否覆盖 | 是 | 是 | 是 |
+| 操作者 | Grantor | Grantor | Grantor（密钥轮换流程） |
 
 ---
 
@@ -465,7 +568,7 @@ if data.key_encrypted.is_some() {
 | `key_encrypted` | TEXT (nullable) | 加密密钥（Confirmed 时设置，可后续补写） |
 | `atype` | INTEGER | 0=View, 1=Takeover（可随时修改） |
 | `status` | INTEGER | 0-4 五种状态 |
-| `wait_time_days` | INTEGER | 等待天数（可随时修改，包括等待期内） |
+| `wait_time_days` | INTEGER NOT NULL | 等待天数（无 CHECK 约束，可写入 0 或负数；可随时修改，包括等待期内） |
 | `recovery_initiated_at` | DATETIME (nullable) | 恢复发起时间（固定起点） |
 | `last_notification_at` | DATETIME (nullable) | 上次通知时间（提醒频率控制） |
 | `updated_at` | DATETIME | 更新时间 |
