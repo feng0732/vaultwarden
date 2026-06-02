@@ -61,22 +61,32 @@ pub fn has_full_access(&self) -> bool {
 }
 ```
 
-**关键点：**
-- Admin 及以上角色 **自动拥有** full_access，无视 access_all 字段
-- Manager 及以下角色需要 `access_all = true` 才拥有 full_access
-- 必须是 Confirmed 状态才生效
+### 2.3 access_all 实际会落到哪些角色？
 
-### 2.3 Custom 角色的 access_all 判定
+**关键代码事实**：
 
-当 Custom 角色勾选了"管理所有集合"时，通过三个权限标志联合判定：
+在 [send_invite()](file:///d:/fz/0601/solo-dogfeeding/code/2-vaultwarden/src/api/core/organizations.rs#L1059-L1063) 和 [edit_member()](file:///d:/fz/0601/solo-dogfeeding/code/2-vaultwarden/src/api/core/organizations.rs#L1546-L1550) 中：
 
 ```rust
-// 在 send_invite() 和 edit_member() 中
 let access_all = new_type >= MembershipType::Admin
-    || (raw_type.eq("4")  // Custom 角色
+    || (raw_type.eq("4")  // Custom/Manager 角色
         && data.permissions.get("editAnyCollection") == Some(&json!(true))
-        && data.permissions.get("deleteAnyCollection") == Some(&json!(true))
-        && data.permissions.get("createNewCollections") == Some(&json!(true)));
+        && ...);
+```
+
+**实际能获得 access_all=true 的只有三类角色：**
+
+| 角色 | access_all 设置方式 | has_full_access() 结果 |
+|--------|-------------------|---------------------|
+| Owner | 自动设置为 true | true（因为 atype >= Admin） |
+| Admin | 自动设置为 true | true（因为 atype >= Admin） |
+| Manager(Custom) | 勾选"管理所有集合"时设为 true | access_all=true 时为 true |
+| User | **永远不会被设置为 true** | 永远为 false |
+
+**User 角色不可能获得组织级 full_access。代码注释也明确说明：[collection.rs L102](file:///d:/fz/0601/solo-dogfeeding/code/2-vaultwarden/src/db/models/collection.rs#L102)
+
+```rust
+// Users are not able to have full access
 ```
 
 ---
@@ -90,7 +100,7 @@ let access_all = new_type >= MembershipType::Admin
 ```rust
 pub async fn can_access_collection(member: &Membership, col_id: &CollectionId, conn: &DbConn) -> bool {
     member.has_status(MembershipStatus::Confirmed)
-        && (member.has_full_access()  // 1. 组织级别的 full_access
+        && (member.has_full_access()  // 1. 组织级别的 full_access（仅 Owner/Admin/Manager+access_all
             || CollectionUser::has_access_to_collection_by_user(col_id, &member.user_uuid, conn).await  // 2. 直接分配给用户
             || (CONFIG.org_groups_enabled()
                 && (GroupUser::has_full_access_by_member(&member.org_uuid, &member.uuid, conn).await  // 3a. 组级别的 full_access
@@ -113,9 +123,9 @@ pub async fn can_access_collection(member: &Membership, col_id: &CollectionId, c
 用户只要通过 **任一来源** 获得访问权限，即可访问集合：
 
 ```
-用户能访问集合 = 
+用户能访问集合 =
   (用户是 Admin/Owner) OR
-  (用户 access_all = true) OR
+  (用户是 Manager 且 access_all = true) OR
   (用户被直接分配到该集合) OR
   (用户所在组的 access_all = true) OR
   (用户所在组被分配到该集合)
@@ -132,8 +142,8 @@ pub async fn can_access_collection(member: &Membership, col_id: &CollectionId, c
 在 [collection.rs](file:///d:/fz/0601/solo-dogfeeding/code/2-vaultwarden/src/db/models/collection.rs#L93-L147) 中，当客户端执行 `/sync` 时，每个集合以 `collectionDetails` 对象返回给用户：
 
 ```rust
-let (read_only, hide_passwords, manage) = 
-    // 路径 A: full_access 用户（Owner/Admin 或 access_all=true 或 组 access_all=true）
+let (read_only, hide_passwords, manage) =
+    // 路径 A: 组织级 full_access 用户（Owner/Admin/Manager+access_all）
     if m.has_full_access() => (false, false, m.atype >= MembershipType::Manager)
 
     // 路径 B: 有用户直接分配
@@ -155,15 +165,16 @@ let (read_only, hide_passwords, manage) =
 ;
 ```
 
-**逐路径分析：**
+**逐路径分析：
 
-#### 路径 A：full_access（组织角色直接压制集合级权限）
+#### 路径 A：组织级 full_access
 
 当 `has_full_access()` 返回 true 时：
-- `readOnly = false`，`hidePasswords = false`：Admin/Owner 或 access_all 用户对**所有集合**拥有完整读写、密码可见权限，集合级限制完全无效
-- `manage = m.atype >= MembershipType::Manager`：只有 Manager 及以上角色才 `manage = true`，普通 User 即使 access_all=true 也 **不** 能管理集合
-
-**这里的微妙之处**：一个 `access_all = true` 的 User 角色（路径 A 生效）会得到 `(false, false, false)`，意味着能看到所有集合和密码、能编辑，但**不能管理集合成员**。这在 [to_json_user_details()](file:///d:/fz/0601/solo-dogfeeding/code/2-vaultwarden/src/db/models/organization.rs#L582-L583) 中也有同样逻辑。
+- `readOnly = false`，`hidePasswords = false`：Admin/Owner 或 Manager+access_all 用户对**所有集合**拥有完整读写、密码可见权限，集合级限制完全无效
+- `manage = m.atype >= MembershipType::Manager`：
+  - Owner/Admin → manage=true（因为 >= Manager）
+  - Manager+access_all → manage=true
+  - **注意：User 角色永远走不到这条路径
 
 #### 路径 B：用户直接分配（read_only / hide_passwords 取原始值，manage 受角色提升）
 
@@ -182,6 +193,14 @@ let (read_only, hide_passwords, manage) =
 
 与路径 B 完全对称，只是数据来源从 `user_collections` 换成了 `user_collections_groups`。
 
+#### 关键发现：组级 full_access 在这条路径里**完全没有被检查！
+
+`to_json_details()` 只检查 `m.has_full_access()`（组织级），但**没有检查用户是否属于 access_all=true 的组**。这意味着：
+
+- **组级 full_access 的用户在集合详情中不会触发 full_access 路径**，而是会走到路径 C（组分配）。
+
+- 因为组级 full_access 的用户，其 CollectionGroup 记录在 CipherSyncData 构建时被预合并了所有集合的权限，所以仍能看到所有集合，但权限值是从组分配来的，不是从 full_access 路径来的。
+
 #### 路径 D 的含义
 
 如果走到这里，说明用户既没有直接分配也没有组分配。在 CipherSyncData 预构建逻辑中，这通常不会发生（因为 `find_by_user_uuid` 只返回用户有权限的集合），但作为防御返回 `(false, false, false)`。
@@ -192,7 +211,7 @@ let (read_only, hide_passwords, manage) =
 
 ```rust
 // 先判断是否在 full_access 组中
-let full_access_group = CONFIG.org_groups_enabled() 
+let full_access_group = CONFIG.org_groups_enabled()
     && Group::is_in_full_access_group(&self.user_uuid, &self.org_uuid, conn).await;
 
 // 如果 full_access_group 或 access_all 为 true，collections 返回空数组
@@ -225,7 +244,7 @@ let collections: Vec<Value> = if include_collections && !(full_access_group || s
 当 `!(full_access_group || self.access_all)` 时，进入集合列表构建：
 
 ```rust
-let (read_only, hide_passwords, manage) = 
+let (read_only, hide_passwords, manage) =
     // 分支 1: has_full_access()（角色为 Admin/Owner 且 Confirmed）
     if self.has_full_access() => (false, false, self.atype >= MembershipType::Manager)
 
@@ -248,8 +267,8 @@ let (read_only, hide_passwords, manage) =
 
 | 场景 | manage 公式 | 区别 |
 |------|------------|------|
-| `to_json_details()`（自己看） | `is_manager && (cu.manage \|\| (!ro && !hp))` | Manager 角色是前置条件 |
-| `to_json_user_details()`（管理员看成员） | `cu.manage \|\| (is_manager && !ro && !hp)` | cu.manage 直接生效，角色只是额外提升 |
+| `to_json_details()`（自己看） | `is_manager && (cu.manage || (!ro && !hp))` | Manager 角色是前置条件 |
+| `to_json_user_details()`（管理员看成员） | `cu.manage || (is_manager && !ro && !hp))` | cu.manage 直接生效，角色只是额外提升 |
 
 在管理员视角，`cu.manage = true` 时不论角色都显示 manage=true，因为这反映的是**实际的集合级配置**；而在用户同步视角，只有 Manager 角色才能行使管理权。
 
@@ -292,7 +311,7 @@ pub fn to_json_details_for_member(&self, membership_type: i32) -> Value {
 在 [ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/2-vaultwarden/src/api/core/ciphers.rs#L2175-L2193) 中，CipherSyncData 构建时对同一集合的多个组权限做了**预合并**：
 
 ```rust
-let user_collections_groups: HashMap<CollectionId, CollectionGroup> = 
+let user_collections_groups: HashMap<CollectionId, CollectionGroup> =
     CollectionGroup::find_by_user(user_id, conn).await.into_iter().fold(
         HashMap::new(),
         |mut combined_permissions, cg| {
@@ -320,7 +339,7 @@ let user_collections_groups: HashMap<CollectionId, CollectionGroup> =
 在 [to_json_user_details()](file:///d:/fz/0601/solo-dogfeeding/code/2-vaultwarden/src/db/models/organization.rs#L556-L562) 中：
 
 ```rust
-let full_access_group = CONFIG.org_groups_enabled() 
+let full_access_group = CONFIG.org_groups_enabled()
     && Group::is_in_full_access_group(&self.user_uuid, &self.org_uuid, conn).await;
 
 let collections: Vec<Value> = if include_collections && !(full_access_group || self.access_all) {
@@ -405,14 +424,16 @@ if self.is_owned_by_user(user_uuid)                    // 1. 用户直接拥有
 }
 ```
 
-[is_in_full_access_org()](file:///d:/fz/0601/solo-dogfeeding/code/2-vaultwarden/src/db/models/cipher.rs#L558-L575) 检查用户在该组织中是否 `has_full_access()`（即 Admin/Owner 或 access_all=true）。
+[is_in_full_access_org()](file:///d:/fz/0601/solo-dogfeeding/code/2-vaultwarden/src/db/models/cipher.rs#L558-L575) 检查用户在该组织中是否 `has_full_access()`（即 Admin/Owner 或 Manager+access_all=true）。
 
 [is_in_full_access_group()](file:///d:/fz/0601/solo-dogfeeding/code/2-vaultwarden/src/db/models/cipher.rs#L577-L594) 检查 CipherSyncData 中的 `user_group_full_access_for_organizations`，这是在 [CipherSyncData::new()](file:///d:/fz/0601/solo-dogfeeding/code/2-vaultwarden/src/api/core/ciphers.rs#L2196-L2200) 中预计算的：
 
 ```rust
-let user_group_full_access_for_organizations: HashSet<OrganizationId> = 
+let user_group_full_access_for_organizations: HashSet<OrganizationId> =
     Group::get_orgs_by_user_with_full_access(user_id, conn).await.into_iter().collect();
 ```
+
+**注意**：这里会检查组级 full_access！与 `to_json_details()` 不同！
 
 ### 6.3 第二级：集合权限收集（用户直接权限优先于组权限）
 
@@ -590,7 +611,7 @@ pub fn revoke(&mut self) -> bool {
 | 操作 | 成员记录 | 集合分配 | 组成员 | 推送通知 | 可恢复 |
 |------|----------|----------|--------|----------|--------|
 | Revoke (撤销) | 保留，status 减 128 | **保留** | **保留** | 无 SyncOrgKeys | 是（restore） |
-| Delete (删除) | 彻底删除 | 级联删除 | 级联删除 | **发送 SyncOrgKeys** | 否 |
+| Delete (删除) | 彻底删除 | 级联删除 | 级联删除 | **发送 SyncOrgKeys | 否 |
 
 **撤销的访问切断方式不同**：撤销不删除任何数据，只修改 status 字段。访问切断完全依赖 `has_status(MembershipStatus::Confirmed)` 检查：
 
