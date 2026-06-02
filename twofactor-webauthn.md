@@ -253,7 +253,7 @@ async fn generate_recover_code(user: &mut User, conn: &DbConn) {
   │   │   ├─ user.check_valid_recovery_code(twofactor_code)
   │   │   │   → User 模型方法（user.rs#L169）
   │   │   │   → crypto::ct_eq(recovery_code, totp_recover.to_lowercase())
-  │   │   │   → 常量时间比较，大小写不敏感
+  │   │   │   → 常量时间比较，**用户必须输入小写**
   │   │   │
   │   │   ├─ TwoFactor::delete_all_by_user()    ← 清除所有 2FA！
   │   │   ├─ enforce_2fa_policy()                ← 可能撤销组织成员资格
@@ -266,13 +266,55 @@ async fn generate_recover_code(user: &mut User, conn: &DbConn) {
   └─ TwoFactorIncomplete::mark_complete() → 标记2FA完成
 ```
 
-### 2.4 恢复码的设计意图
+### 2.4 恢复码的大小写真实要求：用户必须输入小写
+
+这是代码中一个容易被误解的细节。让我们追踪三个关键位置的大小写处理：
+
+#### 位置 1：生成时 [mod.rs#L123](file:///d:/fz/0601/solo-dogfeeding/code/4-vaultwarden/src/api/core/two_factor/mod.rs#L123)
+
+```rust
+let totp_recover = crypto::encode_random_bytes::<20>(&BASE32);
+```
+
+`data-encoding` 库的 `BASE32` 遵循 RFC4648 标准，**默认输出大写字母**（A-Z, 2-7）。
+
+#### 位置 2：存储时 [mod.rs#L124](file:///d:/fz/0601/solo-dogfeeding/code/4-vaultwarden/src/api/core/two_factor/mod.rs#L124)
+
+```rust
+user.totp_recover = Some(totp_recover);  // 大写原样存储
+```
+
+数据库 `users.totp_recover` 字段中存储的是**大写**。
+
+#### 位置 3：校验时 [user.rs#L171](file:///d:/fz/0601/solo-dogfeeding/code/4-vaultwarden/src/db/models/user.rs#L171)
+
+```rust
+crypto::ct_eq(recovery_code, totp_recover.to_lowercase())
+```
+
+**关键不对称**：
+- 左边 `recovery_code`：用户原始输入，**未做大小写转换**
+- 右边 `totp_recover.to_lowercase()`：数据库值被转成**小写**
+- `ct_eq` 是 [subtle](file:///d:/fz/0601/solo-dogfeeding/code/4-vaultwarden/src/crypto.rs#L112-L115) 库的**字节级精确比较**
+
+**结论**：
+| 用户输入 | 数据库存储（大写） | 比较的右侧（转小写） | 匹配结果 |
+|---------|------------------|-------------------|---------|
+| `ABCDE...`（大写） | `ABCDE...` | `abcde...` | ❌ 不匹配 |
+| `abcde...`（小写） | `ABCDE...` | `abcde...` | ✅ 匹配 |
+| `aBcDe...`（混合） | `ABCDE...` | `abcde...` | ❌ 不匹配 |
+
+**用户必须输入全小写的恢复码才能通过校验。** 这与 TOTP 密钥的处理方式形成对比——TOTP 在 [authenticator.rs#L83](file:///d:/fz/0601/solo-dogfeeding/code/4-vaultwarden/src/api/core/two_factor/authenticator.rs#L83) 存储时会 `key.to_uppercase()` 统一转大写。
+
+---
+
+### 2.5 恢复码的设计意图
 
 | 特性 | 说明 |
 |------|------|
 | 不在 TwoFactor 表中 | 与具体 2FA 方式解耦，是用户级别的"紧急出口" |
 | 只生成一次 | 首次启用任何 2FA 时生成，后续不覆盖 |
-| 大小写不敏感 | [check_valid_recovery_code()](file:///d:/fz/0601/solo-dogfeeding/code/4-vaultwarden/src/db/models/user.rs#L169) 中 `.to_lowercase()` |
+| 大小写要求 | 用户必须输入**全小写** |
 | 使用后果严重 | 删除**所有** 2FA 配置 + 清除恢复码本身 + 可能触发组织策略 |
 | 特殊通道进入 | 绕过 `twofactor_ids.contains()` 检查，客户端可主动选择 |
 
@@ -400,15 +442,108 @@ async fn delete_webauthn(data: Json<DeleteU2FData>, headers: Headers, conn: DbCo
                                    ← 只有通用禁用可用
 ```
 
-### 3.5 专用禁用的一个潜在问题
+### 3.5 删除最后一个 WebAuthn 密钥后的完整路径
 
-当 `DELETE /two-factor/webauthn` 删到最后一个密钥时：
-- `TwoFactor` 记录的 `data` 变为 `[]`（空数组）
+当 `DELETE /two-factor/webauthn` 删到最后一个密钥时，数据库状态：
+- `TwoFactor(atype=7)` 记录仍然存在
 - `enabled` 字段仍为 `true`
-- **不会**调用 `enforce_2fa_policy()`
+- `data` 字段变为 `[]`（空 JSON 数组）
+- **不会**调用 `enforce_2fa_policy()` 检查组织策略
 - 返回 `"enabled": true`
 
-这意味着用户虽然已没有任何可用的 WebAuthn 密钥，但 `TwoFactor(atype=7)` 记录仍存在且 `enabled=true`。在登录时，[is_twofactor_provider_usable()](file:///d:/fz/0601/solo-dogfeeding/code/4-vaultwarden/src/api/core/two_factor/mod.rs#L39-L69) 对 WebAuthn 只检查 `CONFIG.is_webauthn_2fa_supported()`（即 DOMAIN 配置），不检查密钥是否为空。空密钥的情况会在 [generate_webauthn_login()](file:///d:/fz/0601/solo-dogfeeding/code/4-vaultwarden/src/api/core/two_factor/webauthn.rs#L378-L416) 中被 `if creds.is_empty()` 捕获并报错。
+接下来的三处代码路径会各自表现出不同的行为：
+
+#### 路径 1：设置页面读取（GET /two-factor）
+
+入口：[get_twofactor()](file:///d:/fz/0601/solo-dogfeeding/code/4-vaultwarden/src/api/core/two_factor/mod.rs#L90-L106)
+
+```
+GET /two-factor
+  ↓
+TwoFactor::find_by_user() → 包含 atype=7 记录
+  ↓
+is_twofactor_provider_usable(Webauthn, Some("[]"))
+  └→ 检查 CONFIG.is_webauthn_2fa_supported()  ← 仅检查 DOMAIN 配置
+      不检查 tf.data 是否为空
+  └→ 返回 true
+  ↓
+TwoFactor::to_json_provider(tf)
+  └→ 返回 {"enabled": true, "type": 7, ...}
+  ↓
+前端认为 WebAuthn 已启用，点击进入详情
+  ↓
+POST /two-factor/get-webauthn
+  └→ get_webauthn_registrations()
+      └→ 返回 (enabled=true, registrations=[])  ← 空数组
+  └→ 返回 {"enabled": true, "keys": [], ...}
+  ↓
+前端显示 "已启用，0 个密钥"
+```
+
+关键点：[is_twofactor_provider_usable()](file:///d:/fz/0601/solo-dogfeeding/code/4-vaultwarden/src/api/core/two_factor/mod.rs#L39-L69) 的第 59 行 **不检查** `data` 是否为空，只检查全局配置。
+
+#### 路径 2：登录时的提供者列表构建
+
+入口：[twofactor_auth()](file:///d:/fz/0601/solo-dogfeeding/code/4-vaultwarden/src/api/identity.rs#L779-L785)
+
+```
+POST /connect/token（首次登录）
+  ↓
+TwoFactor::find_by_user() → 包含 atype=7 记录
+  ↓
+构建 twofactor_ids:
+  for tf in twofactors:
+    if tf.enabled && is_twofactor_provider_usable(atype, &tf.data)
+      → Webauthn: 条件成立（enabled=true && 配置有效）
+      → 加入 twofactor_ids
+  ↓
+twofactor_ids = [7]  ← WebAuthn 在可用列表中
+  ↓
+json_err_twofactor([7], ...)
+  └→ 遍历 providers，为每个类型生成 TwoFactorProviders2
+  └→ 遇到 type=7 时调用 generate_webauthn_login()
+      ↓
+      generate_webauthn_login():
+        creds = get_webauthn_registrations().1 → []（空数组）
+        if creds.is_empty() {
+          err!("No Webauthn devices registered")  ← 这里报错！
+        }
+  ↓
+整个登录流程返回 500 错误
+```
+
+**后果**：用户无法登录。因为：
+1. WebAuthn 被认定为"可用"并加入 `twofactor_ids`
+2. 但生成挑战时发现无密钥，抛出错误
+3. `json_err_twofactor()` 提前失败，不返回 2FA 提供者列表给客户端
+
+#### 路径 3：如果有其他 2FA 方式（例如同时有 TOTP）
+
+```
+twofactor_ids = [0, 7]  ← TOTP + WebAuthn
+  ↓
+json_err_twofactor([0, 7], ...)
+  ↓
+遍历 [0, 7]:
+  type=0 (Authenticator): 无特殊处理，返回 null 给客户端
+  type=7 (Webauthn): 调用 generate_webauthn_login() → 报错
+  ↓
+整个流程失败
+```
+
+**即使有其他可用的 2FA 方式，WebAuthn 的空密钥问题也会导致整个登录失败。**
+
+#### 修复点建议
+
+在 [is_twofactor_provider_usable()](file:///d:/fz/0601/solo-dogfeeding/code/4-vaultwarden/src/api/core/two_factor/mod.rs#L39-L69) 中，WebAuthn 的判断应额外检查：
+
+```rust
+TwoFactorType::Webauthn =>
+    CONFIG.is_webauthn_2fa_supported()
+    && provider_data.is_some_and(|d| d != "[]"),  // ← 新增：排除空数组
+```
+
+或者在 [get_webauthn_registrations()](file:///d:/fz/0601/solo-dogfeeding/code/4-vaultwarden/src/api/core/two_factor/webauthn.rs#L367-L376) 返回 `(false, [])` 当数组为空时。
 
 ### 3.6 Authenticator 的专用禁用对比
 
