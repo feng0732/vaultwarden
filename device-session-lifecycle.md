@@ -516,7 +516,192 @@ refresh_token 轮换，旧 refresh_token 失效
 
 ---
 
-## 9. 相关文件索引
+## 9. 管理员强制失效：删设备与令牌轮换的执行顺序差异
+
+三条管理员级别的强制失效路径虽然都同时触发了「删除设备」和「重置安全戳」，但**执行顺序不同**，导致令牌轮换的实际效果截然不同。
+
+### 9.1 三条路径的执行顺序对比
+
+| 步骤 | [deauth_user](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/api/admin.rs#L463-L482) | [disable_user](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/api/admin.rs#L484-L497) | [post_sstamp](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/api/core/accounts.rs#L919-L934) |
+|------|-----------|-------------|------------|
+| 1 | `send_logout` | `reset_security_stamp` | `reset_security_stamp` |
+| 2 | 注销推送设备 | 设 `enabled=false` | `user.save` |
+| 3 | **`delete_all_by_user`** | `user.save` | `send_logout` |
+| 4 | **`reset_security_stamp`** | `send_logout` | **`delete_all_by_user`** |
+| 5 | `user.save` | **`delete_all_by_user`** | — |
+
+### 9.2 关键差异：令牌轮换是空操作还是有意义操作
+
+#### deauth_user：先删设备，再轮换 → 轮换是空操作
+
+```rust
+// admin.rs L478-L479
+Device::delete_all_by_user(&user.uuid, &conn).await?;   // ← 先删，设备表已清空
+user.reset_security_stamp(&conn).await?;                  // ← 再轮换，但已无设备可轮换
+```
+
+[reset_security_stamp()](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/db/models/user.rs#L217-L221) 内部调用 [rotate_refresh_tokens_by_user()](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/db/models/device.rs#L263-L272)，后者执行 `Self::find_by_user()` 查找该用户的所有设备。此时设备记录已经被删光，返回空 Vec，for 循环体不执行。
+
+**实际效果**：
+- 安全戳已更新 → 旧 access_token 立即失效 ✓
+- 设备记录已删除 → [find_by_refresh_token()](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/db/models/device.rs#L222-L225) 查不到任何设备 → 旧 refresh_token 也失效 ✓
+- 令牌轮换代码跑了一遍，但对空列表操作 → **无副作用，属于冗余调用**
+
+#### disable_user：先轮换，再删设备 → 轮换执行了但结果被覆盖
+
+```rust
+// admin.rs L487
+user.reset_security_stamp(&conn).await?;   // ← 先轮换，设备还在，逐个生成新 refresh_token
+// ...中间保存用户、发送通知...
+// admin.rs L494
+Device::delete_all_by_user(&user.uuid, &conn).await?;  // ← 再删，刚轮换的设备全删
+```
+
+**实际效果**：
+- 轮换确实执行了（每个设备的 `refresh_token` 字段被更新写入数据库）
+- 但紧接着设备记录被全删，刚写入的新令牌随之消失
+- 最终效果与 deauth_user 一样：安全戳变了、设备没了，旧令牌全部失效
+- 区别仅是**多做了一次无用的数据库写入**
+
+#### post_sstamp：先轮换，再删设备 → 与 disable_user 同理
+
+```rust
+// accounts.rs L926
+user.reset_security_stamp(&conn).await?;   // ← 先轮换
+// accounts.rs L929
+nt.send_logout(&user, None, &conn).await;  // ← 通知所有设备（无豁免）
+// accounts.rs L931
+Device::delete_all_by_user(&user.uuid, &conn).await?;  // ← 再删
+```
+
+与 disable_user 执行顺序相同，轮换的写入同样被后续删除覆盖。
+
+### 9.3 为什么三条路径的最终效果相同
+
+尽管执行顺序不同，三条路径的最终效果**完全一致**：
+
+| 维度 | 最终状态 |
+|------|---------|
+| `user.security_stamp` | 已更新为新 UUID |
+| 设备记录 | 全部删除 |
+| 旧 access_token | 安全戳不匹配 → 失效 |
+| 旧 refresh_token | 设备记录不存在 → `find_by_refresh_token` 返回 None → 失效 |
+| WebSocket/Push 通知 | 所有设备收到登出消息 |
+
+**结论**：当同时做了「删设备」和「轮换令牌」两件事时，删设备本身就足以让旧 refresh_token 失效（因为找不到匹配的设备记录），令牌轮换只是额外的安全冗余。对于 `deauth_user` 这种先删再轮换的路径，轮换更是纯空操作。
+
+---
+
+## 10. 密码变更与 KDF 调整后当前设备的令牌可用性
+
+密码变更和 KDF 变更都通过 [set_password()](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/db/models/user.rs#L192-L215) 触发安全戳重置和刷新令牌轮换，但传入参数不同，导致当前设备持有的两种令牌可用性存在关键差异。
+
+### 10.1 set_password 内部的执行时序
+
+```rust
+// user.rs L192-L215
+pub async fn set_password(&mut self, ..., allow_next_route: Option<Vec<String>>, ...) -> EmptyResult {
+    self.password_hash = crypto::hash_password(...);
+
+    if let Some(route) = allow_next_route {
+        self.set_stamp_exception(route);       // ① 先保存旧安全戳到例外（如果提供）
+    }
+
+    if let Some(new_key) = new_key {
+        self.akey = new_key;
+    }
+
+    if reset_security_stamp {
+        self.reset_security_stamp(conn).await?; // ② 再生成新安全戳 + 轮换刷新令牌
+    }
+    Ok(())
+}
+```
+
+时序关键点：**stamp_exception 在 reset_security_stamp 之前设置**，因此例外中保存的是变更前的旧安全戳，恰好与当前设备 access_token 中嵌入的 `sstamp` 一致。
+
+### 10.2 两种场景下令牌状态对比
+
+#### 密码变更 (post_password)
+
+[post_password()](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/api/core/accounts.rs#L513-L550) 调用：
+```rust
+user.set_password(
+    &data.new_master_password_hash,
+    Some(data.key),
+    true,                          // reset_security_stamp = true
+    Some(vec![                     // allow_next_route = 有例外路由
+        "post_rotatekey",
+        "get_contacts",
+        "get_public_keys",
+        "get_api_webauthn",
+    ]),
+    &conn,
+).await?;
+nt.send_logout(&user, Some(&headers.device), &conn).await;  // 排除当前设备
+```
+
+| 令牌类型 | 变更后状态 | 原因 |
+|---------|-----------|------|
+| **access_token** | ⚠️ 部分可用（2分钟宽限） | sstamp 不匹配，但有 stamp_exception；仅 `post_rotatekey`/`get_contacts`/`get_public_keys`/`get_api_webauthn` 四个路由可通过验证 |
+| **refresh_token** | ❌ 不可用 | reset_security_stamp 内部调用 rotate_refresh_tokens_by_user，数据库中当前设备的 refresh_token 已被替换；JWT 中的 device_token 查不到匹配记录 |
+
+#### KDF 变更 (post_kdf)
+
+[post_kdf()](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/api/core/accounts.rs#L615-L648) 调用：
+```rust
+user.set_password(
+    &data.authentication_data.master_password_authentication_hash,
+    Some(data.unlock_data.master_key_wrapped_user_key),
+    true,    // reset_security_stamp = true
+    None,    // allow_next_route = 无例外路由！
+    &conn,
+).await?;
+nt.send_logout(&user, Some(&headers.device), &conn).await;  // 排除当前设备
+```
+
+| 令牌类型 | 变更后状态 | 原因 |
+|---------|-----------|------|
+| **access_token** | ❌ 立即不可用 | sstamp 不匹配，且**无 stamp_exception**；任何路由的请求都会返回 401 |
+| **refresh_token** | ❌ 不可用 | 同密码变更，数据库中的 refresh_token 已被轮换 |
+
+### 10.3 令牌可用性汇总表
+
+| 场景 | access_token | refresh_token | stamp_exception | 设备豁免通知 |
+|------|-------------|---------------|-----------------|------------|
+| 密码变更 | ⚠️ 4个路由可用2分钟 | ❌ 不可用 | ✅ 有（4路由/2分钟） | ✅ 当前设备豁免 |
+| KDF 变更 | ❌ 立即不可用 | ❌ 不可用 | ❌ 无 | ✅ 当前设备豁免 |
+| 邮箱变更 | ❌ 立即不可用 | ❌ 不可用 | ❌ 无 | ❌ 全部设备通知 |
+| 密钥轮换 | ❌ 立即不可用 | ❌ 不可用 | ❌ 无 | ✅ 当前设备豁免 |
+| 管理员踢出 | ❌ 立即不可用 | ❌ 设备已删 | ❌ 无 | ❌ 全部设备通知 |
+| 禁用用户 | ❌ 立即不可用 | ❌ 设备已删 | ❌ 无 | ❌ 全部设备通知 |
+| 安全戳重置 | ❌ 立即不可用 | ❌ 设备已删 | ❌ 无 | ❌ 全部设备通知 |
+
+### 10.4 为什么密码变更需要 stamp_exception 而 KDF 变更不需要
+
+密码变更的客户端流程是多步操作：
+
+```
+1. POST /accounts/password          ← 密码变更本身（此时 stamp_exception 生效）
+2. POST /accounts/key-management/rotate-user-account-keys  ← 重新加密所有数据
+3. 客户端提示用户重新登录
+```
+
+密码变更后，客户端必须紧接着调用密钥轮换接口来重新加密所有数据。这两步之间，客户端只能依靠 stamp_exception 继续通过身份验证。
+
+而 KDF 变更是原子操作——客户端在一次请求中同时提交新的认证数据和加密密钥，无需后续步骤，因此不需要例外窗口。
+
+### 10.5 stamp_exception 在密钥轮换后的状态
+
+[post_rotatekey()](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/api/core/accounts.rs#L797-L917) 内部再次调用 `set_password(..., true, None, &conn)`，即**再次重置安全戳但不设置新的 stamp_exception**。
+
+注意 [reset_security_stamp()](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/db/models/user.rs#L217-L221) 不会清除 `stamp_exception` 字段。但此时 `stamp_exception` 中保存的旧安全戳与新生成的安全戳已完全不同，且例外的2分钟窗口在正常流程下也已过期，因此**残留的 stamp_exception 不会被误用**。
+
+过期清理机制：当请求守卫检测到 stamp_exception 已过期时，[auth.rs L664-L671](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/auth.rs#L664-L671) 会主动调用 `user.reset_stamp_exception()` 并保存用户记录，将过期的例外从数据库中清除。
+
+---
+
+## 11. 相关文件索引
 
 | 功能模块 | 文件路径 |
 |---------|---------|
