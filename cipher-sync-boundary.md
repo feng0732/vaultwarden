@@ -185,8 +185,41 @@ WHERE users_organizations.org_uuid = ?
 | 组织条目内容更新，用户 X 通过集合 A 有只读访问 | ✅ 刷新 X | X 需要看到更新后的内容 |
 | 组织 Owner/Admin 修改条目，普通成员 Y 通过组有访问权 | ✅ 刷新 Y | Y 需要同步最新数据 |
 | 组织条目改动，用户 Z 不是该组织成员 | ❌ 不刷新 | Z 完全看不到这个条目 |
-| 组织条目改动，用户 W 是组织成员但未确认（status ≠ Confirmed） | ❌ 不刷新 | SQL 过滤了 `status = Confirmed` |
+| **⚠️ 组织条目改动，未确认成员（Invited/Accepted）** | **✅ 刷新** | **SQL 没有 `status = Confirmed` 过滤** |
 | 个人条目改动，其他用户通过组织有间接访问 | ❌ 不刷新 | 个人条目只刷新拥有者 |
+
+#### ⚠️ 代码漏洞：未确认成员也会被刷新
+
+**问题代码位置**：
+- [find_by_cipher_and_org](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/organization.rs#L1053-L1073)
+- [find_by_cipher_and_org_with_group](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/organization.rs#L1075-L1107)
+
+**关键发现**：这两个查询只过滤了 `org_uuid` 和访问权限，但**没有**添加 `status = Confirmed` 过滤条件：
+
+```sql
+-- find_by_cipher_and_org 的 WHERE 子句
+WHERE users_organizations.org_uuid = ?
+    AND (
+        users_organizations.access_all = true
+        OR ciphers_collections.cipher_uuid = ?
+    )
+-- ⚠️ 缺少：AND users_organizations.status = 2 (Confirmed)
+```
+
+对比其他查询（如第 1045 行的策略查询）：
+```rust
+.filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
+```
+
+**实际影响**：
+- Invited（已邀请未接受）和 Accepted（已接受未确认）状态的成员也会收到修订刷新
+- 但这些成员实际上**无法登录**或**看不到组织数据**
+- 属于"无效刷新"，浪费数据库资源和推送通知带宽
+
+**建议修复**：在两个查询中添加状态过滤：
+```rust
+.filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
+```
 
 #### ⚠️ 存在的问题：重复刷新风险
 
@@ -210,22 +243,66 @@ for member in collection_users {
 1. **渠道一**：用户被直接分配到条目所在的集合（`find_by_cipher_and_org` 查到）
 2. **渠道二**：用户所在的组被分配到条目所在的集合（`find_by_cipher_and_org_with_group` 查到）
 
-**影响**：
+#### 🔗 重复刷新在通知链路上的具体落点
+
+**完整调用链路**：
+
+```
+cipher.save() / cipher.delete()
+         │
+         ▼
+update_users_revision() → 返回 Vec<UserId>（可能有重复）
+         │
+         ▼
+nt.send_cipher_update(ut, cipher, &user_ids, device, ...)
+         │
+         ├─ 【链路 A】WebSocket 通知（第 445-449 行）
+         │   for uuid in user_ids {               // ⚠️ 有重复就循环多次！
+         │       self.send_update(uuid, &data).await;
+         │   }
+         │
+         └─ 【链路 B】Push 通知（第 451-453 行）
+             if CONFIG.push_enabled() && user_ids.len() == 1 {  // ✅ 有保护！
+                 push_cipher_update(...).await;
+             }
+```
+
+**代码位置**：[src/api/notifications.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/api/notifications.rs#L445-L453)
+
+**落点分析**：
+
+| 通知链路 | 是否受重复影响 | 原因 |
+|---------|--------------|------|
+| **WebSocket 通知** | ✅ 受影响 | 直接 `for uuid in user_ids` 遍历，重复的用户 ID 会导致同一用户收到多次相同的 WebSocket 消息 |
+| **Push 通知** | ❌ 不受影响 | 有 `user_ids.len() == 1` 保护，组织条目（多用户）完全不会触发 Push 通知 |
+| **数据库更新** | ✅ 受影响 | 每次循环都调用 `User::update_uuid_revision()`，执行多次 `UPDATE` |
+| **返回列表** | ✅ 受影响 | `user_uuids` 包含重复 ID，调用方可能误用 |
+
+**WebSocket 重复通知的实际影响**：
+- 客户端会收到多条相同的 `SyncCipherUpdate` 消息
+- 但消息内容完全相同（同一个 `cipher.updated_at`）
+- 客户端通常会忽略重复或过期的同步通知
+- 主要影响：WebSocket 带宽浪费，客户端日志噪音
+
+**完整影响清单**：
 - 同一个用户的 `User::update_uuid_revision()` 可能被多次调用
 - 数据库执行多次 `UPDATE users SET updated_at = NOW() WHERE uuid = ?`
 - 返回的 `user_uuids` 列表可能包含重复的用户 ID
-- 推送通知系统可能发送重复通知
+- WebSocket 通知系统可能发送重复消息给同一用户
+- Push 通知不受影响（有长度保护）
 
 **但实际上的影响有限**：
 - 数据库更新是幂等的（都是设为当前时间，最终结果一致）
 - 多次更新在同一毫秒内完成，`user.updated_at` 最终值相同
 - 客户端同步只看时间戳是否变化，重复更新不会导致多余的同步
+- WebSocket 重复消息通常会被客户端去重
 
 **建议优化**（代码中未实现）：
 ```rust
-// 在 extend 后去重
+// 在 extend 后去重，同时保留 Membership 信息用于去重
 use std::collections::HashSet;
-let unique_users: HashSet<_> = collection_users.into_iter().collect();
+let mut seen = HashSet::new();
+collection_users.retain(|m| seen.insert(m.user_uuid.clone()));
 ```
 
 #### 📊 影响成员范围总结
@@ -233,8 +310,15 @@ let unique_users: HashSet<_> = collection_users.into_iter().collect();
 | 条目类型 | 刷新的用户范围 | 可能重复刷新？ |
 |---------|--------------|--------------|
 | 个人条目 | 仅条目拥有者（1 人） | ❌ 不可能 |
-| 组织条目（组功能禁用） | 直接访问集合的用户 + access_all 成员 | ❌ 不可能 |
-| 组织条目（组功能启用） | 直接访问的用户 + 组间接访问的用户 | ✅ 可能（双渠道用户） |
+| 组织条目（组功能禁用） | 直接访问集合的用户 + access_all 成员 + **未确认成员** | ❌ 不可能 |
+| 组织条目（组功能启用） | 直接访问的用户 + 组间接访问的用户 + **未确认成员** | ✅ 可能（双渠道用户） |
+
+#### 🚨 两个已知问题汇总
+
+| 问题 | 影响 | 严重程度 | 代码位置 |
+|------|------|---------|---------|
+| 未确认成员被纳入刷新范围 | 无效数据库更新 + 无效通知发送 | 中 | [organization.rs#L1053-L1107](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/organization.rs#L1053-L1107) |
+| 双渠道用户重复刷新 | 多次数据库 UPDATE + 多次 WebSocket 通知 | 低 | [cipher.rs#L424-L435](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/cipher.rs#L424-L435) |
 
 #### ⚠️ 特别注意：用户侧操作（收藏/归档/移文件夹）的修订刷新范围
 
