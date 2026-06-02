@@ -108,7 +108,7 @@ Invited(0) ──accept──▶ Accepted(1) ──confirm──▶ Confirmed(2)
 
 ### 阶段 4：等待期与自动批准
 
-等待期的核心逻辑由两个定时任务实现：
+等待期的核心逻辑由两个定时任务实现。两个任务共享同一个数据源查询 `find_all_recoveries_initiated()`，筛选条件为 `status = RecoveryInitiated(3) AND recovery_initiated_at IS NOT NULL`。
 
 #### 4a. 自动批准（emergency_request_timeout_job）
 
@@ -117,7 +117,8 @@ Invited(0) ──accept──▶ Accepted(1) ──confirm──▶ Confirmed(2)
   1. 查询所有 `status = RecoveryInitiated(3)` 且 `recovery_initiated_at IS NOT NULL` 的记录
   2. 计算 `recovery_allowed_at = recovery_initiated_at + wait_time_days 天`
   3. 若 `recovery_allowed_at <= now`，则将状态更新为 `RecoveryApproved(4)`
-  4. 发送邮件：
+  4. 仅更新 `status` 和 `updated_at` 两个字段（不更新整条记录，避免与 reminder_job 冲突）
+  5. 发送邮件：
      - 给 Grantor：`emergency_access_recovery_timed_out`
      - 给 Grantee：`emergency_access_recovery_approved`
 
@@ -125,31 +126,157 @@ Invited(0) ──accept──▶ Accepted(1) ──confirm──▶ Confirmed(2)
 
 - **调度**：`EMERGENCY_NOTIFICATION_REMINDER_SCHEDULE`，默认 `0 3 * * * *`（每小时第 3 分钟）
 - **逻辑**（见 [emergency_access.rs#L777-L834](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L777-L834)）：
-  1. 遍历所有 `RecoveryInitiated` 状态的记录
-  2. 计算 `final_recovery_reminder_at = recovery_initiated_at + (wait_time_days - 1) 天`（到期前一天）
-  3. 若 `final_recovery_reminder_at <= now` 且距上次通知已超过 1 天（或从未通知），则发送提醒
-  4. 发送 `emergency_access_recovery_reminder` 邮件给 Grantor
 
-#### ⚠️ 定时任务注释与默认配置的矛盾点
+提醒发送需同时满足两个条件，代码为：
 
-[main.rs#L701-L703](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/main.rs#L701-L703) 的注释明确说明：
+```rust
+let final_recovery_reminder_at =
+    emer.recovery_initiated_at.unwrap() + TimeDelta::try_days(i64::from(emer.wait_time_days - 1)).unwrap();
+
+let next_recovery_reminder_at = if let Some(last_notification_at) = emer.last_notification_at {
+    last_notification_at + TimeDelta::try_days(1).unwrap()
+} else {
+    now
+};
+
+if final_recovery_reminder_at.le(&now) && next_recovery_reminder_at.le(&now) {
+    // 发送提醒并更新 last_notification_at
+}
+```
+
+**条件一**（进入提醒窗口）：`final_recovery_reminder_at <= now`
+
+- `final_recovery_reminder_at = recovery_initiated_at + (wait_time_days - 1) 天`
+- 含义：进入到期前 1 天的窗口期后才允许发送提醒
+- 当 `wait_time_days = 1` 时，`final_recovery_reminder_at = recovery_initiated_at + 0 天 = recovery_initiated_at`，即**发起后立即进入提醒窗口**
+
+**条件二**（节流控制）：`next_recovery_reminder_at <= now`
+
+- 若 `last_notification_at` 有值：`next_recovery_reminder_at = last_notification_at + 1 天`
+- 若 `last_notification_at` 为 None：`next_recovery_reminder_at = now`（立即满足，但正常流程不会出现 None）
+- 含义：距离上次通知至少间隔 24 小时，防止重复发送
+
+**`last_notification_at` 的生命周期**：
+
+| 时机 | 赋值 | 效果 |
+|------|------|------|
+| [initiate](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L468) 时 | `last_notification_at = now` | 设为发起时间，首次提醒需等 24 小时后 |
+| reminder_job 发送提醒后 | `last_notification_at = now`（通过 [update_last_notification_date_and_save](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/db/models/emergency_access.rs#L203-L219)） | 重置节流计时器，下次提醒再等 24 小时 |
+| reject 后 | **不更新** | 保留原值，但下次 initiate 时会被重设 |
+
+#### 4c. 默认调度时序与注释矛盾
+
+[main.rs#L701-L703](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/main.rs#L701-L703) 的注释：
 
 > "This job should run **before** the emergency access reminders job to avoid sending reminders for requests that are about to be granted anyway."
 
-**意图**：timeout_job 应该先执行，这样对于已经满足等待期条件的请求，就不会再发送不必要的提醒。
+**注释意图**：timeout_job 先执行，把已到期的记录批准掉，这样 reminder_job 就不会为这些记录发送多余的提醒。
 
 **实际默认配置**（[config.rs#L551-L557](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/config.rs#L551-L557)）：
 
-| 任务 | cron 表达式 | 执行时间 |
-|------|-------------|----------|
-| `emergency_notification_reminder_schedule` | `0 3 * * * *` | 每小时第 3 分钟 |
-| `emergency_request_timeout_schedule` | `0 7 * * * *` | 每小时第 7 分钟 |
+| 任务 | cron 表达式 | 每小时执行时间 |
+|------|-------------|---------------|
+| `emergency_notification_reminder_schedule` | `0 3 * * * *` | 第 3 分钟 |
+| `emergency_request_timeout_schedule` | `0 7 * * * *` | 第 7 分钟 |
 
-**分析**：
+**实际执行顺序与注释意图相反**：reminder_job 先于 timeout_job 执行。后果是：在等待期到期的那个小时内，reminder_job 可能在 timeout_job 批准之前发送一次提醒，4 分钟后 timeout_job 才批准。
 
-- 实际执行顺序与注释意图**相反**：reminder_job（第 3 分钟）先于 timeout_job（第 7 分钟）执行
-- **后果**：在等待期刚好到期的那个小时内，reminder_job 会先发送"还剩 1 天"的提醒，4 分钟后 timeout_job 才执行批准操作
-- **但影响有限**：因为提醒的触发条件是 `wait_time_days - 1` 天（到期前一天），所以在到期当天 reminder_job 可能会发一次不必要的提醒（除非 `wait_time_days == 1`）
+#### 4d. 不同等待期下的逐步推演
+
+以下推演基于默认 cron 调度（reminder 在分钟 :03，timeout 在分钟 :07）。
+
+---
+
+**场景 A：`wait_time_days = 7`，发起时间 Day 0 10:00**
+
+| 字段 | 值 |
+|------|----|
+| `recovery_initiated_at` | Day 0 10:00 |
+| `last_notification_at` | Day 0 10:00 |
+| `recovery_allowed_at`（timeout 计算） | Day 7 10:00 |
+| `final_recovery_reminder_at`（reminder 条件一） | Day 6 10:00 |
+| `next_recovery_reminder_at`（reminder 条件二，首次） | Day 1 10:00 |
+
+| 时间 | 任务 | 条件一 `final ≤ now` | 条件二 `next ≤ now` | 结果 |
+|------|------|---------------------|---------------------|------|
+| Day 0 11:03 | reminder | Day 6 10:00 ≤ Day 0 11:03 ✗ | - | **不发送**（未进入提醒窗口） |
+| Day 6 10:03 | reminder | Day 6 10:00 ≤ Day 6 10:03 ✓ | Day 1 10:00 ≤ Day 6 10:03 ✓ | **发送提醒**，更新 `last_notification_at = Day 6 10:03` |
+| Day 7 10:03 | reminder | Day 6 10:00 ≤ Day 7 10:03 ✓ | Day 7 10:03 ≤ Day 7 10:03 ✓ | **发送提醒**，更新 `last_notification_at = Day 7 10:03` |
+| Day 7 10:07 | timeout | Day 7 10:00 ≤ Day 7 10:07 ✓ | - | **批准恢复** |
+
+**结论**：7 天等待期下，提醒在 Day 6 首次发出（到期前 1 天），Day 7 再发一次（到期当天，先于批准 4 分钟），然后 timeout 批准。
+
+---
+
+**场景 B：`wait_time_days = 1`，发起时间 Day 0 10:00**
+
+| 字段 | 值 |
+|------|----|
+| `recovery_initiated_at` | Day 0 10:00 |
+| `last_notification_at` | Day 0 10:00 |
+| `recovery_allowed_at`（timeout 计算） | Day 1 10:00 |
+| `final_recovery_reminder_at`（reminder 条件一） | Day 0 10:00（+0 天 = 发起时间本身） |
+| `next_recovery_reminder_at`（reminder 条件二，首次） | Day 1 10:00 |
+
+| 时间 | 任务 | 条件一 `final ≤ now` | 条件二 `next ≤ now` | 结果 |
+|------|------|---------------------|---------------------|------|
+| Day 0 10:03 | reminder | Day 0 10:00 ≤ Day 0 10:03 ✓ | Day 1 10:00 ≤ Day 0 10:03 ✗ | **不发送**（节流未通过） |
+| Day 0 11:03 ~ Day 0 23:03 | reminder | ✓ | Day 1 10:00 ≤ 各时间点 ✗ | **不发送** |
+| Day 1 10:03 | reminder | ✓ | Day 1 10:00 ≤ Day 1 10:03 ✓ | **发送提醒** |
+| Day 1 10:07 | timeout | Day 1 10:00 ≤ Day 1 10:07 ✓ | - | **批准恢复** |
+
+**结论**：1 天等待期下，提醒在到期时刻（Day 1 10:03）才首次发出，仅比批准（Day 1 10:07）早 4 分钟。原因是条件二（节流）要求距 `last_notification_at`（发起时设为 Day 0 10:00）至少 24 小时，与到期时间重合。Grantor 收到提醒时恢复几乎已被批准，提醒实际上**没有起到预警作用**。
+
+---
+
+**场景 C：`wait_time_days = 1`，发起时间 Day 0 10:05**
+
+| 字段 | 值 |
+|------|----|
+| `recovery_initiated_at` | Day 0 10:05 |
+| `last_notification_at` | Day 0 10:05 |
+| `recovery_allowed_at`（timeout 计算） | Day 1 10:05 |
+| `final_recovery_reminder_at`（reminder 条件一） | Day 0 10:05 |
+| `next_recovery_reminder_at`（reminder 条件二，首次） | Day 1 10:05 |
+
+| 时间 | 任务 | 条件一 | 条件二 | 结果 |
+|------|------|--------|--------|------|
+| Day 1 10:03 | reminder | ✓ | Day 1 10:05 ≤ Day 1 10:03 ✗ | **不发送**（10:05 > 10:03） |
+| Day 1 10:07 | timeout | Day 1 10:05 ≤ Day 1 10:07 ✓ | - | **批准恢复** |
+| Day 1 11:03 | reminder | — | — | **不再执行**（状态已非 RecoveryInitiated，查询过滤掉） |
+
+**结论**：当发起时间的分钟数落在 :03 ~ :07 之间时，1 天等待期下 reminder_job 永远不会发送提醒。timeout_job 先于下一个 reminder 周期批准了恢复，记录从查询结果中消失。
+
+---
+
+**场景 D：`wait_time_days = 1`，`last_notification_at` 为 None**
+
+代码分支（[emergency_access.rs#L797-L801](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L797-L801)）：
+
+```rust
+let next_recovery_reminder_at = if let Some(last_notification_at) = emer.last_notification_at {
+    last_notification_at + TimeDelta::try_days(1).unwrap()
+} else {
+    now  // next_recovery_reminder_at = now，条件二立即满足
+};
+```
+
+正常流程中 `last_notification_at` 在 initiate 时被设为 `now`，不会为 None。此分支为防御性回退：若数据库被手动修改或迁移导致该字段为空，则跳过节流限制，立即允许发送提醒。
+
+#### 4e. 两个任务的并发安全设计
+
+两个定时任务操作同一条记录的不同字段，代码通过**分离更新范围**来避免并发冲突：
+
+| 任务 | 更新方式 | 更新字段 |
+|------|----------|----------|
+| timeout_job | [update_access_status_and_save](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/db/models/emergency_access.rs#L178-L201) | 仅 `status` + `updated_at` |
+| reminder_job | [update_last_notification_date_and_save](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/db/models/emergency_access.rs#L203-L219) | 仅 `last_notification_at` + `updated_at` |
+
+代码注释明确说明（[L741-L742](file:///d:/fz/0601/solo-dogfeeding/code/5-vaultwarden/src/api/core/emergency_access.rs#L741-L742)）：
+
+> "Only update the access status. Updating the whole record could cause issues when the emergency_notification_reminder_job is also active"
+
+若使用 `save()` 更新整条记录，可能产生 last-write-wins 的覆盖问题。通过分离字段更新，两个任务可以在同一小时内安全地分别执行。
 
 ### 阶段 5：授权生效后的操作（RecoveryApproved）
 
@@ -313,7 +440,7 @@ if data.key_encrypted.is_some() {
 |------|------|
 | 邀请 JWT 过期 | 由 `INVITATION_EXPIRATION_HOURS` 控制（默认值取决于配置），过期后 accept 请求会被 JWT 验证拒绝 |
 | 等待期超时自动批准 | `recovery_initiated_at + wait_time_days <= now` 时由 `emergency_request_timeout_job` 自动批准 |
-| 提醒通知时机 | 等待期到期前 1 天发送最终提醒，之后每 24 小时发送一次 |
+| 提醒通知时机 | 进入到期前 1 天窗口后发送，之后每 24 小时一次（受 `last_notification_at` 节流控制）；`wait_time_days = 1` 时提醒与批准几乎同时或根本不发送（详见 §4d 推演） |
 | 无整体过期 | 紧急访问关系本身**不会过期**，除非被主动删除 |
 
 ---
