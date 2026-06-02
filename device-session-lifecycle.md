@@ -691,186 +691,153 @@ nt.send_logout(&user, Some(&headers.device), &conn).await;  // 排除当前设�
 
 而 KDF 变更是原子操作——客户端在一次请求中同时提交新的认证数据和加密密钥，无需后续步骤，因此不需要例外窗口。
 
-### 10.5 stamp_exception 在密钥轮换后的状态
+### 10.5 密钥轮换后旧访问令牌仍可继续使用例外窗口
 
-[post_rotatekey()](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/api/core/accounts.rs#L797-L917) 内部再次调用 `set_password(..., true, None, &conn)`，即**再次重置安全戳但不设置新的 stamp_exception**。
+[post_rotatekey()](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/api/core/accounts.rs#L797-L917) 内部调用 `set_password(..., true, None, &conn)`，即再次重置安全戳但不设置新的 stamp_exception。
 
-注意 [reset_security_stamp()](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/db/models/user.rs#L217-L221) 不会清除 `stamp_exception` 字段。但此时 `stamp_exception` 中保存的旧安全戳与新生成的安全戳已完全不同，且例外的2分钟窗口在正常流程下也已过期，因此**残留的 stamp_exception 不会被误用**。
+**关键**：[reset_security_stamp()](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/db/models/user.rs#L217-L221) **不会清除** `stamp_exception` 字段。这意味着密码变更时写入的 stamp_exception 在密钥轮换后仍然有效——旧访问令牌在 2 分钟窗口内**仍然可以访问那 4 个例外路由**。
 
-过期清理机制：当请求守卫检测到 stamp_exception 已过期时，[auth.rs L664-L671](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/auth.rs#L664-L671) 会主动调用 `user.reset_stamp_exception()` 并保存用户记录，将过期的例外从数据库中清除。
+#### 状态时序
+
+```
+T0: 密码变更前
+    user.security_stamp = S0
+    access_token.sstamp = S0
+
+T1: post_password 完成
+    set_password(allow_next_route: Some([...]))
+      ① set_stamp_exception() → stamp_exception = { routes: [4个], security_stamp: S0, expire: T1+2min }
+      ② reset_security_stamp() → user.security_stamp = S1, refresh_token 全部轮换
+
+    此时：旧 access_token (sstamp=S0) 可通过例外访问 4 个路由 ✓
+
+T2: post_rotatekey 完成（约 T1 后几秒到几十秒）
+    set_password(allow_next_route: None)
+      ① allow_next_route = None → 不调用 set_stamp_exception，stamp_exception 不变
+      ② reset_security_stamp() → user.security_stamp = S2, refresh_token 再次轮换
+
+    此时：旧 access_token (sstamp=S0) 仍可通过例外访问 4 个路由 ✓
+          因为 stamp_exception = { security_stamp: S0, expire: T1+2min } 未被修改
+```
+
+#### 验证逻辑
+
+请求守卫 [auth.rs L653-L677](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/auth.rs#L653-L677) 的判断步骤：
+
+```
+1. user.security_stamp (S2) != claims.sstamp (S0)  → 不匹配，进入例外分支
+2. stamp_exception 存在  → 继续
+3. now <= expire (T1+2min)  → 未过期，继续
+4. current_route ∈ stamp_exception.routes  → 路由匹配，继续
+5. stamp_exception.security_stamp (S0) == claims.sstamp (S0)  → 安全戳匹配，放行
+```
+
+步骤 5 是关键：守卫拿例外中保存的 `security_stamp` 和 JWT 中的 `claims.sstamp` 比较，**不与** `user.security_stamp` 比较。密钥轮换只改了 `user.security_stamp`（从 S1 变 S2），例外里的 S0 不受影响，所以 S0 == S0 仍然成立。
+
+#### 安全边界
+
+虽然旧令牌仍可访问 4 个例外路由，但实际风险有限：
+
+- 仅限 4 个特定路由，其余路由一律 401
+- 2 分钟硬限制，从密码变更时算起，密钥轮换后剩余时间更短
+- refresh_token 在 T1 时已轮换，无法用旧令牌续期
+- `post_rotatekey` 本身就是例外的核心用途，属于预期行为
+- `get_contacts`、`get_public_keys`、`get_api_webauthn` 都是只读接口
 
 ---
 
-### 10.6 例外窗口内的可用路由边界
+### 10.6 例外窗口内可放行的 4 个路由
 
-密码变更时设置的 stamp_exception 只放行 4 个路由，其余路由即使携带旧访问令牌也会被拒绝。
+| 路由名称 | 实际端点 | 用途 |
+|---------|---------|------|
+| `post_rotatekey` | `POST /accounts/key-management/rotate-user-account-keys` | 重新加密所有用户数据（密钥轮换核心接口） |
+| `get_contacts` | `GET /emergency-access/trusted` | 获取紧急访问联系人列表（只读） |
+| `get_public_keys` | `GET /users/<user_id>/public-key` | 获取指定用户公钥（只读） |
+| `get_api_webauthn` | `GET /webauthn` | WebAuthn 配置占位，始终返回空列表（只读） |
 
-| 路由名称 | 实际端点 | 用途 | 是否在例外列表 |
-|---------|---------|------|--------------|
-| `post_rotatekey` | `POST /accounts/key-management/rotate-user-account-keys` | 重新加密所有用户数据（核心） | ✅ 是 |
-| `get_contacts` | `GET /emergency-access/trusted` | 获取紧急访问联系人列表 | ✅ 是 |
-| `get_public_keys` | `GET /users/<user_id>/public-key` | 获取指定用户公钥 | ✅ 是 |
-| `get_api_webauthn` | `GET /webauthn` | 获取 WebAuthn 配置（空响应占位） | ✅ 是 |
-| 其他所有路由 | 如 `GET /sync`、`GET /ciphers` 等 | - | ❌ 否 |
-
-**路由匹配机制**：[auth.rs L673-L674](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/auth.rs#L673-L674)
-```rust
-} else if !stamp_exception.routes.contains(&current_route.to_owned()) {
-    err_handler!("Invalid security stamp: Current route and exception route do not match")
-}
-```
-使用 Rocket 路由名称做精确字符串匹配，不支持通配符。
-
-**四个路由的具体用途**：
-
-1. **[post_rotatekey](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/api/core/accounts.rs#L797-L917)**
-   - 密钥轮换的核心接口，重新加密所有用户数据
-   - 接受完整的加密后的 cipher、folder、send、emergency access 数据
-   - 内部会再次重置安全戳（第三次）
-
-2. **[get_contacts](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/api/core/emergency_access.rs#L49-L67)**
-   - 获取紧急访问（Emergency Access）的联系人列表
-   - 密钥轮换过程中可能需要获取这些信息
-
-3. **[get_public_keys](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/api/core/accounts.rs#L472-L484)**
-   - 获取指定用户的公钥
-   - 密钥轮换时可能需要重新加密共享数据
-
-4. **[get_api_webauthn](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/api/core/mod.rs#L199-L208)**
-   - 占位接口，始终返回空列表
-   - 兼容官方客户端在密钥轮换时的调用，防止 404 错误
+路由匹配使用 Rocket 路由名称做精确字符串匹配，不支持通配符或前缀匹配（[auth.rs L673-L674](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/auth.rs#L673-L674)）。不在列表中的路由一律返回 401，且不会清除 stamp_exception。
 
 ---
 
-### 10.7 密钥轮换完成后旧令牌的残留可用性
+### 10.7 例外的失效条件
 
-**关键发现**：密钥轮换完成后，stamp_exception 仍然存在，旧访问令牌在 2 分钟窗口内**仍然可以访问这 4 个例外路由**。
+stamp_exception 只会在以下条件之一满足时失效或被清除。
 
-#### 状态时序分析
+#### 条件一：2 分钟窗口到期（最终失效）
 
-```
-时间点 T0：密码变更前
-  user.security_stamp = S0
-  当前设备 access_token 中的 sstamp = S0
+**触发**：`Utc::now().timestamp() > stamp_exception.expire`
 
-时间点 T1：post_password 完成后
-  set_password(allow_next_route: Some([...])) 执行
-  ① set_stamp_exception() 被调用
-    stamp_exception.security_stamp = S0  ← 保存旧安全戳
-    stamp_exception.expire = T1 + 2分钟
-  ② reset_security_stamp() 执行
-    user.security_stamp = S1
-    rotate_refresh_tokens → 当前设备 refresh_token 变更
-
-  ★ 此时：旧 access_token (sstamp=S0) 可以访问 4 个例外路由
-```
-
-```
-时间点 T2：post_rotatekey 执行中（约 T1 之后几秒到几十秒）
-  set_password(allow_next_route: None) 执行
-  ① allow_next_route 为 None → 不调用 set_stamp_exception
-    stamp_exception 仍然是 { security_stamp: S0, expire: T1+2min }
-  ② reset_security_stamp() 执行
-    user.security_stamp = S2  ← 再次变更
-    rotate_refresh_tokens → 当前设备 refresh_token 再次变更
-
-  ★ 此时：旧 access_token (sstamp=S0) 仍然可以访问 4 个例外路由！
-     因为 stamp_exception.security_stamp 还是 S0，且未过期
-```
-
-**验证逻辑**：[auth.rs L653-L677](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/auth.rs#L653-L677)
-```rust
-if user.security_stamp != claims.sstamp {           // S2 != S0 → true，进入例外分支
-    if let Some(stamp_exception) {
-        if Utc::now().timestamp() > stamp_exception.expire {  // 还没过期，通过
-        } else if !stamp_exception.routes.contains(&current_route) {  // 路由匹配，通过
-        } else if stamp_exception.security_stamp != claims.sstamp {   // S0 == S0 → 匹配！通过
-        }
-    }
-}
-```
-
-**安全边界**：
-- 仅限 4 个只读或受控的特定路由
-- 2 分钟硬限制
-- 仅限持有旧访问令牌的客户端
-- refresh_token 早已在 T1 时就失效，无法续期
-
----
-
-### 10.8 例外令牌的提前失效与最终失效
-
-stamp_exception 不是必须等满 2 分钟才失效，存在多种提前失效路径。
-
-#### 10.8.1 最终失效：时间窗口过期
-
-**触发条件**：`Utc::now().timestamp() > stamp_exception.expire`
-
-**执行路径**：[auth.rs L664-L672](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/auth.rs#L664-L672)
+**执行**：[auth.rs L664-L672](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/auth.rs#L664-L672)
 ```rust
 if Utc::now().timestamp() > stamp_exception.expire {
-    // 过期时主动从数据库清除
     let mut user = user;
-    user.reset_stamp_exception();
-    if let Err(e) = user.save(&conn).await {
-        error!("Error updating user: {e:#?}");
-    }
+    user.reset_stamp_exception();    // 清除
+    user.save(&conn).await;          // 持久化
     err_handler!("Stamp exception is expired")
 }
 ```
 
-**注意**：这是**延迟清理**机制——stamp_exception 字段会一直保留在数据库中，直到**下一次携带旧安全戳令牌的请求到来**时才会被检测到并清除。如果没有后续请求，它会永久残留但不会产生实际影响。
+这是**唯一会主动清除** stamp_exception 的路径。清除是延迟触发——需要等到下一次携带旧安全戳令牌的请求到来时才会执行。如果 2 分钟内没有旧令牌请求，stamp_exception 会残留在数据库中但无法被利用（因为已过期）。
 
-#### 10.8.2 提前失效路径一：路由不匹配被拒绝
+#### 条件二：访问非例外路由（被拒绝，但例外不被清除）
 
-**触发条件**：携带旧安全戳令牌访问不在例外列表中的任意路由
+**触发**：携带旧令牌访问不在 4 个例外路由中的任意端点
 
-**执行路径**：[auth.rs L673-L674](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/auth.rs#L673-L674)
+**执行**：[auth.rs L673-L674](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/auth.rs#L673-L674)
 ```rust
 } else if !stamp_exception.routes.contains(&current_route.to_owned()) {
     err_handler!("Invalid security stamp: Current route and exception route do not match")
 }
 ```
 
-**注意**：这种情况**不会清除** stamp_exception，只是返回 401。stamp_exception 对例外路由的放行能力仍然存在，直到时间窗口过期。
+**注意**：仅拒绝当前请求，**不清除** stamp_exception。下一次请求如果命中例外路由，仍然放行。
 
-#### 10.8.3 提前失效路径二：安全戳不匹配
+#### 条件三：例外中的安全戳与令牌中的不一致（被拒绝，例外不被清除）
 
-**触发条件**：例外中保存的安全戳与 JWT 中的不匹配
+**触发**：`stamp_exception.security_stamp != claims.sstamp`
 
-**执行路径**：[auth.rs L675-L676](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/auth.rs#L675-L676)
+**执行**：[auth.rs L675-L676](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/auth.rs#L675-L676)
 ```rust
 } else if stamp_exception.security_stamp != claims.sstamp {
     err_handler!("Invalid security stamp for matched stamp exception")
 }
 ```
 
-这种情况比较少见，通常发生在：
-- 多次密码变更后，中间某次的 stamp_exception 残留
-- 客户端使用了更早的旧令牌
+正常密码变更→密钥轮换流程中不会出现此情况。它只在客户端持有多代旧令牌（如更早之前的 access_token）时才会触发。
 
-#### 10.8.4 提前失效路径三：其他用户操作隐式覆盖
+#### 条件四：set_stamp_exception 被再次调用（覆盖旧的例外）
 
-**触发条件**：在 2 分钟窗口内再次调用会重置安全戳的接口
+**触发**：在 2 分钟窗口内再次执行密码变更
 
-| 操作 | 对 stamp_exception 的影响 |
-|------|------------------------|
-| 再次密码变更 | 新的 set_password 会调用 set_stamp_exception，覆盖旧的例外 |
-| 邮箱变更 | set_password(allow_next_route: None)，不清除旧例外，但安全戳再次变更 |
-| 管理员踢出 | 不直接清除 stamp_exception，但设备被删、用户可能被禁用 |
-| 安全戳重置 (sstamp) | 不直接清除 stamp_exception，但设备被删 |
+[set_stamp_exception()](file:///d:/fz/0601/solo-dogfeeding/code/3-vaultwarden/src/db/models/user.rs#L230-L237) 会用新的例外覆盖旧的，包括新的 `security_stamp` 和新的 `expire` 时间。旧例外彻底丢失。
 
-#### 10.8.5 失效状态汇总
+#### 条件五：设备被删除（间接失效）
 
-| 场景 | 例外路由是否可用 | 非例外路由是否可用 | stamp_exception 状态 |
-|------|----------------|------------------|--------------------|
-| 密码变更后，窗口内，访问例外路由 | ✅ 可用 | ❌ 不可用 | 保留 |
-| 密钥轮换后，窗口内，访问例外路由 | ✅ 可用 | ❌ 不可用 | 保留 |
-| 密码变更后，窗口内，访问非例外路由 | ✅ 仍可用 | ❌ 不可用 | 保留（仅拒绝当前请求） |
-| 时间窗口过期后，任意请求 | ❌ 不可用 | ❌ 不可用 | 被清除 |
-| 2 分钟内无任何旧令牌请求 | - | - | 残留但无害 |
+**触发**：管理员踢出、禁用用户、安全戳重置等操作
 
----
+这些操作会删除设备记录。虽然 stamp_exception 可能仍残留在用户记录中，但请求守卫在验证安全戳**之前**会先查找设备：
+
+```rust
+// auth.rs L645-L647
+let Some(device) = Device::find_by_uuid_and_user(&device_id, &user_id, &conn).await else {
+    err_handler!("Invalid device id")
+};
+```
+
+设备不存在时直接返回错误，不会进入安全戳验证逻辑，stamp_exception 根本不会被检查。
+
+#### 失效条件汇总
+
+| 条件 | 结果 | stamp_exception 是否被清除 |
+|------|------|--------------------------|
+| 2 分钟到期 + 旧令牌请求到来 | 请求被拒绝 | ✅ 清除并持久化 |
+| 2 分钟到期 + 无旧令牌请求 | 无法利用（过期） | ❌ 残留但无害 |
+| 访问非例外路由 | 当前请求被拒绝，例外路由仍可用 | ❌ 不清除 |
+| 安全戳不匹配 | 当前请求被拒绝 | ❌ 不清除 |
+| 再次密码变更 | 旧例外被新例外覆盖 | ✅ 被覆盖 |
+| 设备被删除 | 请求在设备检查阶段被拒 | ❌ 可能残留，但无法触达验证逻辑 |
+
+**核心结论**：在正常的密码变更→密钥轮换流程中，旧访问令牌从密码变更那一刻起有 2 分钟时间可以访问 4 个例外路由，直到时间窗口到期被清除为止。中间没有任何操作会主动清除这份例外——密钥轮换不会，访问非例外路由不会，路由不匹配也不会。唯一的终止条件是时间到期后下一次旧令牌请求触发清除，或者用户再次执行密码变更覆盖旧的例外。
 
 ## 11. 相关文件索引
 
