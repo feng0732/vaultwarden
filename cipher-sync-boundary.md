@@ -127,6 +127,63 @@ pub async fn save(&mut self, conn: &DbConn) -> EmptyResult {
 | 修订传播 | 通过 `update_users_revision` 通知所有相关用户 |
 | 推送通知 | 通过 WebSocket 实时同步 |
 
+### 2.5 条目版本时间变化时机详解
+
+**核心原则**：只有调用 `cipher.save()` 才会更新 `cipher.updated_at`（条目本身版本）。
+
+#### ✅ 改变条目版本的操作（调用 `save()`）
+
+| 操作 | 说明 | 代码位置 |
+|------|------|---------|
+| **创建新条目** | `Cipher::new()` + `save()` | [src/api/core/ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/api/core/ciphers.rs#L361-L375) |
+| **更新条目内容** | 修改 name/notes/fields/data 等字段 | [src/api/core/ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/api/core/ciphers.rs#L680-L706) |
+| **软删除** | 设置 `deleted_at` 字段 | [src/api/core/ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/api/core/ciphers.rs#L1785-L1787) |
+| **从回收站恢复** | 清除 `deleted_at` 字段 | [src/api/core/ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/api/core/ciphers.rs#L1872-L1873) |
+| **分享到组织** | 转换所有权 + 更新字段 | [src/api/core/ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/api/core/ciphers.rs#L1028-L1077) |
+| **添加/删除附件** | 触发条目版本更新 | [src/api/core/ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/api/core/ciphers.rs#L1317-L1325) |
+
+**`save()` 方法内部实现** ([src/db/models/cipher.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/cipher.rs#L442-L474)):
+```rust
+pub async fn save(&mut self, conn: &DbConn) -> EmptyResult {
+    self.update_users_revision(conn).await;     // 更新用户修订
+    self.updated_at = Utc::now().naive_utc();   // ⬅️ 条目版本时间戳更新
+    // 数据库操作...
+}
+```
+
+#### ❌ 不改变条目版本的操作（只更新用户修订）
+
+这些操作只调用 `User::update_uuid_revision()`，**不**调用 `cipher.save()`，因此：
+- `cipher.updated_at` **不变**（条目版本不变）
+- `user.updated_at` **变化**（用户同步修订变化）
+
+| 操作 | 说明 | 代码位置 |
+|------|------|---------|
+| **移动到文件夹** | 修改 FolderCipher 关联表 | [src/db/models/cipher.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/cipher.rs#L518-L551) |
+| **收藏/取消收藏** | 修改 favorites 关联表 | [src/db/models/favorite.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/favorite.rs#L34-L68) |
+| **归档/取消归档** | 修改 archives 关联表 | [src/db/models/archive.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/archive.rs#L36-L81) |
+| **创建/更新文件夹** | 文件夹本身的操作 | [src/db/models/folder.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/folder.rs#L75-L107) |
+| **删除文件夹** | 删除文件夹本身 | [src/db/models/folder.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/folder.rs#L109-L119) |
+| **批量移动条目** | 多个条目移动文件夹 | [src/api/core/ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/api/core/ciphers.rs#L1593-L1645) |
+
+**用户修订更新实现** ([src/db/models/user.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/user.rs#L351-L386)):
+```rust
+pub async fn update_uuid_revision(uuid: &UserId, conn: &DbConn) {
+    // 只更新 users.updated_at，不影响 ciphers 表
+    Self::update_revision_impl(uuid, &Utc::now().naive_utc(), conn).await;
+}
+```
+
+#### 📊 两种版本变化的区别
+
+| 维度 | 条目版本 (`cipher.updated_at`) | 用户修订 (`user.updated_at`) |
+|------|-------------------------------|-----------------------------|
+| **触发条件** | 调用 `cipher.save()` | 调用 `User::update_uuid_revision()` |
+| **影响范围** | 所有能看到该条目的用户 | 仅单个用户 |
+| **同步信号** | `SyncCipherUpdate` (精确推送) | `SyncCiphers` / `SyncVault` (广播) |
+| **客户端行为** | 需要合并/刷新单个条目 | 需要重新同步整个 vault |
+| **版本冲突检测** | ✅ 用于乐观锁检测 | ❌ 不用于冲突检测 |
+
 ---
 
 ## 3. 同步数据结构 (`CipherSyncData`)
@@ -165,9 +222,65 @@ pub enum CipherSyncType {
 }
 ```
 
-**区别**:
-- `User` 类型：加载文件夹、收藏、归档等用户个人数据
-- `Organization` 类型：跳过上述用户个人数据，避免 web-vault 显示问题
+#### 🔄 个人同步 vs 组织同步：用户侧状态返回差异
+
+**核心原则**：用户侧状态（文件夹、收藏、归档）是**用户级**属性，不是 cipher 本身的属性。
+
+| 用户侧状态 | 个人同步 (`User`) | 组织同步 (`Organization`) | 存储位置 |
+|-----------|-------------------|-------------------------|---------|
+| **`folderId`** | ✅ 返回（用户所在文件夹） | ❌ 不返回（始终 null） | `folders_ciphers` 表 |
+| **`favorite`** | ✅ 返回（是否收藏） | ❌ 不返回（始终 false） | `favorites` 表 |
+| **`archivedDate`** | ✅ 返回（归档时间） | ❌ 不返回（始终 null） | `archives` 表 |
+| **`edit`** | ✅ 返回（可编辑权限） | ❌ 不返回 | 权限计算 |
+| **`viewPassword`** | ✅ 返回（密码可见性） | ❌ 不返回 | 权限计算 |
+| **`permissions`** | ✅ 返回（删除/恢复权限） | ❌ 不返回 | 权限计算 |
+
+#### CipherSyncData 数据加载差异 ([src/api/core/ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/api/core/ciphers.rs#L2119-L2142))
+
+```rust
+match sync_type {
+    // User 同步：批量加载用户个人数据
+    CipherSyncType::User => {
+        cipher_folders = FolderCipher::find_by_user(user_id, conn).await.into_iter().collect();
+        cipher_favorites = Favorite::get_all_cipher_uuid_by_user(user_id, conn).await.into_iter().collect();
+        cipher_archives = Archive::find_by_user(user_id, conn).await.into_iter().collect();
+    }
+    // Organization 同步：跳过用户个人数据
+    CipherSyncType::Organization => {
+        cipher_folders = HashMap::with_capacity(0);    // 空
+        cipher_favorites = HashSet::with_capacity(0);  // 空
+        cipher_archives = HashMap::with_capacity(0);   // 空
+    }
+}
+```
+
+#### to_json 输出字段差异 ([src/db/models/cipher.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/cipher.rs#L373-L399))
+
+```rust
+// 这些字段仅在 User 同步类型时返回
+if sync_type == CipherSyncType::User {
+    json_object["folderId"] = ...;      // 文件夹 ID
+    json_object["favorite"] = ...;      // 是否收藏
+    json_object["archivedDate"] = ...;  // 归档时间
+    json_object["edit"] = ...;          // 可编辑
+    json_object["viewPassword"] = ...;  // 密码可见
+    json_object["permissions"] = ...;   // 权限对象
+}
+```
+
+#### 🌐 两种同步的使用场景
+
+| 场景 | 使用同步类型 | API 端点 |
+|------|-------------|---------|
+| **用户登录后全量同步** | `User` | `GET /sync` |
+| **用户获取个人 vault 列表** | `User` | `GET /ciphers` |
+| **组织管理员查看组织 vault** | `Organization` | `GET /organizations/<id>/details` |
+| **组织导出/批量操作** | `Organization` | 内部调用 |
+
+**设计意图**：
+- 组织 vault 是共享的，不应该包含任何用户个人的分类信息
+- 避免 web-vault 在组织管理界面显示个人文件夹/收藏等无关信息
+- 减少不必要的数据传输
 
 ### 3.4 同步接口 (`sync`)
 
@@ -383,7 +496,7 @@ Some((read_only, hide_passwords, manage)) =>
   "id": "uuid",
   "type": 1,
   "creationDate": "ISO时间",
-  "revisionDate": "ISO时间",
+  "revisionDate": "ISO时间",  // 对应 cipher.updated_at（条目版本）
   "deletedDate": "ISO时间或null",
   "reprompt": 0,
   "organizationId": "uuid或null",
@@ -397,7 +510,7 @@ Some((read_only, hide_passwords, manage)) =>
   "passwordHistory": [...],
   "login/secureNote/card/identity/sshKey": {...},
   
-  // User 同步类型特有字段
+  // ⬇️ User 同步类型特有字段（用户侧状态） ⬇️
   "folderId": "uuid或null",
   "favorite": true/false,
   "archivedDate": "ISO时间或null",
@@ -409,6 +522,20 @@ Some((read_only, hide_passwords, manage)) =>
   }
 }
 ```
+
+### 7.3 版本字段说明
+
+| 字段 | 对应数据 | 含义 | 变化时机 |
+|------|---------|------|---------|
+| `creationDate` | `cipher.created_at` | 条目创建时间 | 永不变化 |
+| `revisionDate` | `cipher.updated_at` | 条目的**内容版本** | 调用 `cipher.save()` 时变化 |
+| `deletedDate` | `cipher.deleted_at` | 软删除时间 | 软删除/恢复时变化 |
+| `archivedDate` | `archive.archived_at` | 用户个人归档时间 | 归档/取消归档时变化（仅个人同步） |
+
+**重要提示**：
+- `revisionDate` 是条目本身的版本，用于乐观锁冲突检测
+- 用户侧操作（移动文件夹、收藏、归档）不会改变 `revisionDate`
+- 但这些操作会更新用户的 `user.updated_at`，触发重新同步
 
 ### 7.2 数据兼容性处理
 
