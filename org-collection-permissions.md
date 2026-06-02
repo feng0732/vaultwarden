@@ -306,12 +306,101 @@ pub fn to_json_details_for_member(&self, membership_type: i32) -> Value {
 
 核心差异：**用户同步时普通 User 的 manage=true 被角色门槛过滤掉**，而在管理员视角和集合成员视角则保留原始配置。
 
-### 4.5 CipherSyncData 中组权限的预合并
+### 4.5 group access_all 同步链：三个方法怎样配合
+
+`/sync` 时集合的同步涉及三个方法的精密配合：
+
+#### 第一环：Collection.find_by_user_uuid() — 找出哪些集合应该出现
+
+在 [collection.rs](file:///d:/fz/0601/solo-dogfeeding/code/2-vaultwarden/src/db/models/collection.rs#L225-L301) 中，通过一个复杂的多表 JOIN 查询，一次性找出用户能访问的所有集合：
+
+```rust
+// 开启 groups 功能时的查询
+collections::table
+    .left_join(users_collections...)          // 用户直接分配
+    .left_join(users_organizations...)        // 成员身份
+    .left_join(groups_users...)               // 组成员
+    .left_join(groups...)                     // 组本身
+    .left_join(collections_groups...)         // 组-集合关联
+    .filter(users_organizations::status.eq(Confirmed))
+    .filter(
+        users_collections::user_uuid.eq(user_uuid)                 // 1. 用户直分
+            .or(users_organizations::access_all.eq(true))           // 2. 组织级 access_all
+            .or(groups::access_all.eq(true))                        // 3. 组级 access_all
+            .or(collections_groups::collections_uuid.is_not_null()) // 4. 通过组分配到特定集合
+    )
+    .select(collections::all_columns)
+    .distinct()  // 去重，用户可能通过多渠道访问同一集合
+```
+
+**关键发现**：
+
+1. 条件 3 `groups::access_all.eq(true)` 会拉取用户所在 access_all 组所属组织的**所有集合**，不需要该集合与组有任何显式关联（即 collections_groups 表中没有记录）。
+
+2. 这意味着即使 access_all 组没有在 collections_groups 表中为每个集合创建记录，用户也能看到该组织的**全部集合**。
+
+#### 第二环：CollectionGroup.find_by_user() — 只返回有显式关联的组权限
+
+在 [group.rs](file:///d:/fz/0601/solo-dogfeeding/code/2-vaultwarden/src/db/models/group.rs#L398-L421) 中：
+
+```rust
+pub async fn find_by_user(user_uuid: &UserId, conn: &DbConn) -> Vec<Self> {
+    collections_groups::table
+        .inner_join(groups_users...)
+        .inner_join(users_organizations...)
+        .inner_join(groups...)
+        .inner_join(collections...)
+        .filter(users_organizations::user_uuid.eq(user_uuid))
+        .select(collections_groups::all_columns)  // 只返回 collections_groups 表中有记录的
+}
+```
+
+**重要限制**：这个方法通过 `INNER JOIN collections_groups`，**只返回组与集合有显式关联的记录**。access_all 组通常不在 collections_groups 中为每个集合创建记录，所以这些记录**不会被返回**。
+
+#### 第三环：Collection.to_json_details() — 对 access_all 组"看不见"的集合使用路径 C
+
+回到 [collection.rs](file:///d:/fz/0601/solo-dogfeeding/code/2-vaultwarden/src/db/models/collection.rs#L93-L147)，当集合出现在同步结果中时，会调用此方法计算 readOnly/hidePasswords/manage。
+
+对于 access_all 组的用户：
+- 第一环让用户**看到所有集合**（通过 `groups::access_all.eq(true)` 条件）
+- 但第二环 **没有为这些集合返回 CollectionGroup 记录**（因为 collections_groups 表中没有）
+- 所以在第三环中，`user_collections_groups.get(&self.uuid)` 返回 `None`
+- 代码走到路径 C 的 else 分支，返回 `(false, false, false)`
+
+```rust
+// 实际发生的情况
+else if let Some(cg) = cipher_sync_data.user_collections_groups.get(&self.uuid) {
+    // access_all 组的集合走不到这里，因为 find_by_user() 没返回记录
+} else {
+    (false, false, false)  // 走到这里！
+}
+```
+
+#### 为什么不会自动生成覆盖所有集合的组权限记录？
+
+有三个原因：
+
+**1. 设计策略：不需要**
+
+`find_by_user_uuid()` 中的 `groups::access_all.eq(true)` 条件已经通过数据库 JOIN 让用户看到了所有集合，不需要在 collections_groups 表中为每个集合创建物理记录。
+
+**2. 数据量爆炸风险**
+
+如果 access_all 组需要为每个集合创建 CollectionGroup 记录，那么：
+- 一个组织有 N 个集合、M 个 access_all 组 → 需要 M×N 条记录
+- 每创建一个新集合 → 需要为所有 access_all 组插入记录
+- 这会导致数据量随集合数线性增长，维护成本高
+
+**3. Cipher 级别有短路检查兜底**
+
+在 Cipher 访问权限检查中，`is_in_full_access_group()` 会短路返回 `(false, false, true)`，即使集合级权限返回 `(false, false, false)`，用户也能正常访问和编辑条目。
+
+### 4.6 CipherSyncData 中组权限的预合并
 
 在 [ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/2-vaultwarden/src/api/core/ciphers.rs#L2175-L2193) 中，CipherSyncData 构建时对同一集合的多个组权限做了**预合并**：
 
 ```rust
-let user_collections_groups: HashMap<CollectionId, CollectionGroup> =
+let user_collections_groups: HashMap<CollectionId, CollectionGroup> = 
     CollectionGroup::find_by_user(user_id, conn).await.into_iter().fold(
         HashMap::new(),
         |mut combined_permissions, cg| {
@@ -330,6 +419,8 @@ let user_collections_groups: HashMap<CollectionId, CollectionGroup> =
 
 这意味着在 CipherSyncData 中，**每个集合只保留一个合并后的组权限记录**，而非多个组的原始记录。合并规则与 Cipher 的多集合合并完全一致。
 
+但请记住：access_all 组的集合**不会出现在这里**，因为 `CollectionGroup::find_by_user()` 只返回有显式关联的记录。
+
 ---
 
 ## 五、group full access 为什么不再返回单独 collection
@@ -339,7 +430,7 @@ let user_collections_groups: HashMap<CollectionId, CollectionGroup> =
 在 [to_json_user_details()](file:///d:/fz/0601/solo-dogfeeding/code/2-vaultwarden/src/db/models/organization.rs#L556-L562) 中：
 
 ```rust
-let full_access_group = CONFIG.org_groups_enabled()
+let full_access_group = CONFIG.org_groups_enabled() 
     && Group::is_in_full_access_group(&self.user_uuid, &self.org_uuid, conn).await;
 
 let collections: Vec<Value> = if include_collections && !(full_access_group || self.access_all) {
@@ -380,7 +471,18 @@ pub async fn is_in_full_access_group(user_uuid: &UserId, org_uuid: &Organization
 
 **第三，减少数据冗余和不一致风险**。如果组内集合变更，而成员详情中的 collections 没同步更新，就会出现不一致。只保留组 ID 引用，让客户端按需查询，是更干净的做法。
 
-### 5.3 同一用户既被直接分配又在 full_access 组中的处理
+### 5.3 与 /sync 的本质区别
+
+| 场景 | 检查 group access_all 位置 | 集合可见性 | 权限值来源 |
+|------|------------------------|----------|----------|
+| 成员详情（管理员看） | `to_json_user_details()` 开头，显式判断 | full_access 时 collections 为空 | N/A |
+| 用户自己 /sync | `find_by_user_uuid()` 中通过 JOIN 隐式拉取所有集合 | 显示所有集合 | 无对应 CollectionGroup 记录时用默认 `(false, false, false)` |
+
+这是两个完全独立的判断路径：
+- 成员详情**显式检查**并决定是否隐藏集合列表
+- 用户同步**通过数据库 JOIN 隐式**拉取所有集合，但不生成对应的权限记录
+
+### 5.4 同一用户既被直接分配又在 full_access 组中的处理
 
 回到 [to_json_user_details()](file:///d:/fz/0601/solo-dogfeeding/code/2-vaultwarden/src/db/models/organization.rs#L562)：
 
