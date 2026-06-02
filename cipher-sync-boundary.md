@@ -74,6 +74,132 @@ pub async fn save(&mut self, conn: &DbConn) -> EmptyResult {
   - 直接访问集合的用户
   - 通过组访问集合的用户（如果启用了组功能）
 
+#### 🔬 组织条目改动时，哪些用户的同步修订会被刷新？
+
+当组织条目被修改（调用 `cipher.save()` 或 `cipher.delete()`），`update_users_revision()` 会被触发。此方法的核心逻辑是根据**条目归属**分两条路径：
+
+**路径 A：个人条目**（`cipher.user_uuid = Some(...)`）
+
+```rust
+Some(ref user_uuid) => {
+    User::update_uuid_revision(user_uuid, conn).await;  // 只刷新 1 个用户
+    user_uuids.push(user_uuid.clone());
+}
+```
+
+只刷新条目拥有者本人。因为个人条目只有拥有者能看到。
+
+**路径 B：组织条目**（`cipher.user_uuid = None`）
+
+```rust
+None => {
+    if let Some(ref org_uuid) = self.organization_uuid {
+        // 第一批：通过集合直接访问的用户
+        let mut collection_users =
+            Membership::find_by_cipher_and_org(&self.uuid, org_uuid, conn).await;
+        if CONFIG.org_groups_enabled() {
+            // 第二批：通过组间接访问的用户
+            let group_users =
+                Membership::find_by_cipher_and_org_with_group(&self.uuid, org_uuid, conn).await;
+            collection_users.extend(group_users);
+        }
+        for member in collection_users {
+            User::update_uuid_revision(&member.user_uuid, conn).await;
+            user_uuids.push(member.user_uuid.clone());
+        }
+    }
+}
+```
+
+**查询逻辑详解**：
+
+第一批——[find_by_cipher_and_org](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/organization.rs#L1053-L1073)：通过集合直接分配访问权的用户
+
+```sql
+SELECT DISTINCT users_organizations.*
+FROM users_organizations
+LEFT JOIN users_collections
+    ON users_collections.user_uuid = users_organizations.user_uuid
+LEFT JOIN ciphers_collections
+    ON ciphers_collections.collection_uuid = users_collections.collection_uuid
+    AND ciphers_collections.cipher_uuid = ?
+WHERE users_organizations.org_uuid = ?
+    AND (
+        users_organizations.access_all = true    -- 成员有"全部访问"权限
+        OR ciphers_collections.cipher_uuid = ?   -- 或者条目在用户有权限的集合中
+    )
+```
+
+第二批——[find_by_cipher_and_org_with_group](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/organization.rs#L1075-L1107)：通过组间接获得访问权的用户
+
+```sql
+SELECT DISTINCT users_organizations.*
+FROM users_organizations
+INNER JOIN groups_users
+    ON groups_users.users_organizations_uuid = users_organizations.uuid
+LEFT JOIN collections_groups
+    ON collections_groups.groups_uuid = groups_users.groups_uuid
+LEFT JOIN groups
+    ON groups.uuid = groups_users.groups_uuid
+    AND groups.organizations_uuid = users_organizations.org_uuid
+LEFT JOIN ciphers_collections
+    ON ciphers_collections.collection_uuid = collections_groups.collections_uuid
+    AND ciphers_collections.cipher_uuid = ?
+WHERE users_organizations.org_uuid = ?
+    AND (
+        groups.access_all = true                 -- 组有"全部访问"权限
+        OR ciphers_collections.cipher_uuid = ?   -- 或者条目在组有权限的集合中
+    )
+```
+
+#### 📊 组织条目改动刷新用户修订的完整决策树
+
+```
+组织条目被修改（save/delete）
+         │
+         ▼
+  cipher.organization_uuid 有值？
+    ├─ No → 不刷新任何用户（不应该发生）
+    └─ Yes → 查询该组织下有权访问此条目的用户
+              │
+              ├─ 第一批：集合直接访问用户
+              │   ├─ access_all=true 的成员（Owner/Admin/自定义全访问）
+              │   └─ 条目所在集合 → 被分配到该集合的用户
+              │
+              └─ 第二批（组功能启用时）：组间接访问用户
+                  ├─ access_all=true 的组 → 组内所有成员
+                  └─ 条目所在集合 → 被分配到该集合的组 → 组内所有成员
+              │
+              ▼
+        合并去重后，逐个调用 User::update_uuid_revision()
+        → 每个被影响用户的 user.updated_at 更新为当前时间
+        → 客户端下次同步时检测到修订变化，拉取最新数据
+```
+
+#### 🔑 关键边界情况
+
+| 场景 | 是否刷新用户修订 | 原因 |
+|------|-----------------|------|
+| 组织条目移入集合 A，用户 X 有集合 A 的访问权 | ✅ 刷新 X | X 现在能看到这个条目 |
+| 组织条目移出集合 A，用户 X 只有集合 A 的访问权 | ✅ 刷新 X | X 不再能看到这个条目，需要同步删除 |
+| 组织条目内容更新，用户 X 通过集合 A 有只读访问 | ✅ 刷新 X | X 需要看到更新后的内容 |
+| 组织 Owner/Admin 修改条目，普通成员 Y 通过组有访问权 | ✅ 刷新 Y | Y 需要同步最新数据 |
+| 组织条目改动，用户 Z 不是该组织成员 | ❌ 不刷新 | Z 完全看不到这个条目 |
+| 组织条目改动，用户 W 是组织成员但未确认（status ≠ Confirmed） | ❌ 不刷新 | SQL 过滤了 `status = Confirmed` |
+| 个人条目改动，其他用户通过组织有间接访问 | ❌ 不刷新 | 个人条目只刷新拥有者 |
+
+#### ⚠️ 特别注意：用户侧操作（收藏/归档/移文件夹）的修订刷新范围
+
+与组织条目改动的"扩散刷新"不同，用户侧操作只刷新**操作者本人**：
+
+| 操作 | 刷新范围 | 代码位置 |
+|------|---------|---------|
+| 收藏/取消收藏 | 仅操作者 | [src/db/models/favorite.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/favorite.rs#L43-L53) — `User::update_uuid_revision(user_uuid, ...)` |
+| 归档/取消归档 | 仅操作者 | [src/db/models/archive.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/archive.rs#L42) — `User::update_uuid_revision(user_uuid, ...)` |
+| 移动到文件夹 | 仅操作者 | [src/db/models/cipher.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/cipher.rs#L524) — `User::update_uuid_revision(user_uuid, ...)` |
+
+**原因**：这些是用户级属性，存储在 `(user_uuid, cipher_uuid)` 联合主键的关联表中，只影响操作者自己的视图，不影响其他用户。
+
 ### 2.3 从数据更新 Cipher (`update_cipher_from_data`)
 
 **位置**: [src/api/core/ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/api/core/ciphers.rs#L395-L576)
@@ -281,6 +407,69 @@ if sync_type == CipherSyncType::User {
 - 组织 vault 是共享的，不应该包含任何用户个人的分类信息
 - 避免 web-vault 在组织管理界面显示个人文件夹/收藏等无关信息
 - 减少不必要的数据传输
+
+#### 🔬 组织同步中用户侧状态处理的完整代码追踪
+
+用户侧状态（folderId / favorite / archivedDate / edit / viewPassword / permissions）在组织同步中的处理，需要理解**两层过滤**：
+
+**第一层：CipherSyncData 构造时就不加载用户侧数据**
+
+代码位置：[src/api/core/ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/api/core/ciphers.rs#L2137-L2141)
+
+```rust
+CipherSyncType::Organization => {
+    cipher_folders = HashMap::with_capacity(0);    // 空 HashMap
+    cipher_favorites = HashSet::with_capacity(0);  // 空 HashSet
+    cipher_archives = HashMap::with_capacity(0);   // 空 HashMap
+}
+```
+
+这意味着 `cipher_sync_data.cipher_folders`、`cipher_sync_data.cipher_favorites`、`cipher_sync_data.cipher_archives` 全部为空。即使某个条目确实在用户的某个文件夹中，组织同步的缓存数据中也查不到。
+
+**第二层：to_json() 输出时跳过所有用户侧字段**
+
+代码位置：[src/db/models/cipher.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/cipher.rs#L177-L188)
+
+```rust
+let (read_only, hide_passwords, _) = if sync_type == CipherSyncType::User {
+    if let Some((ro, hp, mn)) = self.get_access_restrictions(user_uuid, cipher_sync_data, conn).await {
+        (ro, hp, mn)
+    } else {
+        (true, true, false)
+    }
+} else {
+    (false, false, false)  // ⬅️ 组织同步直接跳过权限计算，设为默认值
+};
+```
+
+组织同步时 `get_access_restrictions()` **根本不调用**，直接返回 `(false, false, false)`。这节省了权限计算开销，但也意味着 `edit`、`viewPassword`、`permissions` 这些字段不会被计算。
+
+代码位置：[src/db/models/cipher.rs](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/db/models/cipher.rs#L373-L399)
+
+```rust
+if sync_type == CipherSyncType::User {
+    // 只有 User 同步才输出这些字段
+    json_object["folderId"] = ...;
+    json_object["favorite"] = ...;
+    json_object["archivedDate"] = ...;
+    json_object["edit"] = ...;
+    json_object["viewPassword"] = ...;
+    json_object["permissions"] = ...;
+}
+// Organization 同步时，这些字段根本不出现在 JSON 中
+```
+
+**完整结果**：组织同步返回的每个 cipher JSON 中：
+- `folderId` — **字段不存在**（不是 null，是字段缺失）
+- `favorite` — **字段不存在**
+- `archivedDate` — **字段不存在**
+- `edit` — **字段不存在**
+- `viewPassword` — **字段不存在**
+- `permissions` — **字段不存在**
+
+**为什么必须这样做？** 因为组织同步的调用方是 [get_org_details](file:///d:/fz/0601/solo-dogfeeding/code/1-vaultwarden/src/api/core/organizations.rs#L880-L910)，它只返回 cipher 列表，用于 web-vault 的组织管理视图。如果带上用户侧状态，web-vault 会错误地应用这些状态（比如给组织条目标上某个管理员的个人收藏标记）。
+
+**注意**：两种同步都会加载的数据——附件、集合、成员关系、集合权限——这些是条目的固有属性或权限框架，不受同步类型影响。
 
 ### 3.4 同步接口 (`sync`)
 
