@@ -511,3 +511,194 @@ pub const FAKE_ADMIN_UUID: &str = "00000000-0000-0000-0000-000000000000";
 5. **限流器是 `LazyLock` 初始化的**，运行时修改限流参数不会生效，需要重启。
 
 6. **配置写入是"先内存后文件"**，文件写入失败时内存已变，存在不一致风险。
+
+---
+
+## 六、启动时路由配置与运行时行为
+
+### 6.1 路由挂载的时机：启动时一次性确定
+
+理解路由挂载的时机是关键：管理面板的路由列表**只在 Rocket 启动时计算一次**，运行时修改配置不会改变已挂载的路由。
+
+在 [main.rs](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/main.rs#L584-L602) 中：
+
+```rust
+let instance = rocket::custom(config)
+    .mount([basepath, "/"].concat(), api::web_routes())
+    .mount([basepath, "/api"].concat(), api::core_routes())
+    .mount([basepath, "/admin"].concat(), api::admin_routes())  // 调用一次 routes()
+    ...
+    .ignite()
+    .await?;
+```
+
+`api::admin_routes()` 调用 [admin.rs routes()](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/api/admin.rs#L41-L75)，此时根据**启动瞬间**的配置状态决定返回哪些路由：
+
+```rust
+pub fn routes() -> Vec<Route> {
+    if !CONFIG.disable_admin_token() && !CONFIG.is_admin_token_set() {
+        return routes![admin_disabled];  // 只有一个禁用提示页
+    }
+    routes![ /* 全部 30+ 个管理路由 */ ]
+}
+```
+
+同样，[catchers()](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/api/admin.rs#L77-L83) 也只在启动时调用一次：
+
+```rust
+pub fn catchers() -> Vec<Catcher> {
+    if !CONFIG.disable_admin_token() && !CONFIG.is_admin_token_set() {
+        catchers![]  // 无 catcher
+    } else {
+        catchers![admin_login]  // 401 catcher 重定向到登录页
+    }
+}
+```
+
+**这意味着：**
+- 如果启动时 `ADMIN_TOKEN` 未设置 → 路由列表只有 `admin_disabled`，运行时**无法通过配置恢复**，必须重启
+- 如果启动时面板已启用 → 全部路由已挂载，运行时修改配置只影响认证逻辑，不影响路由存在性
+
+### 6.2 ADMIN_TOKEN 改动的生效时机
+
+`ADMIN_TOKEN` 的影响分散在三个不同的检查点，生效时机各不相同：
+
+| 检查点 | 位置 | 读取时机 | 运行时改动是否生效 |
+|---|---|---|---|
+| **路由列表** | `routes()` / `catchers()` | 启动时 | ❌ 不生效，需重启 |
+| **登录验证** | `validate_token()` | 每次登录时 | ✅ 立即生效 |
+| **会话认证** | `decode_admin()` | 每次请求时 | ✅ 不涉及（JWT 独立） |
+
+详细分析：
+
+1. **路由列表**：只在启动时确定。如果启动时面板被禁用（只有 `admin_disabled` 路由），运行时设置 `ADMIN_TOKEN` **无法恢复管理功能**，因为路由根本不存在。
+
+2. **登录验证**：[validate_token()](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/api/admin.rs#L229-L247) 在每次登录时动态读取 `CONFIG.admin_token()`：
+
+   ```rust
+   fn validate_token(token: &str) -> bool {
+       match CONFIG.admin_token().as_ref() {  // 每次都读最新配置
+           None => false,
+           Some(t) if t.starts_with("$argon2") => {
+               argon2::Argon2::default().verify_password(...).is_ok()
+           }
+           Some(t) => crate::crypto::ct_eq(t.trim(), token.trim()),
+       }
+   }
+   ```
+
+   所以：运行时修改 `ADMIN_TOKEN` 对**新登录验证**立即生效。用旧 token 登录会失败，必须用新 token。
+
+3. **会话认证**：JWT 的验证不依赖 `ADMIN_TOKEN` 值，只验证签名和过期时间（见 6.4 节）。
+
+### 6.3 disable_admin_token 改动的生效时机
+
+`disable_admin_token` 的影响也在两个层面，行为不同：
+
+| 检查点 | 位置 | 读取时机 | 运行时改动是否生效 |
+|---|---|---|---|
+| **路由列表** | `routes()` / `catchers()` | 启动时 | ❌ 不生效，需重启 |
+| **请求守卫** | `AdminToken::from_request()` | 每次请求时 | ✅ 立即生效 |
+
+详细分析：
+
+1. **路由列表**：启动时如果 `disable_admin_token = true`，`routes()` 返回全部路由；否则根据 `ADMIN_TOKEN` 是否设置决定。运行时修改不会改变已挂载的路由。
+
+2. **请求守卫**：[AdminToken::from_request()](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/api/admin.rs#L830-L866) 在**每次请求**时动态检查 `CONFIG.disable_admin_token()`：
+
+   ```rust
+   if !CONFIG.disable_admin_token() {  // 每次请求都检查
+       // 执行 JWT 验证
+       let access_token = cookies.get(COOKIE_NAME).map(|c| c.value());
+       if decode_admin(access_token).is_err() {
+           cookies.remove(...);
+           return Outcome::Error((Status::Unauthorized, "Session expired"));
+       }
+   }
+   // disable_admin_token = true 时直接跳过认证
+   Outcome::Success(Self { ip })
+   ```
+
+   所以：
+   - 运行时将 `disable_admin_token` 从 `false` 改为 `true` → **立即对所有请求跳过认证**，已登录和未登录的请求都直接通过
+   - 运行时将 `disable_admin_token` 从 `true` 改为 `false` → **立即要求所有请求提供有效 JWT**，无 Cookie 的请求会返回 401
+
+### 6.4 现有登录会话的有效性：JWT 完全独立于 ADMIN_TOKEN
+
+**关键结论：已登录的管理员会话不受 ADMIN_TOKEN 改动的影响**。
+
+这是因为 JWT 的签发和验证是一个**独立的密码学系统**，与 ADMIN_TOKEN 完全解耦：
+
+**JWT 签发时**（登录成功后）：
+```rust
+// 用 RSA 私钥签名
+let claims = generate_admin_claims();
+let jwt = encode_jwt(&claims);  // encode_jwt 使用 PRIVATE_RSA_KEY
+```
+
+**JWT 验证时**（每次请求）：
+```rust
+// 用 RSA 公钥验证签名
+pub fn decode_admin(token: &str) -> Result<BasicJwtClaims, Error> {
+    decode_jwt(token, JWT_ADMIN_ISSUER.to_string())
+}
+
+pub fn decode_jwt<T: DeserializeOwned>(token: &str, issuer: String) -> Result<T, Error> {
+    let mut validation = jsonwebtoken::Validation::new(JWT_ALGORITHM);
+    validation.leeway = 30;
+    validation.validate_exp = true;
+    validation.validate_nbf = true;
+    validation.set_issuer(&[issuer]);
+    
+    match jsonwebtoken::decode(&token, PUBLIC_RSA_KEY.wait(), &validation) {
+        // 只验证：签名(RSA)、过期时间、nbf、issuer
+    }
+}
+```
+
+RSA 密钥的加载和生命周期：
+- [initialize_keys()](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/auth.rs#L63-L97) 在启动时调用一次
+- 密钥从 `rsa_key.pem` 文件读取（不存在则生成）
+- 加载后存入 `OnceLock<EncodingKey>` 和 `OnceLock<DecodingKey>`，**运行时不可改变**
+- JWT 的 issuer `JWT_ADMIN_ISSUER` 是 `LazyLock<String>`，首次访问时初始化，之后不变
+
+**JWT 失效的唯一方式：**
+1. JWT 自然过期（`admin_session_lifetime` 分钟，默认 20 分钟）
+2. 服务器重启且 RSA 密钥文件被删除/替换（导致签名验证失败）
+3. `disable_admin_token` 从 `true` 改为 `false` 且 Cookie 丢失
+4. 管理员手动点击"注销"（删除 Cookie）
+
+**ADMIN_TOKEN 只影响登录环节**，不影响已签发 JWT 的有效性。源码注释明确说明了这一点：
+
+> "Changing it here will not deauthorize the current session!"
+
+### 6.5 典型场景的行为矩阵
+
+以下是几种常见配置改动场景的行为总结：
+
+| 场景 | 路由是否可用 | 新登录行为 | 现有会话 | 备注 |
+|---|---|---|---|---|
+| **启动时无 ADMIN_TOKEN → 运行时设置 ADMIN_TOKEN** | ❌ 不可用 | N/A | N/A | 路由只在启动时挂载，必须重启 |
+| **启动时有 ADMIN_TOKEN → 运行时删除 ADMIN_TOKEN** | ✅ 可用 | ❌ 无法登录 | ✅ 保持有效 | 路由已挂载，只是 validate_token 返回 false |
+| **运行时修改 ADMIN_TOKEN 值** | ✅ 可用 | ❌ 旧 token 失败<br>✅ 新 token 成功 | ✅ 保持有效 | 已登录会话不受影响 |
+| **运行时 disable_admin_token false → true** | ✅ 可用 | ✅ 无需 token | ✅ 保持有效<br>✅ 无 Cookie 也可访问 | 所有请求跳过认证 |
+| **运行时 disable_admin_token true → false** | ✅ 可用 | ✅ 需要 token | ✅ 有 Cookie 继续有效<br>❌ 无 Cookie 返回 401 | 立即要求认证 |
+| **运行时修改 admin_session_lifetime** | ✅ 可用 | ✅ 新会话使用新值 | ✅ 旧会话仍用原值 | JWT 的 exp 在签发时确定 |
+| **运行时修改 admin_ratelimit 参数** | ✅ 可用 | ✅ 仍受原限流 | ✅ 不受影响 | 限流器是 LazyLock 初始化的 |
+
+### 6.6 安全启示
+
+1. **真正使管理员会话失效的方法**：
+   - 由于没有 JWT 吊销机制，只能等待 JWT 自然过期（默认 20 分钟）
+   - 或者重启服务器并删除 RSA 密钥文件（会使所有 JWT 失效）
+   - 或者修改 `domain`（改变 `JWT_ADMIN_ISSUER`，但这会影响更多功能）
+
+2. **配置改动后的安全窗口期**：
+   - 修改 `ADMIN_TOKEN` 后，已登录的管理员在 JWT 过期前仍可操作
+   - 如果怀疑 token 泄露，仅修改 token 不足以立即阻止访问
+   - 最安全的做法是：修改 token + 重启服务 + 删除 RSA 密钥
+
+3. **disable_admin_token 的危险**：
+   - 设为 `true` 后**任何人都可以直接访问管理面板**，无需任何认证
+   - 这个配置是 `editable=false` 的，**无法通过管理面板修改**，只能通过环境变量
+   - 设计意图是配合前置反向代理做认证（如 Authelia、OAuth2 Proxy 等），切勿单独使用
