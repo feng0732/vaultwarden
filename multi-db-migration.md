@@ -6,84 +6,96 @@ Vaultwarden 使用 Diesel ORM 框架实现多数据库支持，通过**编译时
 
 ### 1.1 核心组件位置
 
-| 组件 | 文件位置 |
+| 组件 | 文件路径 |
 |------|----------|
-| 数据库连接管理 | [src/db/mod.rs](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/src/db/mod.rs) |
-| SQLite 迁移目录 | [migrations/sqlite/](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/migrations/sqlite) |
-| MySQL 迁移目录 | [migrations/mysql/](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/migrations/mysql) |
-| PostgreSQL 迁移目录 | [migrations/postgresql/](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/migrations/postgresql) |
-| 编译特性配置 | [Cargo.toml](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/Cargo.toml) |
-| 构建脚本 | [build.rs](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/build.rs) |
+| 数据库连接管理 | `src/db/mod.rs` |
+| SQLite 迁移目录 | `migrations/sqlite/` |
+| MySQL 迁移目录 | `migrations/mysql/` |
+| PostgreSQL 迁移目录 | `migrations/postgresql/` |
+| 编译特性配置 | `Cargo.toml` |
+| 构建脚本 | `build.rs` |
+| 数据库 Schema 定义 | `src/db/schema.rs` |
 
 ---
 
 ## 二、迁移组织方式
 
-### 2.1 目录结构
+### 2.1 目录结构与脚本数量（已核准）
 
 ```
 migrations/
-├── sqlite/          # 57 个迁移脚本 (2018-01 ~ 2026-05)
+├── sqlite/          # 57 个迁移脚本 (2018-01-14 ~ 2026-05-05)
 │   ├── 2018-01-14-171611_create_tables/
 │   ├── ...
 │   └── 2026-05-05-120000_sso_auth_error/
-├── mysql/           # 56 个迁移脚本 (2018-01 ~ 2026-05)
+├── mysql/           # 56 个迁移脚本 (2018-01-14 ~ 2026-05-05)
 │   ├── 2018-01-14-171611_create_tables/
 │   ├── ...
 │   └── 2026-05-05-120000_sso_auth_error/
-└── postgresql/      # 47 个迁移脚本 (2019-09 ~ 2026-05)
+└── postgresql/      # 47 个迁移脚本 (2019-09-12 ~ 2026-05-05)
     ├── 2019-09-12-100000_create_tables/
     ├── ...
     └── 2026-05-05-120000_sso_auth_error/
 ```
 
-**关键差异**：
-- **PostgreSQL 起步较晚**：第一个迁移从 2019-09 开始，直接创建完整表结构，而非像 SQLite/MySQL 那样逐步演进
-- **迁移命名不完全对齐**：同一功能的迁移在不同数据库中可能有细微的时间戳差异
-- **部分迁移只存在于特定数据库**：如 `2021-03-15-163412_rename_send_key` 在 SQLite 和 PostgreSQL 中有，但 MySQL 中合并到了其他迁移
+**数量差异原因**：
+- **PostgreSQL 起步较晚**：第一个迁移从 2019-09 开始，直接创建完整表结构，而非像 SQLite/MySQL 那样逐步演进，因此缺少 2018-01 至 2019-09 间的 10 个演进式迁移
+- **MySQL 缺少 `2021-03-15-163412_rename_send_key`**：MySQL 在 `2021-03-11-190243_add_sends` 创建 sends 表时直接使用 `akey` 列名，避免了后续改名
 
 ### 2.2 代码层面的迁移执行
 
-在 [src/db/mod.rs](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/src/db/mod.rs#L474-L536) 中，通过 `#[cfg]` 条件编译为每个数据库实现独立的迁移模块：
+在 `src/db/mod.rs` 中，通过 `#[cfg]` 条件编译为每个数据库实现独立的迁移模块：
 
 ```rust
 #[cfg(sqlite)]
 mod sqlite_migrations {
+    use diesel::{Connection, RunQueryDsl};
+    use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
     pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/sqlite");
     
-    pub fn run_migrations(db_url: &str) -> Result<(), Error> {
+    pub fn run_migrations(db_url: &str) -> Result<(), super::Error> {
         let mut connection = diesel::sqlite::SqliteConnection::establish(db_url)?;
         // SQLite 特有：禁用外键检查 + 启用 WAL
-        diesel::sql_query("PRAGMA foreign_keys = OFF").execute(&mut connection)?;
-        if CONFIG.enable_db_wal() {
-            diesel::sql_query("PRAGMA journal_mode=wal").execute(&mut connection)?;
+        diesel::sql_query("PRAGMA foreign_keys = OFF")
+            .execute(&mut connection)
+            .expect("Failed to disable Foreign Key Checks during migrations");
+        if crate::CONFIG.enable_db_wal() {
+            diesel::sql_query("PRAGMA journal_mode=wal")
+                .execute(&mut connection)
+                .expect("Failed to turn on WAL");
         }
-        connection.run_pending_migrations(MIGRATIONS).expect("...");
+        connection.run_pending_migrations(MIGRATIONS).expect("Error running migrations");
         Ok(())
     }
 }
 
 #[cfg(mysql)]
 mod mysql_migrations {
+    use diesel::{Connection, RunQueryDsl};
+    use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
     pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/mysql");
     
-    pub fn run_migrations(db_url: &str) -> Result<(), Error> {
+    pub fn run_migrations(db_url: &str) -> Result<(), super::Error> {
         let mut connection = diesel::mysql::MysqlConnection::establish(db_url)?;
         // MySQL 特有：禁用外键检查
-        diesel::sql_query("SET FOREIGN_KEY_CHECKS = 0").execute(&mut connection)?;
-        connection.run_pending_migrations(MIGRATIONS).expect("...");
+        diesel::sql_query("SET FOREIGN_KEY_CHECKS = 0")
+            .execute(&mut connection)
+            .expect("Failed to disable Foreign Key Checks during migrations");
+        connection.run_pending_migrations(MIGRATIONS).expect("Error running migrations");
         Ok(())
     }
 }
 
 #[cfg(postgresql)]
 mod postgresql_migrations {
+    use diesel::Connection;
+    use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
     pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/postgresql");
     
-    pub fn run_migrations(db_url: &str) -> Result<(), Error> {
+    pub fn run_migrations(db_url: &str) -> Result<(), super::Error> {
         let mut connection = diesel::pg::PgConnection::establish(db_url)?;
-        // PostgreSQL 不禁用外键检查
-        connection.run_pending_migrations(MIGRATIONS).expect("...");
+        // PostgreSQL 不禁用外键检查，依赖正确的迁移顺序
+        connection.run_pending_migrations(MIGRATIONS).expect("Error running migrations");
         Ok(())
     }
 }
@@ -91,7 +103,7 @@ mod postgresql_migrations {
 
 ### 2.3 迁移触发时机
 
-迁移在 [DbPool::from_config()](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/src/db/mod.rs#L182-L232) 中自动执行：
+迁移在 `DbPool::from_config()` 中自动执行：
 
 1. 解析 `DATABASE_URL` 判断数据库类型
 2. 根据数据库类型调用对应 `run_migrations()`
@@ -102,120 +114,111 @@ mod postgresql_migrations {
 
 ## 三、兼容边界分析
 
-### 3.1 数据类型映射差异
+### 3.1 数据类型映射差异（已核准）
 
 | 逻辑类型 | SQLite | MySQL | PostgreSQL |
 |---------|--------|-------|------------|
-| UUID | `TEXT` | `CHAR(36)` | `CHAR(36)` |
-| 字符串 | `TEXT` | `TEXT` / `VARCHAR(255)` | `TEXT` / `VARCHAR(255)` |
+| UUID | `TEXT` | `CHAR(36)` | `CHAR(36)` → 后改为 `VARCHAR(40)` |
+| 字符串 | `TEXT` | `TEXT` / `VARCHAR(255)` | `TEXT` / `VARCHAR(255)` / `VARCHAR(40)` |
 | 时间戳 | `DATETIME` | `DATETIME` | `TIMESTAMP` |
 | 二进制 | `BLOB` | `BLOB` | `BYTEA` |
 | 布尔值 | `BOOLEAN` | `BOOLEAN` | `BOOLEAN` |
-| 大整数 | `INTEGER` (自动 i64) | `BIGINT` | `BIGINT` |
+| 大整数 | `INTEGER` (动态 i64) | `BIGINT` | `BIGINT` |
 
-**示例对比**（users 表）：
+**PostgreSQL 特殊修正**：`2019-09-16-150000_fix_attachments` 迁移将所有 `CHAR(n)` 改为 `VARCHAR(n)` 或 `TEXT`，避免字符填充问题。
 
-**SQLite** [migrations/sqlite/2018-01-14-171611_create_tables/up.sql](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/migrations/sqlite/2018-01-14-171611_create_tables/up.sql#L1-L19):
+### 3.2 关键字处理策略（已核准）
+
+#### 3.2.1 第一次大规模改名：2019-05-26
+
+迁移 `2019-05-26-216651_rename_key_and_type_columns` 统一处理 SQL 关键字冲突：
+
+**SQLite**:
 ```sql
-CREATE TABLE users (
-  uuid                TEXT     NOT NULL PRIMARY KEY,
-  created_at          DATETIME NOT NULL,
-  password_hash       BLOB     NOT NULL,
-  salt                BLOB     NOT NULL,
-  key                 TEXT     NOT NULL,  -- 关键字无需处理
-  ...
-);
+ALTER TABLE attachments RENAME COLUMN key TO akey;
+ALTER TABLE ciphers RENAME COLUMN type TO atype;
+ALTER TABLE devices RENAME COLUMN type TO atype;
+ALTER TABLE twofactor RENAME COLUMN type TO atype;
+ALTER TABLE users RENAME COLUMN key TO akey;
+ALTER TABLE users_organizations RENAME COLUMN key TO akey;
+ALTER TABLE users_organizations RENAME COLUMN type TO atype;
 ```
 
-**MySQL** [migrations/mysql/2018-01-14-171611_create_tables/up.sql](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/migrations/mysql/2018-01-14-171611_create_tables/up.sql#L1-L19):
+**MySQL**（使用 `CHANGE COLUMN` 语法，关键字用反引号转义）:
 ```sql
-CREATE TABLE users (
-  uuid                CHAR(36) NOT NULL PRIMARY KEY,
-  created_at          DATETIME NOT NULL,
-  password_hash       BLOB     NOT NULL,
-  salt                BLOB     NOT NULL,
-  `key`               TEXT     NOT NULL,  -- 使用反引号转义关键字
-  ...
-);
+ALTER TABLE attachments CHANGE COLUMN `key` akey TEXT;
+ALTER TABLE ciphers CHANGE COLUMN type atype INTEGER NOT NULL;
+ALTER TABLE devices CHANGE COLUMN type atype INTEGER NOT NULL;
+ALTER TABLE twofactor CHANGE COLUMN type atype INTEGER NOT NULL;
+ALTER TABLE users CHANGE COLUMN `key` akey TEXT;
+ALTER TABLE users_organizations CHANGE COLUMN `key` akey TEXT;
+ALTER TABLE users_organizations CHANGE COLUMN type atype INTEGER NOT NULL;
 ```
 
-**PostgreSQL** [migrations/postgresql/2019-09-12-100000_create_tables/up.sql](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/migrations/postgresql/2019-09-12-100000_create_tables/up.sql#L1-L21):
-```sql
-CREATE TABLE users (
-  uuid                CHAR(36) NOT NULL PRIMARY KEY,
-  created_at          TIMESTAMP NOT NULL,
-  password_hash       BYTEA     NOT NULL,
-  salt                BYTEA     NOT NULL,
-  akey                TEXT     NOT NULL,  -- 重命名避免关键字冲突
-  ...
-);
-```
+**PostgreSQL**：无此迁移，因为起步时（2019-09-12）就直接使用 `akey` 和 `atype` 命名。
 
-### 3.2 关键字处理策略
+#### 3.2.2 sends 表的特殊处理：2021-03
 
-三种数据库对 SQL 关键字 `key` 的处理方式不同：
+- **SQLite**: `2021-03-11` 创建 sends 表使用 `key` 列名，`2021-03-15` 通过 `RENAME COLUMN key TO akey` 改名
+- **PostgreSQL**: 同上，两步完成
+- **MySQL**: `2021-03-11` 创建 sends 表时直接使用 `akey` 列名，一步到位，无需后续改名迁移
 
-| 数据库 | 处理方式 | 列名 |
-|--------|---------|------|
-| SQLite | 无需特殊处理 | `key` |
-| MySQL | 反引号转义 | `` `key` `` |
-| PostgreSQL | 重命名为 `akey` | `akey` |
+#### 3.2.3 cipher.key 的特殊保留：2023-10-21
 
-**统一层**：在 [src/db/schema.rs](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/src/db/schema.rs) 和模型中使用统一的 Diesel 属性映射：
+`2023-10-21-221242_add_cipher_key` 迁移为 ciphers 表添加 `key` 列，这次**刻意保留关键字命名**，通过数据库特定语法转义：
 
+- **SQLite**: `ALTER TABLE ciphers ADD COLUMN "key" TEXT;` （双引号转义）
+- **MySQL**: `ALTER TABLE ciphers ADD COLUMN `key` TEXT;` （反引号转义）
+- **PostgreSQL**: `ALTER TABLE ciphers ADD COLUMN "key" TEXT;` （双引号转义）
+
+**统一层映射**：在 `src/db/schema.rs` 中 Diesel 自动处理映射：
 ```rust
-// schema.rs 中统一使用 akey
 table! {
     ciphers (uuid) {
         ...
-        key -> Nullable<Text>,  // schema 中使用 key
+        key -> Nullable<Text>,  // Rust 代码中直接使用 key
+        atype -> Integer,       // 其他列使用改名后的 atype
         ...
     }
 }
-
-// 模型通过 Diesel 属性映射
-#[derive(Identifiable, Queryable, Insertable, AsChangeset)]
-#[diesel(table_name = users)]
-pub struct User {
-    pub akey: String,  // Rust 代码中使用 akey
-    ...
-}
 ```
 
-### 3.3 ALTER TABLE 语法差异
+### 3.3 ALTER TABLE 语法差异（已核准）
 
-以 `2024-02-14` 时间戳迁移（修改 `last_used` 列类型）为例：
+以 `2024-02-14` 时间戳迁移（修改 `twofactor.last_used` 列类型）为例：
 
-**SQLite** [migrations/sqlite/2024-02-14-140000_change_time_stamp_data_type/up.sql](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/migrations/sqlite/2024-02-14-140000_change_time_stamp_data_type/up.sql#L1-L1):
+**SQLite** (`2024-02-14-140000_change_time_stamp_data_type`):
 ```sql
--- SQLite 的 INTEGER 本身就是 i64，无需操作
+-- SQLite 的 INTEGER 本身就是 i64 动态类型，无需修改
 ```
 
-**MySQL** [migrations/mysql/2024-02-14-135828_change_time_stamp_data_type/up.sql](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/migrations/mysql/2024-02-14-135828_change_time_stamp_data_type/up.sql#L1-L1):
+**MySQL** (`2024-02-14-135828_change_time_stamp_data_type`):
 ```sql
 ALTER TABLE twofactor MODIFY last_used BIGINT NOT NULL;
 ```
 
-**PostgreSQL** [migrations/postgresql/2024-02-14-135953_change_time_stamp_data_type/up.sql](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/migrations/postgresql/2024-02-14-135953_change_time_stamp_data_type/up.sql#L1-L3):
+**PostgreSQL** (`2024-02-14-135953_change_time_stamp_data_type`):
 ```sql
 ALTER TABLE twofactor
 ALTER COLUMN last_used TYPE BIGINT,
 ALTER COLUMN last_used SET NOT NULL;
 ```
 
-### 3.4 外键检查策略
+### 3.4 外键检查策略（已核准）
 
 迁移期间的外键检查处理：
 
-| 数据库 | 迁移期间处理 |
-|--------|-------------|
-| SQLite | `PRAGMA foreign_keys = OFF` |
-| MySQL | `SET FOREIGN_KEY_CHECKS = 0` |
-| PostgreSQL | 不禁用，依赖正确的迁移顺序 |
+| 数据库 | 迁移期间处理 | 作用范围 |
+|--------|-------------|----------|
+| SQLite | `PRAGMA foreign_keys = OFF` | 连接级别 |
+| MySQL | `SET FOREIGN_KEY_CHECKS = 0` | 会话级别 |
+| PostgreSQL | 不禁用 | 依赖正确的迁移顺序 |
 
-### 3.5 连接初始化语句
+**PostgreSQL 的特殊性**：PostgreSQL 不支持在事务内禁用外键约束，因此必须保证迁移顺序的正确性。
 
-在 [DbConnType::default_init_stmts()](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/src/db/mod.rs#L310-L319) 中：
+### 3.5 连接初始化语句（已核准）
+
+在 `DbConnType::default_init_stmts()` 中：
 
 ```rust
 pub fn default_init_stmts(&self) -> String {
@@ -230,13 +233,18 @@ pub fn default_init_stmts(&self) -> String {
 }
 ```
 
+**SQLite 独有配置**：
+- `busy_timeout = 5000`：等待锁的超时时间 5 秒
+- `synchronous = NORMAL`：平衡性能和安全性的同步级别
+- 可选 `journal_mode = WAL`：Write-Ahead Logging 模式，提升并发性能
+
 ---
 
 ## 四、编译时特性系统
 
 ### 4.1 Cargo 特性定义
 
-在 [Cargo.toml](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/Cargo.toml#L24-L37) 中：
+在 `Cargo.toml` 中：
 
 ```toml
 [features]
@@ -244,13 +252,13 @@ default = []  # 默认不启用任何数据库
 
 mysql = ["diesel/mysql", "diesel_migrations/mysql"]
 postgresql = ["diesel/postgres", "diesel_migrations/postgres"]
-sqlite_system = ["diesel/sqlite", "diesel_migrations/sqlite"]
-sqlite = ["sqlite_system", "libsqlite3-sys/bundled"]  # 静态链接
+sqlite_system = ["diesel/sqlite", "diesel_migrations/sqlite"]  # 动态链接
+sqlite = ["sqlite_system", "libsqlite3-sys/bundled"]          # 静态链接
 ```
 
 ### 4.2 构建脚本配置
 
-在 [build.rs](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/build.rs#L1-L14) 中：
+在 `build.rs` 中：
 
 ```rust
 // 将 feature 转换为 cfg 标记，简化代码中的条件编译
@@ -263,7 +271,7 @@ println!("cargo:rustc-cfg=postgresql");
 
 // 至少启用一个数据库
 #[cfg(not(any(feature = "sqlite_system", feature = "mysql", feature = "postgresql")))]
-compile_error!("You need to enable one DB backend...");
+compile_error!("You need to enable one DB backend. To build with previous defaults do: cargo build --features sqlite");
 ```
 
 ---
@@ -272,7 +280,7 @@ compile_error!("You need to enable one DB backend...");
 
 ### 5.1 MultiConnection 枚举
 
-在 [src/db/mod.rs](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/src/db/mod.rs#L45-L53) 中定义：
+在 `src/db/mod.rs` 中定义：
 
 ```rust
 #[derive(diesel::MultiConnection)]
@@ -288,7 +296,7 @@ pub enum DbConnInner {
 
 ### 5.2 db_run! 宏
 
-[db_run! 宏](file:///d:/fz/0601/solo-dogfeeding/code/14-vaultwarden/src/db/mod.rs#L337-L354) 提供数据库特定代码的执行方式：
+`db_run!` 宏提供数据库特定代码的执行方式：
 
 ```rust
 // 通用执行
@@ -322,45 +330,83 @@ db_run! { conn:
 解析 DATABASE_URL
   │
   ├─► mysql:     ──► 检查 mysql feature ──► mysql_migrations::run_migrations()
+  │                                                  │
+  │                                                  ├─ SET FOREIGN_KEY_CHECKS = 0
+  │                                                  └─ run_pending_migrations
   ├─► postgres:  ──► 检查 postgresql feature ──► postgresql_migrations::run_migrations()
+  │                                                  │
+  │                                                  └─ run_pending_migrations (不禁用外键)
   └─► sqlite:    ──► 检查 sqlite feature ──► sqlite_migrations::run_migrations()
-                          │
-                          ▼
-                  diesel_migrations::embed_migrations!()
-                          │
-                          ▼
-                  执行 __diesel_schema_migrations 表检查
-                          │
-                          ▼
-                  按时间戳顺序执行未执行的迁移
-                          │
-                          ▼
-                  创建连接池 + 设置 ACTIVE_DB_TYPE
-                          │
-                          ▼
-                        就绪
+                                                     │
+                                                     ├─ PRAGMA foreign_keys = OFF
+                                                     ├─ 可选 PRAGMA journal_mode=wal
+                                                     └─ run_pending_migrations
+                                                          │
+                                                          ▼
+                                          diesel_migrations::embed_migrations!()
+                                                          │
+                                                          ▼
+                                          执行 __diesel_schema_migrations 表检查
+                                                          │
+                                                          ▼
+                                          按时间戳顺序执行未执行的迁移
+                                                          │
+                                                          ▼
+                                          创建连接池 + 设置 ACTIVE_DB_TYPE
+                                                          │
+                                                          ▼
+                                                        就绪
 ```
 
 ---
 
-## 七、关键兼容边界总结
+## 七、关键兼容边界总结（已核准）
 
 | 维度 | SQLite | MySQL | PostgreSQL |
 |------|--------|-------|------------|
 | **迁移起点** | 2018-01 | 2018-01 | 2019-09 (跳过早期演进) |
 | **迁移数量** | 57 | 56 | 47 |
-| **UUID 类型** | TEXT | CHAR(36) | CHAR(36) |
+| **UUID 类型** | TEXT | CHAR(36) | CHAR(36) → VARCHAR(40) |
 | **时间类型** | DATETIME | DATETIME | TIMESTAMP |
 | **二进制类型** | BLOB | BLOB | BYTEA |
-| **关键字 `key`** | 直接使用 | 反引号转义 | 重命名为 `akey` |
+| **关键字 `key` 改名** | 2019-05 迁移 | 2019-05 迁移 | 起始即用 `akey` |
+| **sends.key 改名** | 2021-03 迁移 | 未发生，直接用 `akey` | 2021-03 迁移 |
+| **cipher.key 新增** | 2023-10 `"key"` 转义 | 2023-10 `` `key` `` 转义 | 2023-10 `"key"` 转义 |
 | **迁移时外键** | 禁用 | 禁用 | 保持启用 |
-| **ALTER TABLE** | 常为空操作 | MODIFY | ALTER COLUMN |
+| **ALTER TABLE** | 常为空操作 | `MODIFY` | `ALTER COLUMN ... TYPE` |
 | **连接初始化** | busy_timeout + synchronous | 无 | 无 |
+| **WAL 模式** | 支持配置 | 不适用 | 不适用 |
 | **数据库备份** | VACUUM INTO 支持 | 不支持 | 不支持 |
 
 ---
 
-## 八、注意事项
+## 八、关键字改名时间线（已核准）
+
+```
+2018-01  SQLite/MySQL 创建表，使用 key/type 列名
+2018-11  添加 attachments.key 列
+   │
+   ▼
+2019-05  迁移 2019-05-26-216651_rename_key_and_type_columns
+   │     ├─ SQLite: RENAME COLUMN key → akey, type → atype
+   │     └─ MySQL: CHANGE COLUMN `key` → akey, type → atype
+   │
+2019-09  PostgreSQL 起步，直接使用 akey/atype，跳过改名
+   │
+2021-03  创建 sends 表
+   │     ├─ SQLite/PG: 使用 key → 4 天后通过 RENAME 改为 akey
+   │     └─ MySQL: 直接使用 akey，无需改名
+   │
+2023-10  添加 ciphers.key 列，刻意保留关键字名
+         ├─ SQLite: ADD COLUMN "key" TEXT
+         ├─ MySQL: ADD COLUMN `key` TEXT
+         └─ PG: ADD COLUMN "key" TEXT
+         └─ schema.rs 统一映射为 key -> Nullable<Text>
+```
+
+---
+
+## 九、注意事项
 
 1. **跨数据库数据迁移不支持**：三种数据库的迁移脚本完全独立，没有提供从一种数据库迁移到另一种数据库的工具
 
@@ -369,3 +415,10 @@ db_run! { conn:
 3. **回滚支持**：每个迁移目录都有 `down.sql`，但生产环境通常不建议回滚
 
 4. **WAL 模式**：仅 SQLite 支持 WAL（Write-Ahead Logging）模式配置
+
+5. **迁移顺序依赖**：PostgreSQL 不禁用外键，迁移顺序必须正确，SQLite 和 MySQL 则通过禁用外键规避顺序问题
+
+6. **关键字处理原则**：
+   - 早期列名：统一改名为 `akey`/`atype`
+   - 新增列名：优先避免使用关键字
+   - 业务必需保留关键字：通过数据库特定转义语法处理，Diesel schema 层统一映射
