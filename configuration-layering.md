@@ -5,14 +5,14 @@
 Vaultwarden 的配置加载严格遵循代码执行顺序，从启动到最终生效分为以下阶段：
 
 ```
-阶段 A：LazyLock 静态初始化  → 确定 CONFIG_FILE 路径
-阶段 B：from_env()           → .env 注入 + 环境变量读取（含 X/X_FILE 互斥）
-阶段 C：from_file()          → 读取 config.json
-阶段 D：merge()              → config.json 覆盖环境变量
-阶段 E：build()              → 用 none_action 填充缺失值
+阶段 A：main() 访问 CONFIG          → 触发 Config::load()
+阶段 B：Config::load() → from_env()  → ENV_FILE 定位 → .env 注入 + 环境变量读取
+阶段 C：Config::load() → from_file() → 首次访问 CONFIG_FILE LazyLock → 读取 config.json
+阶段 D：merge()                      → config.json 覆盖环境变量
+阶段 E：build()                      → 用 none_action 填充缺失值
 ```
 
-核心入口在 [Config::load()](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L1418-L1443)：
+核心入口在 [Config::load()](src/config.rs#L1418-L1443)：
 
 ```rust
 pub async fn load() -> Result<Self, Error> {
@@ -32,47 +32,46 @@ pub async fn load() -> Result<Self, Error> {
 
 ---
 
-## 二、阶段 A：CONFIG_FILE 路径的确定（LazyLock 静态初始化）
-
-在 [Config::load()](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L1418-L1443) 被调用之前，三个 `LazyLock` 静态变量已经确定了 config.json 的路径：
+## 二、阶段 A：CONFIG LazyLock 触发 Config::load()
 
 ```rust
-static CONFIG_FILE: LazyLock<String> = LazyLock::new(|| {
-    let data_folder = get_env("DATA_FOLDER").unwrap_or_else(|| String::from("data"));
-    get_env("CONFIG_FILE").unwrap_or_else(|| storage::join_path(&data_folder, "config.json"))
+// src/config.rs#L37-L54
+pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().unwrap_or_else(|e| { exit(12) });
+        rt.block_on(Config::load()).unwrap_or_else(|e| { exit(12) })
+    }).join().unwrap_or_else(|e| { exit(12) })
 });
 ```
 
-路径解析规则：
+`CONFIG` 是一个 `LazyLock<Config>` 静态变量，**在首次被访问时**才执行初始化闭包。在 [main.rs](src/main.rs#L79) 中，`init_logging()` 调用 `CONFIG.log_level()` 时首次触发 `CONFIG` 的初始化，从而调用 `Config::load()`。
 
-```
-CONFIG_FILE 环境变量设置了？  → 是 → 使用 CONFIG_FILE 的值
-                              → 否 → DATA_FOLDER 环境变量设置了？
-                                        → 是 → DATA_FOLDER + "/config.json"
-                                        → 否 → "data/config.json"
-```
-
-**注意**：此时 `get_env("DATA_FOLDER")` 是直接调用 [util.rs 中的 get_env](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/util.rs#L412-L417)，此时 .env 文件尚未被加载（`from_env()` 还没执行），所以 `DATA_FOLDER` 和 `CONFIG_FILE` 只能通过外部环境变量设置，.env 文件中设置它们不会生效。
+**关键点**：`Config::load()` 的执行时机是在 `main()` 函数的早期，此时只有外部环境变量（Docker env / Shell export / systemd Environment）存在于进程环境中，.env 文件尚未加载。
 
 ---
 
 ## 三、阶段 B：from_env() —— 环境变量层的完整流程
 
-[from_env()](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L218-L260) 是环境变量层的核心，内部按严格顺序执行三个步骤：
+[from_env()](src/config.rs#L218-L260) 是环境变量层的核心，内部按严格顺序执行三个步骤：
 
 ### 步骤 B-1：ENV_FILE 引导 .env 路径
 
 ```rust
+// src/config.rs#L219
 let env_file = get_env("ENV_FILE").unwrap_or_else(|| String::from(".env"));
 ```
 
-与阶段 A 同理，此时 .env 文件尚未加载，`ENV_FILE` 只能通过外部环境变量设置。
+此时 .env 文件尚未加载，`get_env("ENV_FILE")` 只能从**外部环境变量**中读取。
 
 `ENV_FILE` 的作用是**告诉 dotenvy 去哪里找 .env 文件**，默认值为当前目录下的 `.env`。
+
+⚠️ **`ENV_FILE` 无法通过 .env 文件自身设置**——因为读取 `ENV_FILE` 在加载 .env 之前。这是一个"鸡生蛋"的问题：你需要先知道 .env 文件在哪里，才能加载它。
 
 ### 步骤 B-2：dotenvy::from_path() —— .env 注入，外部变量保留
 
 ```rust
+// src/config.rs#L220
 match dotenvy::from_path(&env_file) { ... }
 ```
 
@@ -113,10 +112,11 @@ dotenvy 还提供了 `load_override()` 方法（无条件覆盖），但 Vaultwa
 .env 注入完成后，`from_env()` 遍历所有配置项，通过 `make_config!` 宏展开为：
 
 ```rust
+// src/config.rs#L254-L257
 builder.$name = make_config! { @getenv stringify!([<$name:upper>]), $ty };
 ```
 
-宏展开后实际调用 [get_env()](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/util.rs#L412-L417) 或 [get_env_bool()](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/util.rs#L419-L428)，两者都依赖 [get_env_str_value()](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/util.rs#L396-L410) 获取原始字符串：
+宏展开后实际调用 [get_env()](src/util.rs#L412-L417) 或 [get_env_bool()](src/util.rs#L419-L428)，两者都依赖 [get_env_str_value()](src/util.rs#L396-L410) 获取原始字符串：
 
 ```rust
 pub fn get_env_str_value(key: &str) -> Option<String> {
@@ -150,8 +150,8 @@ pub fn get_env_str_value(key: &str) -> Option<String> {
 
 **获取到字符串后的类型转换**：
 
-- [get_env()](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/util.rs#L412-L417)：通过 [try_parse_string()](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/util.rs#L381-L391) 调用 `FromStr::parse()`，解析失败返回 `None`（静默回退到默认值，不报错）
-- [get_env_bool()](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/util.rs#L419-L428)：布尔专用，支持 `true/t/yes/y/1` 和 `false/f/no/n/0`（不区分大小写），其他值返回 `None`
+- [get_env()](src/util.rs#L412-L417)：通过 [try_parse_string()](src/util.rs#L381-L391) 调用 `FromStr::parse()`，解析失败返回 `None`（静默回退到默认值，不报错）
+- [get_env_bool()](src/util.rs#L419-L428)：布尔专用，支持 `true/t/yes/y/1` 和 `false/f/no/n/0`（不区分大小写），其他值返回 `None`
 
 ### 步骤 B 小结：环境变量层内部的优先级
 
@@ -168,22 +168,69 @@ X 直接值 或 X_FILE 文件值（两者互斥，冲突 panic）
 
 ---
 
-## 四、阶段 C：from_file() —— 读取 config.json
+## 四、阶段 C：from_file() —— CONFIG_FILE LazyLock 首次触发 + 读取 config.json
 
-[from_file()](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L262-L267) 读取由阶段 A 确定的 CONFIG_FILE 路径：
+这是理解配置加载顺序的关键阶段。[from_file()](src/config.rs#L262-L267) 的代码：
 
 ```rust
 async fn from_file() -> Result<Self, Error> {
-    let operator = storage::operator_for_path(&CONFIG_FILE_PARENT_DIR)?;
+    let operator = storage::operator_for_path(&CONFIG_FILE_PARENT_DIR)?;  // ← 首次访问 CONFIG_FILE
     let config_bytes = operator.read(&CONFIG_FILENAME).await?;
     println!("[INFO] Using saved config from `{}` for configuration.\n", *CONFIG_FILE);
     serde_json::from_slice(&config_bytes.to_vec()).map_err(Into::into)
 }
 ```
 
-**config.json 的来源**：由 Admin 面板通过 [update_config()](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L1445-L1481) 写入。首次启动时文件不存在，`from_file()` 返回错误，由 `Config::load()` 中 `.unwrap_or_default()` 处理为全 `None` 的 `ConfigBuilder`。
+### 4.1 CONFIG_FILE LazyLock 的真实触发时机
 
-**自定义反序列化器**（第 120-207 行）：Vaultwarden 为 `ConfigBuilder` 实现了自定义的 `Deserialize`，特点：
+`CONFIG_FILE` 是 `LazyLock<String>`，声明在 [config.rs#L24-L27](src/config.rs#L24-L27)：
+
+```rust
+static CONFIG_FILE: LazyLock<String> = LazyLock::new(|| {
+    let data_folder = get_env("DATA_FOLDER").unwrap_or_else(|| String::from("data"));
+    get_env("CONFIG_FILE").unwrap_or_else(|| storage::join_path(&data_folder, "config.json"))
+});
+```
+
+LazyLock **不会在声明时执行**，只在**首次访问时执行**初始化闭包。通过搜索全部代码，`CONFIG_FILE`（及其依赖的 `CONFIG_FILE_PARENT_DIR`、`CONFIG_FILENAME`）仅在以下位置被访问：
+
+| 访问位置 | 时机 |
+|---|---|
+| [from_file()](src/config.rs#L263-L265) | `Config::load()` 内，`from_env()` 之后 |
+| [update_config()](src/config.rs#L1477-L1478) | 运行时 Admin 面板更新 |
+| [delete_config()](src/config.rs#L1542-L1543) | 运行时 Admin 面板删除 |
+
+**首次触发一定是在 `from_file()` 中**，而 `from_file()` 在 `from_env()` 之后执行。
+
+### 4.2 这意味着什么：DATA_FOLDER 和 CONFIG_FILE 可以从 .env 设置
+
+由于 `CONFIG_FILE` LazyLock 在 `from_file()` 中才首次被访问，此时 `from_env()` **已经执行完毕**，.env 文件中的变量已经被注入到进程环境中。
+
+因此 `CONFIG_FILE` 初始化闭包中的 `get_env("DATA_FOLDER")` 和 `get_env("CONFIG_FILE")` **可以读取到 .env 文件中设置的值**。
+
+完整路径解析规则：
+
+```
+CONFIG_FILE 环境变量设置了？（来自外部环境变量 或 .env 文件）
+  → 是 → 使用 CONFIG_FILE 的值
+  → 否 → DATA_FOLDER 环境变量设置了？（来自外部环境变量 或 .env 文件）
+           → 是 → DATA_FOLDER + "/config.json"
+           → 否 → "data/config.json"
+```
+
+### 4.3 三个"引导变量"的 .env 可用性对比
+
+| 变量 | 读取时机 | .env 中设置是否生效 | 原因 |
+|---|---|---|---|
+| `ENV_FILE` | `from_env()` 步骤 B-1 | ❌ 不生效 | 读取时 .env 尚未加载（鸡生蛋问题） |
+| `DATA_FOLDER` | `from_file()` 阶段 C 的 CONFIG_FILE LazyLock | ✅ 生效 | .env 已在阶段 B 加载 |
+| `CONFIG_FILE` | `from_file()` 阶段 C 的 CONFIG_FILE LazyLock | ✅ 生效 | .env 已在阶段 B 加载 |
+
+### 4.4 config.json 的加载与反序列化
+
+`from_file()` 读取由 CONFIG_FILE 确定的路径。首次启动时文件不存在，`from_file()` 返回错误，由 `Config::load()` 中 `.unwrap_or_default()` 处理为全 `None` 的 `ConfigBuilder`。
+
+**自定义反序列化器**（[config.rs#L120-L207](src/config.rs#L120-L207)）：Vaultwarden 为 `ConfigBuilder` 实现了自定义的 `Deserialize`，特点：
 - **忽略未知字段**：JSON 中的多余键不会导致反序列化失败
 - **检测重复键**：同一键出现两次会报错
 - **所有字段可选**：缺失的字段保持 `None`
@@ -192,14 +239,15 @@ async fn from_file() -> Result<Self, Error> {
 
 ## 五、阶段 D：merge() —— config.json 覆盖环境变量
 
-[merge()](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L279-L299) 将环境变量层（env）和 config.json 层（usr）合并：
+[merge()](src/config.rs#L279-L299) 将环境变量层（env）和 config.json 层（usr）合并：
 
 ```rust
+/// Merges the values of both builders into a new builder.
+/// If both have the same element, `other` wins.
 fn merge(&self, other: &Self, show_overrides: bool, overrides: &mut Vec<&str>) -> Self {
     let mut builder = self.clone();
     // other（config.json 来源）中某字段为 Some → 覆盖 self（环境变量来源）
     // 如果 self 中也有值 → 记录到 overrides 列表
-    // ...
 }
 ```
 
@@ -211,7 +259,7 @@ fn merge(&self, other: &Self, show_overrides: bool, overrides: &mut Vec<&str>) -
 
 ## 六、阶段 E：build() —— 用 none_action 填充缺失值
 
-[build()](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L301-L321) 将 `ConfigBuilder`（所有字段为 `Option`）转换为 `ConfigItems`（字段有具体类型）。
+[build()](src/config.rs#L301-L321) 将 `ConfigBuilder`（所有字段为 `Option`）转换为 `ConfigItems`（字段有具体类型）。
 
 `make_config!` 宏中定义了四种 `none_action`：
 
@@ -225,10 +273,10 @@ fn merge(&self, other: &Self, show_overrides: bool, overrides: &mut Vec<&str>) -
 典型示例：
 
 ```rust
-data_folder:       String, false, def,       "data".to_owned();
-database_url:      String, false, auto,      |c| format!("sqlite://{}", ...);
-hibp_api_key:      Pass,   true,  option;
-_ip_header_enabled:bool,   false, generated, |c| &c.ip_header.trim().to_lowercase() != "none";
+data_folder:        String, false, def,       "data".to_owned();
+database_url:       String, false, auto,      |c| format!("sqlite://{}", ...);
+hibp_api_key:       Pass,   true,  option;
+_ip_header_enabled: bool,   false, generated, |c| &c.ip_header.trim().to_lowercase() != "none";
 ```
 
 额外后处理：`domain` 去 `/`、`signups_domains_whitelist`/`org_creation_users` trim+小写、`icon_blacklist_regex` → `http_request_block_regex` 兼容迁移。
@@ -237,7 +285,7 @@ _ip_header_enabled:bool,   false, generated, |c| &c.ip_header.trim().to_lowercas
 
 ## 七、`make_config!` 宏 —— 声明式配置定义
 
-所有配置项在一个大型宏调用中声明，位于 [config.rs 第 502-921 行](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L502-L921)。每个配置项的格式为：
+所有配置项在一个大型宏调用中声明，位于 [config.rs#L502-L921](src/config.rs#L502-L921)。每个配置项的格式为：
 
 ```
 /// Friendly Name |> Description
@@ -257,13 +305,13 @@ name: type, is_editable, none_action, default_value?;
 
 ### 7.2 is_editable 标记
 
-`is_editable` 控制该配置项是否可以在 Admin 面板中修改。`false` 表示只能通过环境变量设置，见 [clear_non_editable()](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L269-L275)。
+`is_editable` 控制该配置项是否可以在 Admin 面板中修改。`false` 表示只能通过环境变量设置，见 [clear_non_editable()](src/config.rs#L269-L275)。
 
 ---
 
 ## 八、运行时更新
 
-当通过 Admin 面板更新配置时（[update_config()](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L1445-L1481)）：
+当通过 Admin 面板更新配置时（[update_config()](src/config.rs#L1445-L1481)）：
 
 1. 清除不可编辑字段（`clear_non_editable()`）
 2. 将新配置与原始 `env` 合并（`env.merge(&builder, ...)`）—— config.json 仍然覆盖环境变量
@@ -274,7 +322,7 @@ name: type, is_editable, none_action, default_value?;
 
 ## 九、配置校验
 
-[validate_config()](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L923-L1267) 在 `build()` 之后执行，包含大量业务规则校验，例如：
+[validate_config()](src/config.rs#L923-L1267) 在 `build()` 之后执行，包含大量业务规则校验，例如：
 - `PASSWORD_ITERATIONS` 必须 ≥ 100000
 - `DOMAIN` 必须以 `http://` 或 `https://` 开头
 - `PUSH_ENABLED` 时必须提供 `PUSH_INSTALLATION_ID` 和 `PUSH_INSTALLATION_KEY`
@@ -308,34 +356,36 @@ name: type, is_editable, none_action, default_value?;
 2. `X` 与 `X_FILE` 是同一配置项的两种互斥取值方式，同时设置 → **panic**
 3. `config.json` 中的值覆盖所有环境变量（包括外部环境变量和 .env 文件）
 4. 未在任何层级设置的值，由 `none_action` 策略决定最终值
-5. `ENV_FILE`、`CONFIG_FILE`、`DATA_FOLDER` 只能通过外部环境变量设置，.env 文件中设置它们无效（因为 .env 尚未加载时这些值就已经被读取了）
+5. `ENV_FILE` 只能通过外部环境变量设置（.env 文件中设置无效，因为读取时 .env 尚未加载）
+6. `DATA_FOLDER` 和 `CONFIG_FILE` **可以** 通过 .env 文件设置（因为 CONFIG_FILE LazyLock 在 .env 加载之后才首次被访问）
 
 ---
 
 ## 十一、关键代码位置索引
 
-| 概念 | 文件 | 行号 |
-|---|---|---|
-| `CONFIG_FILE` LazyLock 路径确定 | [config.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L24-L27) | 24-27 |
-| `make_config!` 宏定义 | [config.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L58-L488) | 58-488 |
-| 所有配置项声明 | [config.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L502-L921) | 502-921 |
-| `from_env()` 环境变量构建 | [config.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L218-L260) | 218-260 |
-| ENV_FILE 引导 .env 路径 | [config.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L219) | 219 |
-| dotenvy::from_path 调用 | [config.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L220) | 220 |
-| ENV_FILE 错误处理分支 | [config.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L224-L251) | 224-251 |
-| 逐项读取环境变量（宏展开） | [config.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L254-L257) | 254-257 |
-| `from_file()` config.json 加载 | [config.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L262-L267) | 262-267 |
-| `merge()` 合并覆盖 | [config.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L279-L299) | 279-299 |
-| `build()` 默认值填充 | [config.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L301-L321) | 301-321 |
-| `Config::load()` 入口 | [config.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L1418-L1443) | 1418-1443 |
-| `update_config()` 运行时更新 | [config.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L1445-L1481) | 1445-1481 |
-| `get_env_str_value()` 含 X/X_FILE 互斥 | [util.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/util.rs#L396-L410) | 396-410 |
-| `get_env()` 泛型读取 | [util.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/util.rs#L412-L417) | 412-417 |
-| `get_env_bool()` 布尔读取 | [util.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/util.rs#L419-L428) | 419-428 |
-| `try_parse_string()` 类型转换 | [util.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/util.rs#L381-L391) | 381-391 |
-| `validate_config()` 校验 | [config.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/config.rs#L923-L1267) | 923-1267 |
-| `.env.template` 模板 | [.env.template](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/.env.template) | - |
-| Admin 面板配置写入 | [admin.rs](file:///d:/fz/0601/solo-dogfeeding/code/16-vaultwarden/src/api/admin.rs#L798-L804) | 798-804 |
+| 概念 | 位置 |
+|---|---|
+| `CONFIG_FILE` LazyLock 声明 | [config.rs#L24-L27](src/config.rs#L24-L27) |
+| `CONFIG` LazyLock 声明 | [config.rs#L37-L54](src/config.rs#L37-L54) |
+| `make_config!` 宏定义 | [config.rs#L58-L488](src/config.rs#L58-L488) |
+| 所有配置项声明 | [config.rs#L502-L921](src/config.rs#L502-L921) |
+| `Config::load()` 入口 | [config.rs#L1418-L1443](src/config.rs#L1418-L1443) |
+| `from_env()` 环境变量构建 | [config.rs#L218-L260](src/config.rs#L218-L260) |
+| ENV_FILE 引导 .env 路径 | [config.rs#L219](src/config.rs#L219) |
+| dotenvy::from_path 调用 | [config.rs#L220](src/config.rs#L220) |
+| ENV_FILE 错误处理分支 | [config.rs#L224-L251](src/config.rs#L224-L251) |
+| 逐项读取环境变量（宏展开） | [config.rs#L254-L257](src/config.rs#L254-L257) |
+| `from_file()` config.json 加载 | [config.rs#L262-L267](src/config.rs#L262-L267) |
+| `merge()` 合并覆盖 | [config.rs#L279-L299](src/config.rs#L279-L299) |
+| `build()` 默认值填充 | [config.rs#L301-L321](src/config.rs#L301-L321) |
+| `update_config()` 运行时更新 | [config.rs#L1445-L1481](src/config.rs#L1445-L1481) |
+| `get_env_str_value()` 含 X/X_FILE 互斥 | [util.rs#L396-L410](src/util.rs#L396-L410) |
+| `get_env()` 泛型读取 | [util.rs#L412-L417](src/util.rs#L412-L417) |
+| `get_env_bool()` 布尔读取 | [util.rs#L419-L428](src/util.rs#L419-L428) |
+| `try_parse_string()` 类型转换 | [util.rs#L381-L391](src/util.rs#L381-L391) |
+| `validate_config()` 校验 | [config.rs#L923-L1267](src/config.rs#L923-L1267) |
+| main() 中首次访问 CONFIG | [main.rs#L79](src/main.rs#L79) |
+| `.env.template` 模板 | [.env.template](.env.template) |
 
 **外部库参考**：
 - `dotenvy::Iter::load()` 非覆盖实现：[dotenvy 0.15.7 源码](https://docs.rs/dotenvy/0.15.7/src/dotenvy/iter.rs.html#29-L40)
