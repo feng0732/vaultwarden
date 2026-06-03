@@ -494,3 +494,562 @@ if CONFIG.mail_enabled() && device.is_new() {
 4. **认证失败增强**：SMTP 535 错误会额外添加 "Authentication credentials invalid" 提示
 
 5. **严格模式**：`require_device_email` 配置可确保登录通知邮件必须发送成功才能登录
+
+---
+
+## 10. 关键邮件流程深度解析
+
+### 10.1 邀请码邮件流程（send_invite）
+
+#### 触发入口
+- **组织邀请**：[organizations.rs#L1113](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1113)
+- **管理端邀请**：[admin.rs#L307-L335](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L307-L335)
+- **重发邀请**：[organizations.rs#L1208-L1262](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1208-L1262)
+
+#### 完整处理流程
+
+```
+调用 send_invite(user, org_id, member_id, org_name, invited_by_email)
+        ↓
+1. 生成 JWT Claims ([auth.rs#L310-L329](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/auth.rs#L310-L329))
+   ├─ nbf: 当前时间戳（Not Before）
+   ├─ exp: 当前时间 + invitation_expiration_hours（默认5小时）
+   ├─ iss: "invite" (JWT_INVITE_ISSUER)
+   ├─ sub: user_id
+   ├─ email: 用户邮箱
+   ├─ org_id: 组织ID
+   ├─ member_id: 成员ID
+   └─ invited_by_email: 邀请人邮箱（可选）
+        ↓
+2. JWT 编码 → invite_token
+        ↓
+3. 构建 URL 查询参数 ([mail.rs#L297-L313](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/mail.rs#L297-L313))
+   ├─ email
+   ├─ organizationName
+   ├─ organizationId
+   ├─ organizationUserId
+   ├─ token (JWT invite_token)
+   ├─ orgSsoIdentifier (仅当 sso_enabled && sso_only 时，值为 org_id)
+   └─ orgUserHasExistingUser (仅当 user.private_key.is_some() 时，值为 "true")
+        ↓
+4. 构建最终 URL 格式：
+   {domain}/#/accept-organization/?{query_string}
+        ↓
+5. 模板渲染 ([send_org_invite.hbs](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/static/templates/email/send_org_invite.hbs))
+   ├─ 传入字段：url, img_src, org_name
+   └─ 模板仅显示：org_name（组织名称）和完整的 url 链接
+        ↓
+6. 发送邮件
+```
+
+#### 🔍 URL 参数 vs 模板字段对比
+
+| 数据项 | 存在于 URL 参数 | 存在于模板字段 | 说明 |
+|--------|----------------|----------------|------|
+| `email` | ✅ | ❌ | 仅在URL中，用于客户端识别 |
+| `organizationName` | ✅ | ❌ | 仅在URL中，用于客户端显示 |
+| `organizationId` | ✅ | ❌ | 仅在URL中，用于客户端API调用 |
+| `organizationUserId` | ✅ | ❌ | 仅在URL中，用于客户端API调用 |
+| `token` (JWT) | ✅ | ❌ | 仅在URL中，用于验证邀请有效性 |
+| `orgSsoIdentifier` | ✅ (条件) | ❌ | SSO 专用参数 |
+| `orgUserHasExistingUser` | ✅ (条件) | ❌ | 标识用户是否已有账户 |
+| `org_name` | ❌ | ✅ | 仅在邮件正文中显示组织名称 |
+| `url` (完整链接) | ❌ | ✅ | 邮件中完整可点击链接 |
+| `img_src` | ❌ | ✅ | HTML 模板图片前缀 |
+
+#### 🔑 JWT Claims 结构 ([InviteJwtClaims](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/auth.rs#L287-L308))
+
+```rust
+pub struct InviteJwtClaims {
+    pub nbf: i64,              // Not Before - 令牌生效时间
+    pub exp: i64,              // Expiration - 令牌过期时间
+    pub iss: String,           // Issuer - 签发者，固定为 "invite"
+    pub sub: UserId,           // Subject - 被邀请用户ID
+    pub email: String,         // 被邀请用户邮箱
+    pub org_id: OrganizationId, // 目标组织ID
+    pub member_id: MembershipId, // 成员关系ID
+    pub invited_by_email: Option<String>, // 邀请人邮箱
+}
+```
+
+#### 错误处理
+- **必须成功策略**：使用 `?` 传播错误，调用者必须处理
+- 组织邀请流程中发送失败会导致邀请操作整体失败
+- 管理端邀请失败返回 500 Internal Server Error
+
+---
+
+### 10.2 验证链接邮件流程
+
+#### 10.2.1 邮箱验证邮件（send_verify_email）
+
+##### 触发入口
+- 用户主动请求验证：[accounts.rs#L1065](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1065)
+- 登录时自动发送（未验证邮箱）：[identity.rs#L445](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L445)
+
+##### 完整处理流程
+
+```
+调用 send_verify_email(address, user_id)
+        ↓
+1. 生成 JWT Claims ([auth.rs#L501-L510](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/auth.rs#L501-L510))
+   ├─ nbf: 当前时间戳
+   ├─ exp: 当前时间 + invitation_expiration_hours
+   ├─ iss: "verify_email" (JWT_VERIFYEMAIL_ISSUER)
+   └─ sub: user_id.to_string()
+        ↓
+2. JWT 编码 → verify_email_token
+        ↓
+3. 模板字段构建 ([mail.rs#L193-L202](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/mail.rs#L193-L202))
+   ├─ url: CONFIG.domain()
+   ├─ img_src
+   ├─ user_id
+   ├─ email: percent_encode(address, NON_ALPHANUMERIC)
+   └─ token: verify_email_token
+        ↓
+4. 模板内拼接完整 URL ([verify_email.hbs#L5](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/static/templates/email/verify_email.hbs#L5))
+   {{url}}/#/verify-email/?userId={{user_id}}&token={{token}}
+        ↓
+5. 模板渲染
+   ├─ 显示的完整链接包含：url + /#/verify-email/?userId={{user_id}}&token={{token}}
+   └─ email 字段仅用于 JWT，不显示在邮件正文中
+        ↓
+6. 发送邮件
+```
+
+##### 🔍 字段流向说明
+
+| 字段 | 传入模板 | 模板内显示 | URL 拼接位置 |
+|------|----------|------------|-------------|
+| `user_id` | ✅ | ✅ (在URL中) | `?userId={{user_id}}` |
+| `token` (JWT) | ✅ | ✅ (在URL中) | `&token={{token}}` |
+| `email` (编码后) | ✅ | ❌ | 仅传入模板，不用于URL拼接 |
+| `url` | ✅ | ✅ | 链接前缀 `{{url}}/#/verify-email/` |
+
+##### JWT Claims 结构 ([BasicJwtClaims](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/auth.rs#L485-L499))
+
+```rust
+pub struct BasicJwtClaims {
+    pub nbf: i64,              // Not Before
+    pub exp: i64,              // Expiration
+    pub iss: String,           // Issuer - "verify_email"
+    pub sub: String,           // Subject - user_id
+}
+```
+
+##### 错误处理
+
+| 触发位置 | 错误策略 | 代码位置 |
+|----------|----------|----------|
+| 主动请求验证 | 必须成功，使用 `?` | [accounts.rs#L1065](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1065) |
+| 登录时自动发送 | 宽松策略，仅记录错误，不阻止登录 | [identity.rs#L445-L447](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L445-L447) |
+
+---
+
+#### 10.2.2 注册验证邮件（send_register_verify_email）
+
+##### 触发入口
+- 注册流程中：[identity.rs#L1072](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L1072)
+
+##### 完整处理流程
+
+```
+调用 send_register_verify_email(email, token)
+        ↓
+1. 构建 URL 查询参数 ([mail.rs#L208-L212](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/mail.rs#L208-L212))
+   ├─ email
+   └─ token (注册令牌，由上游生成)
+        ↓
+2. 构建完整 URL
+   {domain}/#/finish-signup/?email={email}&token={token}
+        ↓
+3. 模板渲染 ([register_verify_email.hbs](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/static/templates/email/register_verify_email.hbs))
+   ├─ 传入字段：url (完整URL), img_src, email
+   └─ 模板显示：完整的 url 链接
+        ↓
+4. 发送邮件
+```
+
+##### 🔍 字段流向说明
+
+| 字段 | 存在于 URL 参数 | 传入模板 | 模板显示 |
+|------|----------------|----------|----------|
+| `email` | ✅ | ✅ | ❌ (仅传入，不单独显示) |
+| `token` | ✅ | ❌ | ❌ (仅在URL中) |
+| `url` (完整链接) | ❌ | ✅ | ✅ (作为可点击链接) |
+
+##### 错误处理
+- **必须成功策略**：使用 `?` 传播错误，注册流程失败
+- 上游 token 生成逻辑：[identity.rs#L1037-L1056](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L1037-L1056)
+
+---
+
+#### 10.2.3 欢迎邮件（需验证，send_welcome_must_verify）
+
+##### 触发入口
+- 用户注册（需验证）：[accounts.rs#L320](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L320)
+
+##### URL 拼接方式（模板内）
+
+```handlebars
+{{url}}/#/verify-email/?userId={{user_id}}&token={{token}}
+```
+
+模板：[welcome_must_verify.hbs](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/static/templates/email/welcome_must_verify.hbs)
+
+---
+
+#### 10.2.4 删除账户邮件（send_delete_account）
+
+##### 触发入口
+- 用户请求删除账户：[accounts.rs#L1115](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1115)
+
+##### URL 拼接方式（模板内）
+
+```handlebars
+{{url}}/#/verify-recover-delete?userId={{user_id}}&token={{token}}&email={{email}}
+```
+
+模板：[delete_account.hbs](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/static/templates/email/delete_account.hbs)
+
+---
+
+### 10.3 紧急访问邮件流程
+
+#### 10.3.1 紧急访问邀请（send_emergency_access_invite）
+
+##### 触发入口
+- 发起紧急访问邀请：[emergency_access.rs#L265](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L265)
+- 重发紧急访问邀请：[emergency_access.rs#L281-L323](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L281-L323)
+
+##### 完整处理流程
+
+```
+调用 send_emergency_access_invite(address, user_id, emer_id, grantor_name, grantor_email)
+        ↓
+1. 生成 JWT Claims ([auth.rs#L348-L367](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/auth.rs#L348-L367))
+   ├─ nbf: 当前时间戳
+   ├─ exp: 当前时间 + invitation_expiration_hours
+   ├─ iss: "emergency_access_invite" (JWT_EMERGENCY_ACCESS_INVITE_ISSUER)
+   ├─ sub: user_id (grantor 用户ID)
+   ├─ email: grantee 邮箱
+   ├─ emer_id: 紧急访问ID
+   ├─ grantor_name: 授权人姓名
+   └─ grantor_email: 授权人邮箱
+        ↓
+2. JWT 编码 → token
+        ↓
+3. 构建 URL 查询参数 ([mail.rs#L348-L356](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/mail.rs#L348-L356))
+   ├─ id: emer_id.to_string()
+   ├─ name: grantor_name
+   ├─ email: address (grantee 邮箱)
+   └─ token: JWT token
+        ↓
+4. 构建完整 URL
+   {domain}/#/accept-emergency/?{query_string}
+        ↓
+5. 模板渲染 ([send_emergency_access_invite.hbs](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/static/templates/email/send_emergency_access_invite.hbs))
+   ├─ 传入字段：url (完整URL), img_src, grantor_name
+   └─ 模板显示：grantor_name 和完整的 url 链接
+        ↓
+6. 发送邮件
+```
+
+##### 🔍 URL 参数 vs 模板字段对比
+
+| 数据项 | 存在于 URL 参数 | 传入模板 | 模板显示 | 说明 |
+|--------|----------------|----------|----------|------|
+| `id` (emer_id) | ✅ | ❌ | ❌ | 用于客户端API调用 |
+| `name` (grantor_name) | ✅ | ❌ | ❌ | URL 中用于客户端显示 |
+| `email` (grantee) | ✅ | ❌ | ❌ | URL 中用于客户端识别 |
+| `token` (JWT) | ✅ | ❌ | ❌ | 用于验证邀请有效性 |
+| `grantor_name` | ❌ | ✅ | ✅ | 邮件正文中显示授权人姓名 |
+| `url` (完整链接) | ❌ | ✅ | ✅ | 邮件中完整可点击链接 |
+| `img_src` | ❌ | ✅ | ✅ | HTML 模板图片前缀 |
+
+##### JWT Claims 结构 ([EmergencyAccessInviteJwtClaims](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/auth.rs#L331-L346))
+
+```rust
+pub struct EmergencyAccessInviteJwtClaims {
+    pub nbf: i64,              // Not Before
+    pub exp: i64,              // Expiration
+    pub iss: String,           // Issuer - "emergency_access_invite"
+    pub sub: UserId,           // Subject - grantor user_id
+    pub email: String,         // grantee email
+    pub emer_id: EmergencyAccessId,
+    pub grantor_name: String,
+    pub grantor_email: String,
+}
+```
+
+##### 错误处理
+- **必须成功策略**：使用 `?` 传播错误
+
+---
+
+#### 10.3.2 紧急访问恢复超时（定时任务）
+
+##### 触发方式
+- 定时任务：每小时第 7 分钟执行
+- 入口函数：[emergency_access.rs#L727-L775](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L727-L775)
+
+##### 处理逻辑
+```
+查询所有 RecoveryInitiated 状态的紧急访问记录
+        ↓
+检查 recovery_initiated_at + wait_time_days <= now
+        ↓
+更新状态为 RecoveryApproved
+        ↓
+发送邮件 (使用 .expect("Error on sending email"))
+├─ send_emergency_access_recovery_timed_out → grantor
+└─ send_emergency_access_recovery_approved → grantee
+```
+
+##### 错误处理
+- **强制崩溃策略**：使用 `.expect()`，发送失败会导致程序 panic
+- 理由：这是关键安全操作，必须确保通知送达
+
+---
+
+#### 10.3.3 紧急访问恢复提醒（定时任务）
+
+##### 触发方式
+- 定时任务：每小时第 3 分钟执行
+- 入口函数：[emergency_access.rs#L777-L834](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L777-L834)
+
+##### 处理逻辑
+```
+查询所有 RecoveryInitiated 状态的紧急访问记录
+        ↓
+检查：
+├─ final_recovery_reminder_at <= now (wait_time_days - 1 天前发起)
+└─ next_recovery_reminder_at <= now (每天最多提醒一次)
+        ↓
+更新 last_notification_at = now
+        ↓
+发送邮件 send_emergency_access_recovery_reminder → grantor
+   (使用 .expect("Error on sending email"))
+```
+
+##### 错误处理
+- **强制崩溃策略**：使用 `.expect()`，发送失败会导致程序 panic
+
+---
+
+## 11. 管理端触发功能入口
+
+### 11.1 SMTP 测试邮件
+
+#### API 入口
+```
+POST /admin/test/smtp
+```
+代码位置：[admin.rs#L337-L346](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L337-L346)
+
+#### 请求体
+```json
+{
+  "email": "test@example.com"
+}
+```
+
+#### 处理流程
+1. 检查 `CONFIG.mail_enabled()` 是否为 true
+2. 调用 `mail::send_test(&data.email).await`
+3. 发送使用 `smtp_test` 模板
+4. **错误处理**：必须成功策略，使用 `?` 传播错误
+
+---
+
+### 11.2 管理端邀请用户
+
+#### API 入口
+```
+POST /admin/invite
+```
+代码位置：[admin.rs#L307-L335](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L307-L335)
+
+#### 请求体
+```json
+{
+  "email": "user@example.com"
+}
+```
+
+#### 处理逻辑
+- 检查用户是否已存在（409 Conflict）
+- 创建新用户（无密码）
+- 发送邀请邮件（使用虚拟 org_id: FAKE_ADMIN_UUID 或 FAKE_SSO_IDENTIFIER）
+- **错误处理**：必须成功，失败返回 500 Internal Server Error
+
+---
+
+### 11.3 管理端重发邀请
+
+#### API 入口
+```
+POST /admin/users/{user_id}/invite/resend
+```
+代码位置：[admin.rs#L516-L538](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L516-L538)
+
+#### 前置检查
+- 用户必须存在（404 NotFound）
+- 用户必须尚未接受邀请（password_hash 为空）（400 BadRequest）
+
+#### 错误处理
+- **必须成功策略**：使用 `?` 传播错误
+
+---
+
+### 11.4 组织内重发邀请
+
+#### 单个重发
+```
+POST /organizations/{org_id}/users/{member_id}/reinvite
+```
+代码位置：[organizations.rs#L1208-L1219](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1208-L1219)
+
+#### 批量重发
+```
+POST /organizations/{org_id}/users/reinvite
+```
+代码位置：[organizations.rs#L1173-L1206](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1173-L1206)
+
+#### 前置检查 ([reinvite_member_impl](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1221-L1262))
+- 成员必须存在且属于该组织
+- 成员状态必须是 `Invited` (0)，已接受/已确认无法重发
+
+#### 错误处理
+- 单个重发：必须成功策略
+- 批量重发：宽松策略，每个成员独立处理，错误记录在响应中不中断整体流程
+  ```rust
+  let err_msg = match reinvite_member_impl(...).await {
+      Ok(()) => String::new(),
+      Err(e) => format!("{e:?}"),
+  };
+  ```
+
+---
+
+### 11.5 紧急访问重发邀请
+
+#### API 入口
+```
+POST /emergency-access/{emer_id}/reinvite
+```
+代码位置：[emergency_access.rs#L281-L323](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L281-L323)
+
+#### 前置检查
+- 紧急访问记录必须存在且属于当前用户
+- 状态必须是 `Invited` (0)
+
+---
+
+## 12. 定时任务触发入口总览
+
+| 任务名称 | 触发频率 | 调度时间 | 入口函数 |
+|----------|----------|----------|----------|
+| 2FA 未完成提醒 | 每分钟 | 每分钟第 0 秒 | [send_incomplete_2fa_notifications](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/mod.rs#L244-L284) |
+| 紧急访问恢复超时 | 每小时 | 每小时第 7 分钟 | [emergency_request_timeout_job](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L727-L775) |
+| 紧急访问恢复提醒 | 每小时 | 每小时第 3 分钟 | [emergency_notification_reminder_job](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L777-L834) |
+
+### 定时任务调度配置
+代码位置：[main.rs#L358-L395](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/main.rs#L358-L395)
+
+---
+
+## 13. 错误处理策略完整矩阵
+
+### 13.1 策略类型定义
+
+| 策略类型 | 代码模式 | 行为说明 |
+|----------|----------|----------|
+| **必须成功** | `.await?` | 错误直接向上传播，调用者必须处理，通常导致操作失败 |
+| **严格条件** | `if let Err(e) = ... { if CONFIG.require_*() { err!() } }` | 配置项控制是否失败，默认宽松 |
+| **宽松捕获** | `if let Err(e) = ... { error!("..."); }` | 仅记录错误日志，不影响主流程继续执行 |
+| **批量宽松** | 循环内 `match` 每个操作 | 每个元素独立处理，错误不中断整体批量操作 |
+| **重试保留** | `match { Ok(()) => delete_record, Err(e) => error!(e) }` | 失败不删除数据库记录，下次定时任务继续尝试 |
+| **强制崩溃** | `.await.expect("...")` | 发送失败直接 panic，终止程序 |
+
+### 13.2 各场景错误处理策略对照表
+
+| 邮件类型 | 触发场景 | 处理策略 | 数据库记录 | 代码位置 |
+|----------|----------|----------|------------|----------|
+| **send_invite** | 组织邀请 | 必须成功 | 成员状态保持 Invited | [organizations.rs#L1113](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1113) |
+| **send_invite** | 管理端邀请 | 必须成功 | 用户已创建但无法登录 | [admin.rs#L331](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L331) |
+| **send_invite** | 组织批量重发 | 批量宽松 | 每个成员独立 | [organizations.rs#L1187-L1190](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1187-L1190) |
+| **send_invite** | 管理端重发 | 必须成功 | - | [admin.rs#L531](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L531) |
+| **send_verify_email** | 主动请求验证 | 必须成功 | - | [accounts.rs#L1065](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1065) |
+| **send_verify_email** | 登录时自动发送 | 宽松捕获 | 登录仍可继续 | [identity.rs#L445-L447](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L445-L447) |
+| **send_register_verify_email** | 注册流程 | 必须成功 | 注册失败 | [identity.rs#L1072](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L1072) |
+| **send_welcome_must_verify** | 注册（需验证） | 必须成功 | - | [accounts.rs#L320](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L320) |
+| **send_welcome** | 注册（无需验证） | 宽松捕获 | 登录正常 | [accounts.rs#L324](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L324) |
+| **send_delete_account** | 删除账户请求 | 必须成功 | - | [accounts.rs#L1115](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1115) |
+| **send_password_hint** | 密码提示 | 必须成功 | - | [accounts.rs#L1212](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1212) |
+| **send_new_device_logged_in** | 新设备登录 | 严格条件<br>(require_device_email) | 默认宽松<br>严格时登录失败 | [identity.rs#L480-L489](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L480-L489) |
+| **send_token** (2FA) | 登录时发送 | 必须成功 | 登录失败 | [identity.rs#L982](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L982) |
+| **send_token** (2FA) | 配置 2FA 验证 | 必须成功 | - | [email.rs#L188](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/email.rs#L188) |
+| **send_incomplete_2fa_login** | 定时任务 | 重试保留 | 发送成功才删除记录 | [two_factor/mod.rs#L265-L282](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/mod.rs#L265-L282) |
+| **send_protected_action_token** | 受保护操作 | 必须成功 | - | [protected_actions.rs#L94](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/protected_actions.rs#L94) |
+| **send_emergency_access_invite** | 发起邀请 | 必须成功 | - | [emergency_access.rs#L265](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L265) |
+| **send_emergency_access_invite** | 重发邀请 | 必须成功 | - | [emergency_access.rs#L306](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L306) |
+| **send_emergency_access_invite_accepted** | 邀请被接受 | 宽松捕获 | - | [emergency_access.rs#L377](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L377) |
+| **send_emergency_access_recovery_initiated** | 发起恢复 | 宽松捕获 | - | [emergency_access.rs#L472](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L472) |
+| **send_emergency_access_recovery_approved** | 批准恢复 | 宽松捕获 | - | [emergency_access.rs#L510](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L510) |
+| **send_emergency_access_recovery_rejected** | 拒绝恢复 | 宽松捕获 | - | [emergency_access.rs#L543](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L543) |
+| **send_emergency_access_recovery_timed_out** | 定时任务-超时 | 强制崩溃 | 状态已更新 | [emergency_access.rs#L758](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L758) |
+| **send_emergency_access_recovery_reminder** | 定时任务-提醒 | 强制崩溃 | 通知日期已更新 | [emergency_access.rs#L820](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L820) |
+| **send_invite_accepted** | 邀请被接受 | 宽松捕获 | - | [core/mod.rs#L296](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/mod.rs#L296) |
+| **send_invite_confirmed** | 邀请被确认 | 宽松捕获 | - | [organizations.rs#L1320](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1320) |
+| **send_2fa_removed_from_org** | 组织移除2FA | 必须成功 | - | [two_factor/mod.rs#L186](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/mod.rs#L186) |
+| **send_single_org_removed_from_org** | 移出组织 | 宽松捕获 | - | [organizations.rs#L2099](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L2099) |
+| **send_change_email\*** | 邮箱变更 | 必须成功 | - | [accounts.rs#L962-L982](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L962-L982) |
+| **send_sso_change_email** | SSO邮箱变更 | 必须成功 | - | [identity.rs#L330](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L330) |
+| **send_test** | SMTP测试 | 必须成功 | - | [admin.rs#L342](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L342) |
+| **send_admin_reset_password** | 管理员重置密码 | 必须成功 | - | [organizations.rs#L2943](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L2943) |
+
+### 13.3 策略选择逻辑总结
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    何时使用哪种策略？                            │
+├─────────────────────────────────────────────────────────────────┤
+│ 🔴 必须成功 (?)                                                 │
+│   ├─ 验证类邮件（邮箱验证、注册验证、删除确认）                   │
+│   ├─ 2FA 令牌邮件（用户需要令牌才能继续操作）                     │
+│   ├─ 邀请类邮件（创建邀请后必须送达）                            │
+│   ├─ 管理员主动触发的操作（测试邮件、重置密码）                   │
+│   └─ 安全相关变更（邮箱变更、2FA 移除）                          │
+├─────────────────────────────────────────────────────────────────┤
+│ 🟡 严格条件 (if CONFIG.require_*)                               │
+│   └─ 新设备登录通知（默认宽松，可配置为严格）                     │
+├─────────────────────────────────────────────────────────────────┤
+│ 🟢 宽松捕获 (if let Err(e) = ... { error! })                    │
+│   ├─ 通知类邮件（欢迎邮件、邀请接受/确认通知）                   │
+│   ├─ 登录后自动发送的验证邮件（不阻止登录）                       │
+│   ├─ 组织操作通知（移出组织、紧急访问非关键通知）                 │
+│   └─ 批量操作中的非关键通知                                      │
+├─────────────────────────────────────────────────────────────────┤
+│ 🔵 重试保留 (match Ok→delete, Err→keep)                         │
+│   └─ 定时任务发送的 2FA 未完成提醒（失败下次重试）                │
+├─────────────────────────────────────────────────────────────────┤
+│ ⚫ 强制崩溃 (.expect())                                         │
+│   └─ 定时任务中的紧急访问超时和提醒（关键安全操作，必须送达）      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 13.4 错误分类与日志级别
+
+| 错误类型 | 日志级别 | 说明 |
+|----------|----------|------|
+| SMTP 客户端错误 | `debug!` + `err!` | 详细错误在 debug，用户消息在 error |
+| SMTP 4xx 临时错误 | `debug!` + `err!` | 可重试错误 |
+| SMTP 5xx 永久错误 | `debug!` + `err!` | 535 认证失败有额外提示 |
+| SMTP 超时 | `debug!` + `err!` | 网络或服务器响应慢 |
+| SMTP TLS 错误 | `debug!` + `err!` | 加密连接问题 |
+| Sendmail 错误 | `debug!` + `err!` | 命令执行问题 |
+| 模板渲染错误 | `err!` | 模板语法或数据问题 |
+| 上游调用方捕获 | `error!` | 触发点使用 if let Err 记录 |
+
+代码位置：[mail.rs#L653-L701](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/mail.rs#L653-L701)
