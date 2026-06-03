@@ -228,12 +228,83 @@ CONFIG_FILE 环境变量设置了？（来自外部环境变量 或 .env 文件�
 
 ### 4.4 config.json 的加载与反序列化
 
-`from_file()` 读取由 CONFIG_FILE 确定的路径。首次启动时文件不存在，`from_file()` 返回错误，由 `Config::load()` 中 `.unwrap_or_default()` 处理为全 `None` 的 `ConfigBuilder`。
+`from_file()` 读取由 CONFIG_FILE 确定的路径。
 
 **自定义反序列化器**（[config.rs#L120-L207](src/config.rs#L120-L207)）：Vaultwarden 为 `ConfigBuilder` 实现了自定义的 `Deserialize`，特点：
 - **忽略未知字段**：JSON 中的多余键不会导致反序列化失败
 - **检测重复键**：同一键出现两次会报错
 - **所有字段可选**：缺失的字段保持 `None`
+
+### 4.5 from_file 失败场景与 unwrap_or_default 回退机制
+
+`from_file()` 是一个 `Result<Self, Error>`，在 `Config::load()` 中被 `.unwrap_or_default()` 处理：
+
+```rust
+// src/config.rs#L1421
+let usr = ConfigBuilder::from_file().await.unwrap_or_default();
+```
+
+**这意味着：任何失败都会静默回退到 `ConfigBuilder::default()`，即所有字段为 `None` 的空配置。**
+
+#### 4.5.1 from_file 可能失败的四个位置
+
+| 失败位置 | 错误来源 | 触发条件 | 结果 |
+|---|---|---|---|
+| `operator_for_path()` | 存储后端初始化失败 | 路径无效、权限不足等 | 回退空配置 |
+| `operator.read()` | 文件读取失败 | 文件不存在、权限不足、磁盘 IO 错误 | 回退空配置 |
+| `serde_json::from_slice()` | JSON 语法错误 | 格式非法（如括号不匹配）、类型不匹配 | 回退空配置 |
+| 自定义反序列化器 | 重复键检测 | JSON 中同一键出现两次 | 回退空配置 |
+
+**关键结论**：无论是文件不存在、JSON 语法错误、还是重复键，都不会阻止程序启动——只是 config.json 层的所有配置丢失，完全回退到环境变量层。
+
+#### 4.5.2 JSON 重复键的处理：代码 vs 注释的差异
+
+注释第 118 行声称：
+> "In case of duplicate keys ... the last value is used!"
+
+但实际代码在第 190-192 行明确检查了重复键并返回错误：
+
+```rust
+// src/config.rs#L189-L194
+Field::$name => {
+    if builder.$name.is_some() {
+        return Err(de::Error::duplicate_field(stringify!($name)));
+    }
+    builder.$name = map.next_value()?;
+}
+```
+
+**实际行为：重复键 → 反序列化失败 → unwrap_or_default → 回退空配置。**
+
+注释是错误的，应以实际代码为准。
+
+#### 4.5.3 回退空配置对 merge 覆盖关系的影响
+
+merge() 的核心逻辑是：
+
+```rust
+// src/config.rs#L282-L283
+if let v @ Some(_) = &other.$name {
+    builder.$name = v.clone();
+}
+```
+
+只有 `other`（config.json 来源）中为 `Some(_)` 的字段才会覆盖。如果 `from_file()` 失败并回退到 `ConfigBuilder::default()`，则所有字段都是 `None`，**不会覆盖任何环境变量**。
+
+**覆盖行为对照表**：
+
+| config.json 状态 | usr 中字段值 | merge 时是否覆盖环境变量 |
+|---|---|---|
+| 文件存在且合法，某字段有值 | `Some(value)` | ✅ 覆盖，打印警告（如果环境变量也设置了） |
+| 文件存在且合法，某字段无值 | `None` | ❌ 不覆盖，保留环境变量值 |
+| 文件不存在 / 读取失败 / 解析失败 | 全 `None` | ❌ 完全不覆盖，所有配置来自环境变量 |
+
+#### 4.5.4 失败时的用户感知
+
+- **没有错误日志**：`.unwrap_or_default()` 静默吞掉所有错误
+- **没有警告提示**：文件损坏或被删除时，管理员可能完全不知情
+- **效果等同于清空 Admin 面板的所有设置**：所有曾经保存到 config.json 的配置瞬间消失
+- **静默回退可能导致意外行为**：比如 `DOMAIN` 突然从 `https://prod.example.com` 回退到环境变量的 `https://localhost`，导致回调 URL 失效
 
 ---
 
@@ -355,9 +426,10 @@ name: type, is_editable, none_action, default_value?;
 1. `.env` 文件中的变量 **不会** 覆盖外部已存在的同名环境变量
 2. `X` 与 `X_FILE` 是同一配置项的两种互斥取值方式，同时设置 → **panic**
 3. `config.json` 中的值覆盖所有环境变量（包括外部环境变量和 .env 文件）
-4. 未在任何层级设置的值，由 `none_action` 策略决定最终值
-5. `ENV_FILE` 只能通过外部环境变量设置（.env 文件中设置无效，因为读取时 .env 尚未加载）
-6. `DATA_FOLDER` 和 `CONFIG_FILE` **可以** 通过 .env 文件设置（因为 CONFIG_FILE LazyLock 在 .env 加载之后才首次被访问）
+4. `config.json` 读取失败（文件不存在 / JSON 语法错误 / 重复键等）→ **静默回退到空配置**，所有字段为 `None`，不覆盖任何环境变量
+5. 未在任何层级设置的值，由 `none_action` 策略决定最终值
+6. `ENV_FILE` 只能通过外部环境变量设置（.env 文件中设置无效，因为读取时 .env 尚未加载）
+7. `DATA_FOLDER` 和 `CONFIG_FILE` **可以** 通过 .env 文件设置（因为 CONFIG_FILE LazyLock 在 .env 加载之后才首次被访问）
 
 ---
 
@@ -376,7 +448,11 @@ name: type, is_editable, none_action, default_value?;
 | ENV_FILE 错误处理分支 | [config.rs#L224-L251](src/config.rs#L224-L251) |
 | 逐项读取环境变量（宏展开） | [config.rs#L254-L257](src/config.rs#L254-L257) |
 | `from_file()` config.json 加载 | [config.rs#L262-L267](src/config.rs#L262-L267) |
+| `unwrap_or_default()` 静默回退 | [config.rs#L1421](src/config.rs#L1421) |
+| 自定义反序列化器（含重复键检测） | [config.rs#L120-L207](src/config.rs#L120-L207) |
+| 重复键检测代码 | [config.rs#L190-L192](src/config.rs#L190-L192) |
 | `merge()` 合并覆盖 | [config.rs#L279-L299](src/config.rs#L279-L299) |
+| merge 条件覆盖逻辑 | [config.rs#L282-L283](src/config.rs#L282-L283) |
 | `build()` 默认值填充 | [config.rs#L301-L321](src/config.rs#L301-L321) |
 | `update_config()` 运行时更新 | [config.rs#L1445-L1481](src/config.rs#L1445-L1481) |
 | `get_env_str_value()` 含 X/X_FILE 互斥 | [util.rs#L396-L410](src/util.rs#L396-L410) |
