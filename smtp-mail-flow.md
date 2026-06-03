@@ -356,8 +356,12 @@ if let Err(e) = mail::send_new_device_logged_in(...).await {
 
 适用场景：
 - 新设备登录通知
-- 欢迎邮件
-- 组织邀请确认
+- 邮箱验证请求（`send_verify_email`，无论主动还是自动触发）
+- 欢迎邮件（`send_welcome`、`send_welcome_must_verify`）
+- 删除账户确认邮件
+- 邮箱变更验证邮件（`send_change_email`）
+- 邮箱变更通知邮件（`send_change_email_existing/invited`）
+- 组织邀请确认通知
 - 紧急访问非关键通知
 
 #### 严格策略（发送失败则操作失败）
@@ -376,8 +380,30 @@ send_email(address, &subject, body_html, body_text).await
 适用场景：
 - 两步验证令牌发送（`send_token`）
 - 受保护操作令牌
-- 邮箱验证令牌
+- 注册验证邮件（`send_register_verify_email`）
+- 密码提示邮件（`send_password_hint`）
 - 管理员主动发送的测试邮件
+- SSO 邮箱变更通知
+- 组织移除 2FA 通知
+
+#### 回滚删除策略（发送失败后清理已创建的记录）
+
+组织邀请用户时，先保存用户和成员记录，再发送邀请邮件。如果发送失败，则回滚删除已创建的记录，恢复到发送前状态。
+
+```rust
+// 示例: organizations.rs#L1122-L1130
+if let Err(e) = mail::send_invite(...).await {
+    if user_created {
+        user.delete(&conn).await?;  // 新用户 → 删除用户
+    } else {
+        new_member.delete(&conn).await?;  // 已有用户 → 仅删除成员关系
+    }
+    err!(format!("Error sending invite: {e:?} "));
+}
+```
+
+适用场景：
+- 组织邀请用户（新用户或已有用户）
 
 ### 6.3 定时任务中的错误处理
 
@@ -966,6 +992,7 @@ POST /emergency-access/{emer_id}/reinvite
 | 策略类型 | 代码模式 | 行为说明 |
 |----------|----------|----------|
 | **必须成功** | `.await?` | 错误直接向上传播，调用者必须处理，通常导致操作失败 |
+| **回滚删除** | `if let Err(e) → delete records → err!()` | 发送失败后删除已创建的数据库记录，再返回错误 |
 | **严格条件** | `if let Err(e) = ... { if CONFIG.require_*() { err!() } }` | 配置项控制是否失败，默认宽松 |
 | **宽松捕获** | `if let Err(e) = ... { error!("..."); }` | 仅记录错误日志，不影响主流程继续执行 |
 | **批量宽松** | 循环内 `match` 每个操作 | 每个元素独立处理，错误不中断整体批量操作 |
@@ -974,40 +1001,41 @@ POST /emergency-access/{emer_id}/reinvite
 
 ### 13.2 各场景错误处理策略对照表
 
-| 邮件类型 | 触发场景 | 处理策略 | 数据库记录 | 代码位置 |
-|----------|----------|----------|------------|----------|
-| **send_invite** | 组织邀请 | 必须成功 | 成员状态保持 Invited | [organizations.rs#L1113](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1113) |
-| **send_invite** | 管理端邀请 | 必须成功 | 用户已创建但无法登录 | [admin.rs#L331](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L331) |
-| **send_invite** | 组织批量重发 | 批量宽松 | 每个成员独立 | [organizations.rs#L1187-L1190](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1187-L1190) |
-| **send_invite** | 管理端重发 | 必须成功 | - | [admin.rs#L531](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L531) |
-| **send_verify_email** | 主动请求验证 | 必须成功 | - | [accounts.rs#L1065](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1065) |
-| **send_verify_email** | 登录时自动发送 | 宽松捕获 | 登录仍可继续 | [identity.rs#L445-L447](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L445-L447) |
-| **send_register_verify_email** | 注册流程 | 必须成功 | 注册失败 | [identity.rs#L1072](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L1072) |
-| **send_welcome_must_verify** | 注册（需验证） | 必须成功 | - | [accounts.rs#L320](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L320) |
-| **send_welcome** | 注册（无需验证） | 宽松捕获 | 登录正常 | [accounts.rs#L324](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L324) |
-| **send_delete_account** | 删除账户请求 | 必须成功 | - | [accounts.rs#L1115](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1115) |
-| **send_password_hint** | 密码提示 | 必须成功 | - | [accounts.rs#L1212](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1212) |
-| **send_new_device_logged_in** | 新设备登录 | 严格条件<br>(require_device_email) | 默认宽松<br>严格时登录失败 | [identity.rs#L480-L489](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L480-L489) |
-| **send_token** (2FA) | 登录时发送 | 必须成功 | 登录失败 | [identity.rs#L982](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L982) |
-| **send_token** (2FA) | 配置 2FA 验证 | 必须成功 | - | [email.rs#L188](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/email.rs#L188) |
-| **send_incomplete_2fa_login** | 定时任务 | 重试保留 | 发送成功才删除记录 | [two_factor/mod.rs#L265-L282](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/mod.rs#L265-L282) |
-| **send_protected_action_token** | 受保护操作 | 必须成功 | - | [protected_actions.rs#L94](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/protected_actions.rs#L94) |
-| **send_emergency_access_invite** | 发起邀请 | 必须成功 | - | [emergency_access.rs#L265](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L265) |
-| **send_emergency_access_invite** | 重发邀请 | 必须成功 | - | [emergency_access.rs#L306](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L306) |
-| **send_emergency_access_invite_accepted** | 邀请被接受 | 宽松捕获 | - | [emergency_access.rs#L377](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L377) |
-| **send_emergency_access_recovery_initiated** | 发起恢复 | 宽松捕获 | - | [emergency_access.rs#L472](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L472) |
-| **send_emergency_access_recovery_approved** | 批准恢复 | 宽松捕获 | - | [emergency_access.rs#L510](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L510) |
-| **send_emergency_access_recovery_rejected** | 拒绝恢复 | 宽松捕获 | - | [emergency_access.rs#L543](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L543) |
-| **send_emergency_access_recovery_timed_out** | 定时任务-超时 | 强制崩溃 | 状态已更新 | [emergency_access.rs#L758](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L758) |
-| **send_emergency_access_recovery_reminder** | 定时任务-提醒 | 强制崩溃 | 通知日期已更新 | [emergency_access.rs#L820](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L820) |
-| **send_invite_accepted** | 邀请被接受 | 宽松捕获 | - | [core/mod.rs#L296](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/mod.rs#L296) |
-| **send_invite_confirmed** | 邀请被确认 | 宽松捕获 | - | [organizations.rs#L1320](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1320) |
-| **send_2fa_removed_from_org** | 组织移除2FA | 必须成功 | - | [two_factor/mod.rs#L186](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/mod.rs#L186) |
-| **send_single_org_removed_from_org** | 移出组织 | 宽松捕获 | - | [organizations.rs#L2099](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L2099) |
-| **send_change_email\*** | 邮箱变更 | 必须成功 | - | [accounts.rs#L962-L982](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L962-L982) |
-| **send_sso_change_email** | SSO邮箱变更 | 必须成功 | - | [identity.rs#L330](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L330) |
-| **send_test** | SMTP测试 | 必须成功 | - | [admin.rs#L342](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L342) |
-| **send_admin_reset_password** | 管理员重置密码 | 必须成功 | - | [organizations.rs#L2943](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L2943) |
+| 邮件类型 | 触发场景 | 处理策略 | 失败后记录变化 | 代码位置 |
+|----------|----------|----------|----------------|----------|
+| **send_invite** | 组织邀请 | 回滚删除 | 已创建的用户/成员被删除，恢复原状 | [organizations.rs#L1113-L1130](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1113-L1130) |
+| **send_invite** | 管理端邀请 | 必须成功 | 用户未保存（先发邮件再存库） | [admin.rs#L307-L335](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L307-L335) |
+| **send_invite** | 组织批量重发 | 批量宽松 | 每个成员独立，错误记录在响应中 | [organizations.rs#L1173-L1206](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1173-L1206) |
+| **send_invite** | 管理端重发 | 必须成功 | 无记录变更 | [admin.rs#L516-L538](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L516-L538) |
+| **send_verify_email** | 主动请求验证 | 宽松捕获 | 无记录变更，接口仍返回成功 | [accounts.rs#L1057-L1070](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1057-L1070) |
+| **send_verify_email** | 登录时自动发送 | 宽松捕获 | 无记录变更，登录继续 | [identity.rs#L445-L447](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L445-L447) |
+| **send_register_verify_email** | 注册流程 | 必须成功 | 无记录落库，注册中断 | [identity.rs#L1072](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L1072) |
+| **send_welcome_must_verify** | 注册（需验证） | 宽松捕获 | 用户已保存，last_verifying_at 已设置 | [accounts.rs#L318-L324](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L318-L324) |
+| **send_welcome** | 注册（无需验证） | 宽松捕获 | 用户已保存 | [accounts.rs#L324](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L324) |
+| **send_delete_account** | 删除账户请求 | 宽松捕获 | 无记录变更 | [accounts.rs#L1113-L1119](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1113-L1119) |
+| **send_password_hint** | 密码提示 | 必须成功 | 无记录落库 | [accounts.rs#L1212](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1212) |
+| **send_new_device_logged_in** | 新设备登录 | 严格条件<br>(require_device_email) | 默认宽松继续登录<br>严格时登录失败 | [identity.rs#L480-L489](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L480-L489) |
+| **send_token** (2FA) | 登录时发送 | 必须成功 | 令牌已更新但邮件未发，登录失败 | [identity.rs#L982](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L982) |
+| **send_token** (2FA) | 配置 2FA 验证 | 必须成功 | 记录已创建（EmailVerificationChallenge） | [email.rs#L188](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/email.rs#L188) |
+| **send_incomplete_2fa_login** | 定时任务 | 重试保留 | 发送成功才删除记录，失败保留重试 | [two_factor/mod.rs#L265-L282](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/mod.rs#L265-L282) |
+| **send_protected_action_token** | 受保护操作 | 必须成功 | 记录已创建（ProtectedActions） | [protected_actions.rs#L94](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/protected_actions.rs#L94) |
+| **send_emergency_access_invite** | 发起邀请 | 必须成功 | 紧急访问记录已保存（Invited） | [emergency_access.rs#L260-L276](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L260-L276) |
+| **send_emergency_access_invite** | 重发邀请 | 必须成功 | 无记录变更 | [emergency_access.rs#L306](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L306) |
+| **send_emergency_access_invite_accepted** | 邀请被接受 | 宽松捕获 | 无额外记录变更 | [emergency_access.rs#L377](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L377) |
+| **send_emergency_access_recovery_initiated** | 发起恢复 | 宽松捕获 | 无额外记录变更 | [emergency_access.rs#L472](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L472) |
+| **send_emergency_access_recovery_approved** | 批准恢复 | 宽松捕获 | 无额外记录变更 | [emergency_access.rs#L510](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L510) |
+| **send_emergency_access_recovery_rejected** | 拒绝恢复 | 宽松捕获 | 无额外记录变更 | [emergency_access.rs#L543](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L543) |
+| **send_emergency_access_recovery_timed_out** | 定时任务-超时 | 强制崩溃 | 状态已更新为 RecoveryApproved | [emergency_access.rs#L758](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L758) |
+| **send_emergency_access_recovery_reminder** | 定时任务-提醒 | 强制崩溃 | last_notification_at 已更新 | [emergency_access.rs#L820](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L820) |
+| **send_invite_accepted** | 邀请被接受 | 宽松捕获 | 无额外记录变更 | [core/mod.rs#L296](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/mod.rs#L296) |
+| **send_invite_confirmed** | 邀请被确认 | 宽松捕获 | 无额外记录变更 | [organizations.rs#L1320](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1320) |
+| **send_2fa_removed_from_org** | 组织移除2FA | 必须成功 | 2FA 记录已删除，无法回滚 | [two_factor/mod.rs#L186](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/mod.rs#L186) |
+| **send_single_org_removed_from_org** | 移出组织 | 宽松捕获 | 无额外记录变更 | [organizations.rs#L2099](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L2099) |
+| **send_change_email** | 邮箱变更验证 | 宽松捕获 | email_new/email_new_token 已设置 | [accounts.rs#L982-L991](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L982-L991) |
+| **send_change_email_existing/invited** | 邮箱冲突通知 | 宽松捕获 | 无记录变更 | [accounts.rs#L962-L970](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L962-L970) |
+| **send_sso_change_email** | SSO邮箱变更 | 必须成功 | 无记录变更 | [identity.rs#L330](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L330) |
+| **send_test** | SMTP测试 | 必须成功 | 无记录落库 | [admin.rs#L342](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L342) |
+| **send_admin_reset_password** | 管理员重置密码 | 必须成功 | 密码已重置 | [organizations.rs#L2943](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L2943) |
 
 ### 13.3 策略选择逻辑总结
 
@@ -1016,20 +1044,31 @@ POST /emergency-access/{emer_id}/reinvite
 │                    何时使用哪种策略？                            │
 ├─────────────────────────────────────────────────────────────────┤
 │ 🔴 必须成功 (?)                                                 │
-│   ├─ 验证类邮件（邮箱验证、注册验证、删除确认）                   │
-│   ├─ 2FA 令牌邮件（用户需要令牌才能继续操作）                     │
-│   ├─ 邀请类邮件（创建邀请后必须送达）                            │
+│   ├─ 2FA 令牌邮件（send_token，用户需要令牌才能继续操作）        │
+│   ├─ 受保护操作令牌（send_protected_action_token）               │
+│   ├─ 注册验证邮件（send_register_verify_email，中断注册）        │
+│   ├─ 密码提示邮件（send_password_hint）                         │
 │   ├─ 管理员主动触发的操作（测试邮件、重置密码）                   │
-│   └─ 安全相关变更（邮箱变更、2FA 移除）                          │
+│   ├─ SSO 邮箱变更通知                                          │
+│   └─ 组织移除 2FA 通知                                         │
 ├─────────────────────────────────────────────────────────────────┤
-│ 🟡 严格条件 (if CONFIG.require_*)                               │
+│ 🔄 回滚删除 (if let Err → delete records → err!)               │
+│   └─ 组织邀请（发送失败后删除已创建的用户/成员记录）              │
+├─────────────────────────────────────────────────────────────────┤
+│ 🟡 严格条件 (if CONFIG.require_*())                             │
 │   └─ 新设备登录通知（默认宽松，可配置为严格）                     │
 ├─────────────────────────────────────────────────────────────────┤
 │ 🟢 宽松捕获 (if let Err(e) = ... { error! })                    │
-│   ├─ 通知类邮件（欢迎邮件、邀请接受/确认通知）                   │
-│   ├─ 登录后自动发送的验证邮件（不阻止登录）                       │
-│   ├─ 组织操作通知（移出组织、紧急访问非关键通知）                 │
-│   └─ 批量操作中的非关键通知                                      │
+│   ├─ 邮箱验证请求（send_verify_email，主动/自动均为宽松）        │
+│   ├─ 欢迎邮件（send_welcome / send_welcome_must_verify）        │
+│   ├─ 删除账户确认邮件（send_delete_account）                    │
+│   ├─ 邮箱变更验证邮件（send_change_email）                      │
+│   ├─ 邮箱变更通知邮件（send_change_email_existing/invited）     │
+│   ├─ 通知类邮件（邀请接受/确认、移出组织）                       │
+│   └─ 紧急访问非关键通知（接受/发起/批准/拒绝）                   │
+├─────────────────────────────────────────────────────────────────┤
+│ 📦 批量宽松 (循环内 match 每个操作)                              │
+│   └─ 组织批量重发邀请                                           │
 ├─────────────────────────────────────────────────────────────────┤
 │ 🔵 重试保留 (match Ok→delete, Err→keep)                         │
 │   └─ 定时任务发送的 2FA 未完成提醒（失败下次重试）                │
@@ -1058,14 +1097,15 @@ POST /emergency-access/{emer_id}/reinvite
 
 ## 14. 发送失败后的数据库记录变化
 
-### 14.1 四类结果分类
+### 14.1 五类结果分类
 
 | 结果类型 | 说明 | 典型场景 |
 |----------|------|----------|
 | **🔴 清理记录（回滚删除）** | 发送失败后主动删除已创建的数据库记录，恢复到发送前状态 | 组织邀请创建新用户后发送失败 |
-| **🟡 不落库（无持久化）** | 没有任何数据库记录需要保存，发送失败无影响 | 欢迎邮件、通知类邮件 |
-| **🟢 保留给定时任务重试** | 记录保留在数据库中，下次定时任务执行时会再次尝试 | 2FA 未完成提醒 |
-| **🔵 更新时间后发送失败** | 先更新了状态/时间戳记录，再发送邮件失败 | 紧急访问定时任务 |
+| **🟡 记录不变（宽松捕获）** | 发送失败不影响主流程，相关记录已保存或无新增，接口仍返回成功 | 验证邮件、欢迎邮件、通知类邮件 |
+| **🟢 保留重试（定时任务）** | 记录保留在数据库中，下次定时任务执行时会再次尝试发送 | 2FA 未完成提醒 |
+| **🔵 先更后发（状态已更新）** | 先更新了状态/时间戳记录并持久化，再发送邮件失败 | 紧急访问定时任务 |
+| **🟣 先发后存（记录未入库）** | 邮件发送在记录保存之前，发送失败不产生任何记录 | 管理端邀请、注册验证邮件 |
 
 ---
 
@@ -1091,7 +1131,9 @@ POST /emergency-access/{emer_id}/reinvite
 
 ---
 
-#### 14.2.2 管理端邀请用户
+### 14.3 先发后存（记录未入库）场景
+
+#### 14.3.1 管理端邀请用户
 **代码位置**：[admin.rs#L307-L335](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L307-L335)
 
 ```
@@ -1109,9 +1151,9 @@ POST /emergency-access/{emer_id}/reinvite
 
 ---
 
-### 14.3 不落库（无持久化）场景
+### 14.4 记录不变（宽松捕获）场景
 
-#### 14.3.1 邮箱验证请求（主动触发）
+#### 14.4.1 邮箱验证请求（主动触发）
 **代码位置**：[accounts.rs#L1057-L1070](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1057-L1070)
 
 ```rust
@@ -1128,7 +1170,7 @@ Ok(())
 
 ---
 
-#### 14.3.2 登录时自动发送验证邮件
+#### 14.4.2 登录时自动发送验证邮件
 **代码位置**：[identity.rs#L443-L447](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L443-L447)
 
 ```rust
@@ -1144,7 +1186,7 @@ if let Err(e) = mail::send_verify_email(&user.email, &user.uuid).await {
 
 ---
 
-#### 14.3.3 欢迎邮件（注册后）
+#### 14.4.3 欢迎邮件（注册后）
 **代码位置**：[accounts.rs#L318-L326](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L318-L326)
 
 ```rust
@@ -1166,7 +1208,7 @@ user.save(&conn).await?;  // 用户始终会保存
 
 ---
 
-#### 14.3.4 删除账户确认邮件
+#### 14.4.4 删除账户确认邮件
 **代码位置**：[accounts.rs#L1113-L1119](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1113-L1119)
 
 ```rust
@@ -1184,7 +1226,7 @@ Ok(())  // 即使发送失败也返回成功
 
 ---
 
-#### 14.3.5 新设备登录通知
+#### 14.4.5 新设备登录通知
 **代码位置**：[identity.rs#L478-L490](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L478-L490)
 
 ```rust
@@ -1204,7 +1246,7 @@ if let Err(e) = mail::send_new_device_logged_in(...).await {
 
 ---
 
-#### 14.3.6 邀请被接受/确认通知
+#### 14.4.6 邀请被接受/确认通知
 - **邀请被接受**：[core/mod.rs#L296](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/mod.rs#L296)
 - **邀请被确认**：[organizations.rs#L1320](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1320)
 - **移出组织通知**：[organizations.rs#L2099](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L2099)
@@ -1215,7 +1257,7 @@ if let Err(e) = mail::send_new_device_logged_in(...).await {
 
 ---
 
-#### 14.3.7 紧急访问非关键通知
+#### 14.4.7 紧急访问非关键通知
 - 邀请被接受：[emergency_access.rs#L377](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L377)
 - 恢复请求发起/批准/拒绝：[emergency_access.rs#L472, L510, L543](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L472)
 
@@ -1225,9 +1267,9 @@ if let Err(e) = mail::send_new_device_logged_in(...).await {
 
 ---
 
-### 14.4 保留给定时任务重试场景
+### 14.5 保留重试（定时任务）场景
 
-#### 14.4.1 2FA 未完成提醒
+#### 14.5.1 2FA 未完成提醒
 **代码位置**：[two_factor/mod.rs#L255-L283](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/mod.rs#L255-L283)
 
 ```
@@ -1272,9 +1314,9 @@ match mail::send_incomplete_2fa_login(...).await {
 
 ---
 
-### 14.5 更新时间后发送失败场景
+### 14.6 先更后发（状态已更新）场景
 
-#### 14.5.1 紧急访问恢复超时（定时任务）
+#### 14.6.1 紧急访问恢复超时（定时任务）
 **代码位置**：[emergency_access.rs#L727-L775](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L727-L775)
 
 ```
@@ -1308,7 +1350,7 @@ match mail::send_incomplete_2fa_login(...).await {
 
 ---
 
-#### 14.5.2 紧急访问恢复提醒（定时任务）
+#### 14.6.2 紧急访问恢复提醒（定时任务）
 **代码位置**：[emergency_access.rs#L777-L834](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L777-L834)
 
 ```
@@ -1339,9 +1381,9 @@ match mail::send_incomplete_2fa_login(...).await {
 
 ---
 
-### 14.6 必须成功但不落库场景
+### 14.7 先存后发（必须成功，记录已变更）场景
 
-#### 14.6.1 2FA 令牌发送（登录时）
+#### 14.7.1 2FA 令牌发送（登录时）
 **代码位置**：[email.rs#L109-L123](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/email.rs#L109-L123)
 
 ```
@@ -1366,7 +1408,7 @@ match mail::send_incomplete_2fa_login(...).await {
 
 ---
 
-#### 14.6.2 2FA 邮箱配置验证
+#### 14.7.2 2FA 邮箱配置验证
 **代码位置**：[email.rs#L158-L191](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/email.rs#L158-L191)
 
 ```
@@ -1391,7 +1433,7 @@ match mail::send_incomplete_2fa_login(...).await {
 
 ---
 
-#### 14.6.3 受保护操作令牌
+#### 14.7.3 受保护操作令牌
 **代码位置**：[protected_actions.rs#L87-L96](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/protected_actions.rs#L87-L96)
 
 ```
@@ -1414,7 +1456,28 @@ match mail::send_incomplete_2fa_login(...).await {
 
 ---
 
-#### 14.6.4 注册验证邮件
+#### 14.7.5 管理员重置密码
+**代码位置**：[organizations.rs#L2943](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L2943)
+
+```
+处理顺序：
+
+1. 重置用户密码
+        ↓
+2. 发送邮件通知（mail::send_admin_reset_password(...).await?）
+        ↓
+3. 发送失败 → 密码已重置但用户不知情
+```
+
+**记录变化**：
+- ✅ 密码已重置
+- ❌ 发送失败不回滚
+
+---
+
+### 14.8 先发后存（必须成功，记录未入库）场景
+
+#### 14.8.1 注册验证邮件
 **代码位置**：[identity.rs#L1061-L1075](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L1061-L1075)
 
 ```
@@ -1433,7 +1496,7 @@ match mail::send_incomplete_2fa_login(...).await {
 
 ---
 
-#### 14.6.5 SSO 邮箱变更通知
+#### 14.8.2 SSO 邮箱变更通知
 **代码位置**：[identity.rs#L328-L331](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L328-L331)
 
 ```
@@ -1452,7 +1515,7 @@ match mail::send_incomplete_2fa_login(...).await {
 
 ---
 
-#### 14.6.6 组织移除 2FA 通知
+#### 14.7.4 组织移除 2FA 通知
 **代码位置**：[two_factor/mod.rs#L184-L187](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/mod.rs#L184-L187)
 
 ```
@@ -1471,17 +1534,53 @@ match mail::send_incomplete_2fa_login(...).await {
 
 ---
 
-#### 14.6.7 邮箱变更系列邮件
-**代码位置**：[accounts.rs#L945-L995](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L945-L995)
+#### 14.8.3 SMTP 测试邮件
+**代码位置**：[admin.rs#L337-L346](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L337-L346)
 
 ```
-发送变更验证邮件 → 失败：邮箱不变更
-发送变更通知邮件 → 失败：变更已生效但无通知
+处理顺序：
+
+1. 发送测试邮件（mail::send_test(...).await?）
+        ↓
+2. 发送失败 → 返回错误
+```
+
+**记录变化**：
+- ❌ 无数据库记录
+- ❌ 无状态影响
+
+---
+
+#### 14.8.4 密码提示邮件
+**代码位置**：[accounts.rs#L1190-L1221](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1190-L1221)
+
+```
+处理顺序：
+
+1. 查找用户（防枚举：用户不存在时也假装成功）
+        ↓
+2. 发送密码提示邮件（mail::send_password_hint(email, hint).await?）
+        ↓
+3. 发送失败 → 返回错误
+```
+
+**记录变化**：
+- ❌ 无数据库记录
+- ❌ 无状态影响
+
+---
+
+#### 14.8.5 邮箱变更系列邮件
+**代码位置**：[accounts.rs#L945-L991](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L945-L991)
+
+```
+变更验证邮件（send_change_email）：宽松捕获，失败后 email_new/email_new_token 已设置
+变更通知邮件（send_change_email_existing/invited）：宽松捕获，失败无影响
 ```
 
 ---
 
-### 14.7 邀请失败结果核对表
+### 14.9 邀请失败结果核对表
 
 | 邀请场景 | 发送前保存 | 失败后清理 | 最终状态 | 代码位置 |
 |----------|-----------|-----------|----------|----------|
@@ -1496,7 +1595,7 @@ match mail::send_incomplete_2fa_login(...).await {
 
 ---
 
-### 14.8 验证邮件失败结果核对表
+### 14.10 验证邮件失败结果核对表
 
 | 验证场景 | 触发方式 | 失败策略 | 记录变化 | 代码位置 |
 |----------|---------|---------|----------|----------|
@@ -1511,33 +1610,33 @@ match mail::send_incomplete_2fa_login(...).await {
 
 ---
 
-### 14.9 设计模式总结
+### 14.11 设计模式总结
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    发送顺序设计模式                              │
 ├─────────────────────────────────────────────────────────────────┤
-│ 🔴 模式 A：先保存，再发送，失败回滚                              │
+│ 🔴 模式 A：先存再发，失败回滚                                   │
 │    组织邀请（新用户）                                            │
 │    优点：原子性，失败不残留垃圾数据                              │
 │    缺点：需要实现回滚逻辑                                        │
 ├─────────────────────────────────────────────────────────────────┤
-│ 🟡 模式 B：先发送，再保存                                      │
-│    管理端邀请                                                    │
+│ 🟡 模式 B：先发再存                                             │
+│    管理端邀请、注册验证邮件                                      │
 │    优点：实现简单，无回滚需求                                    │
 │    缺点：极端情况（发送成功但保存失败）可能导致邮件已发但数据丢失 │
 ├─────────────────────────────────────────────────────────────────┤
-│ 🟢 模式 C：先保存，再发送，失败不回滚（必须成功）                │
-│    2FA 令牌、邮箱配置                                            │
+│ 🟢 模式 C：先存再发，失败不回滚（必须成功）                     │
+│    2FA 令牌、邮箱配置、组织移除 2FA、管理员重置密码              │
 │    优点：数据一致性由 ? 保证                                     │
 │    缺点：发送失败时数据已更新，可能需要手动清理                   │
 ├─────────────────────────────────────────────────────────────────┤
-│ 🔵 模式 D：先保存，再发送，失败不回滚（宽松捕获）                │
-│    欢迎邮件、通知类邮件                                          │
+│ 🔵 模式 D：先存再发，失败不回滚（宽松捕获）                     │
+│    欢迎邮件、验证邮件、通知类邮件                                │
 │    优点：不影响主流程                                            │
 │    缺点：用户可能收不到邮件                                      │
 ├─────────────────────────────────────────────────────────────────┤
-│ 🟣 模式 E：先更新状态，再发送，失败 panic                      │
+│ 🟣 模式 E：先更状态，再发邮件，失败 panic                       │
 │    紧急访问定时任务                                              │
 │    优点：关键状态必须持久化                                      │
 │    缺点：程序崩溃，需要人工介入                                  │
@@ -1546,7 +1645,7 @@ match mail::send_incomplete_2fa_login(...).await {
 
 ---
 
-### 14.10 风险点与建议
+### 14.12 风险点与建议
 
 | 风险场景 | 问题 | 建议 |
 |----------|------|------|
