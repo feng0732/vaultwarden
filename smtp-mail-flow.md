@@ -76,9 +76,9 @@ pub fn mail_enabled(&self) -> bool {
 |----------|----------|----------|
 | 用户注册（需验证） | [accounts.rs#L320](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L320) | `send_welcome_must_verify` |
 | 用户注册（无需验证） | [accounts.rs#L324](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L324) | `send_welcome` |
-| 邮箱验证请求 | [accounts.rs#L1065](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1065) | `send_verify_email` |
-| 注册验证邮件 | [identity.rs#L1072](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L1072) | `send_register_verify_email` |
-| 账户删除请求 | [accounts.rs#L1115](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1115) | `send_delete_account` |
+| 邮箱验证请求 | [accounts.rs#L1057-L1070](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1057-L1070) | `send_verify_email` |
+| 注册验证邮件 | [identity.rs#L1061-L1075](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L1061-L1075) | `send_register_verify_email` |
+| 账户删除请求 | [accounts.rs#L1113-L1119](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1113-L1119) | `send_delete_account` |
 | 密码提示 | [accounts.rs#L1212](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1212) | `send_password_hint` |
 | 新设备登录 | [identity.rs#L480](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L480) | `send_new_device_logged_in` |
 | 邮箱变更 | [accounts.rs#L962-L982](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L962-L982) | `send_change_email*` |
@@ -338,7 +338,7 @@ multipart/alternative
 
 ### 6.2 触发点的错误处理策略
 
-#### 宽松策略（仅记录错误，不影响主流程）
+#### 宽松捕获（仅记录错误，不影响主流程）
 
 大多数场景使用此策略，邮件发送失败不阻止操作继续：
 
@@ -407,20 +407,31 @@ if let Err(e) = mail::send_invite(...).await {
 
 ### 6.3 定时任务中的错误处理
 
-在定时任务中，邮件发送失败会被记录但不中断任务：
+定时任务根据邮件重要性采用不同的失败处理策略：
+
+#### 重试保留策略（记录保留，下次重试）
 
 ```rust
-// 示例: two_factor/mod.rs#L265-L280
+// 示例: two_factor/mod.rs#L265-L282 （2FA 未完成提醒）
 match mail::send_incomplete_2fa_login(...).await {
     Ok(()) => {
-        // 发送成功后删除记录
+        // 发送成功后删除记录，不再重试
         login.delete(&conn).await
     }
     Err(e) => {
         error!("Error sending incomplete 2FA email: {e:#?}");
-        // 不删除记录，下次继续尝试
+        // 不删除记录，下次任务继续尝试
     }
 }
+```
+
+#### 强制崩溃策略（关键安全操作，失败则 panic）
+
+紧急访问定时任务使用 `.expect()`，发送失败直接终止程序：
+```rust
+// 示例: emergency_access.rs#L758, L820
+mail::send_emergency_access_recovery_timed_out(...).await
+    .expect("Error on sending email");
 ```
 
 ---
@@ -610,8 +621,8 @@ pub struct InviteJwtClaims {
 #### 10.2.1 邮箱验证邮件（send_verify_email）
 
 ##### 触发入口
-- 用户主动请求验证：[accounts.rs#L1065](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1065)
-- 登录时自动发送（未验证邮箱）：[identity.rs#L445](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L445)
+- 用户主动请求验证：[accounts.rs#L1057-L1070](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1057-L1070)
+- 登录时自动发送（未验证邮箱）：[identity.rs#L443-L447](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L443-L447)
 
 ##### 完整处理流程
 
@@ -667,8 +678,8 @@ pub struct BasicJwtClaims {
 
 | 触发位置 | 错误策略 | 代码位置 |
 |----------|----------|----------|
-| 主动请求验证 | 必须成功，使用 `?` | [accounts.rs#L1065](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1065) |
-| 登录时自动发送 | 宽松策略，仅记录错误，不阻止登录 | [identity.rs#L445-L447](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L445-L447) |
+| 主动请求验证 | 宽松捕获，仅记录错误，接口仍返回成功 | [accounts.rs#L1057-L1070](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1057-L1070) |
+| 登录时自动发送 | 宽松捕获，仅记录错误，不阻止登录 | [identity.rs#L443-L447](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L443-L447) |
 
 ---
 
@@ -948,7 +959,7 @@ POST /organizations/{org_id}/users/reinvite
 
 #### 错误处理
 - 单个重发：必须成功策略
-- 批量重发：宽松策略，每个成员独立处理，错误记录在响应中不中断整体流程
+- 批量重发：宽松捕获，每个成员独立处理，错误记录在响应中不中断整体流程
   ```rust
   let err_msg = match reinvite_member_impl(...).await {
       Ok(()) => String::new(),
