@@ -795,21 +795,182 @@ Outcome::Success(Self { ip })
 - JWT 验证失败时才会删除 Cookie
 - 重启本身不删除 Cookie，也不改变密钥/issuer，所以 JWT 仍然有效
 
-### 6.5 典型场景的行为矩阵
+### 6.5 路由挂载与会话校验：两个独立的层级
+
+必须区分两个完全独立的层级：
+
+1. **路由层**：启动时决定挂载哪些路由，运行时不变
+2. **认证层**：每次请求时动态检查，运行时可变
+
+**路由可访问 ≠ 请求能通过认证**，反过来 **JWT/Cookie 有效 ≠ 路由存在**。
+
+#### 路由层的判定逻辑
+
+[routes()](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/api/admin.rs#L41-L75) 在启动时执行一次，根据两个配置项的组合决定返回什么：
+
+```rust
+pub fn routes() -> Vec<Route> {
+    if !CONFIG.disable_admin_token() && !CONFIG.is_admin_token_set() {
+        // 条件：disable_admin_token=false 且 ADMIN_TOKEN 未设置
+        return routes![admin_disabled];  // 只有禁用提示页
+    }
+    // 条件：disable_admin_token=true 或 ADMIN_TOKEN 已设置
+    routes![ /* 全部 30+ 个管理路由 */ ]
+}
+```
+
+[catchers()](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/api/admin.rs#L77-L83) 同理：
+
+```rust
+pub fn catchers() -> Vec<Catcher> {
+    if !CONFIG.disable_admin_token() && !CONFIG.is_admin_token_set() {
+        catchers![]             // 无 401 catcher → 不会被拦截到登录页
+    } else {
+        catchers![admin_login]  // 有 401 catcher → 未认证请求重定向到登录页
+    }
+}
+```
+
+**[admin_disabled](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/api/admin.rs#L100-L103)** 是唯一的路由，只返回纯文本：
+
+```rust
+#[get("/")]
+fn admin_disabled() -> &'static str {
+    "The admin panel is disabled, please configure the 'ADMIN_TOKEN' variable to enable it"
+}
+```
+
+**关键点**：当只有 `admin_disabled` 路由时，所有 `/admin/*` 子路径都返回 404（路由不存在），即使客户端持有有效 Cookie 也无法访问任何管理功能。
+
+#### 认证层的判定逻辑
+
+[AdminToken::from_request()](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/api/admin.rs#L830-L866) 在每次请求时执行：
+
+```rust
+if !CONFIG.disable_admin_token() {
+    // 条件：disable_admin_token=false → 需要认证
+    let access_token = cookies.get(COOKIE_NAME).map(|c| c.value());
+    if let Some(token) = access_token {
+        if decode_admin(token).is_err() {
+            cookies.remove(...);
+            return Outcome::Error((Status::Unauthorized, "Session expired"));
+        }
+    } else {
+        // 无 Cookie
+        if requested_page.is_empty() {
+            return Outcome::Forward(Status::Unauthorized);  // → 触发 admin_login catcher → 显示登录页
+        }
+        return Outcome::Error((Status::Unauthorized, "Unauthorized"));  // → 触发 admin_login catcher
+    }
+}
+// 条件：disable_admin_token=true → 跳过认证，直接成功
+Outcome::Success(Self { ip })
+```
+
+#### 两层逻辑的组合真相表
+
+以**启动时的配置组合**为基准（运行时修改不影响路由）：
+
+| disable_admin_token | ADMIN_TOKEN | 路由层结果 | 认证层行为 | 实际效果 |
+|---|---|---|---|---|
+| `false` | 未设置 | 仅 `admin_disabled` | N/A（此路由无需 AdminToken） | 面板禁用，显示提示文本 |
+| `false` | 已设置 | 完整路由 | 需要 JWT 认证 | 面板启用，登录后可操作 |
+| `true` | 未设置 | 完整路由 | 跳过认证 | 面板启用，任何人可访问 |
+| `true` | 已设置 | 完整路由 | 跳过认证 | 面板启用，任何人可访问（ADMIN_TOKEN 被忽略） |
+
+注意第三行的反直觉情况：`disable_admin_token=true` 且 `ADMIN_TOKEN` 未设置时，完整路由仍然被挂载。这是因为 `routes()` 中的条件是 `&&`，只要 `disable_admin_token=true` 就进入完整路由分支，`ADMIN_TOKEN` 是否设置不影响路由挂载。但此时认证层跳过了 JWT 检查，所以**任何人无需登录即可操作**。
+
+#### 请求处理的两阶段流程图
+
+```
+客户端请求 /admin/xxx
+       │
+       ▼
+  ┌─────────────────────────────────┐
+  │ 阶段1：路由匹配（启动时确定）      │
+  │                                   │
+  │ disable_admin_token=false         │
+  │   且 ADMIN_TOKEN 未设置？          │
+  │   → 匹配 admin_disabled          │
+  │   → 返回 "The admin panel is     │
+  │      disabled..." 文本            │
+  │   → 请求结束，不进入阶段2          │
+  │                                   │
+  │ 否则 → 匹配完整路由               │
+  │   → 进入阶段2                     │
+  └─────────────────────────────────┘
+       │
+       ▼
+  ┌─────────────────────────────────┐
+  │ 阶段2：认证检查（每次请求动态）    │
+  │                                   │
+  │ disable_admin_token=false？       │
+  │   → 检查 Cookie 中的 JWT          │
+  │     有且有效 → 请求通过            │
+  │     有但无效 → 删 Cookie, 401     │
+  │     无且 /admin → Forward→登录页  │
+  │     无且子路径 → 401              │
+  │                                   │
+  │ disable_admin_token=true？        │
+  │   → 跳过认证，直接通过            │
+  └─────────────────────────────────┘
+```
+
+#### "Cookie 有效"与"路由可访问"的独立性示例
+
+| 场景 | Cookie 状态 | 路由状态 | 实际访问结果 |
+|---|---|---|---|
+| 启动时 ADMIN_TOKEN 未设置，未重启就通过环境变量设置 | 有效（假设之前有） | 仅 admin_disabled | ❌ 返回禁用文本，Cookie 无用 |
+| 启动时 ADMIN_TOKEN 已设置，运行时删除 ADMIN_TOKEN（面板操作） | 有效 | 完整路由 | ✅ 仍可通过 JWT 访问所有路由 |
+| 启动时 ADMIN_TOKEN 已设置，运行时通过面板将 ADMIN_TOKEN 清空 | 有效但无法登录新会话 | 完整路由 | ✅ 旧会话有效，❌ 新登录失败 |
+| 修改 domain 后重启 | Cookie 中 JWT 仍存在但 issuer 不匹配 | 取决于新配置 | ❌ issuer 验证失败，Cookie 被删除 |
+
+### 6.6 环境变量重启后的配置组合与访问结果
+
+以下是**通过环境变量修改配置并重启后**，所有可能组合的完整访问结果矩阵。
+
+**前提假设**：RSA 密钥文件未被手动删除，domain 配置未改变。
+
+| # | disable_admin_token | ADMIN_TOKEN | 路由层 | 认证层 | 有 Cookie 能否访问 | 无 Cookie 能否访问 | 新登录 | 实际效果 |
+|---|---|---|---|---|---|---|---|---|
+| 1 | `false` | 未设置 | admin_disabled | N/A | ❌ 只返回禁用文本 | ❌ 只返回禁用文本 | ❌ 无登录入口 | 面板禁用 |
+| 2 | `false` | 已设置 | 完整路由 | JWT 认证 | ✅ JWT 有效则通过 | ❌ → 登录页 | ✅ 用 token 登录 | 面板启用，需认证 |
+| 3 | `true` | 未设置 | 完整路由 | 跳过认证 | ✅ 直接通过 | ✅ 直接通过 | N/A 无需登录 | 面板启用，无认证⚠️ |
+| 4 | `true` | 已设置 | 完整路由 | 跳过认证 | ✅ 直接通过 | ✅ 直接通过 | N/A 无需登录 | 面板启用，无认证⚠️ |
+
+**关于已有 Cookie 在重启后的命运**：
+
+| # | 重启前有 Cookie | 重启后 Cookie 命运 | 原因 |
+|---|---|---|---|
+| 1 | - | 路由只有 admin_disabled，Cookie 存在但无意义 | 请求匹配 admin_disabled，不经过认证层 |
+| 2 | ✅ | Cookie 仍然有效，JWT 验证通过（密钥/issuer 未变） | 认证层检查 JWT，RSA 密钥文件持久化 |
+| 3 | ✅ | Cookie 存在但被忽略 | 认证层跳过，不读 Cookie |
+| 4 | ✅ | Cookie 存在但被忽略 | 认证层跳过，不读 Cookie |
+
+**特别注意组合 #1 的细节**：
+- 重启前如果面板是启用的（如组合 #2），用户持有有效 Cookie
+- 修改环境变量 `ADMIN_TOKEN=""` 后重启，变为组合 #1
+- 路由层只挂载了 `admin_disabled`，所有 `/admin/*` 请求都匹配到禁用提示页
+- **即使 Cookie 中 JWT 仍然有效，也无法访问任何管理功能**——因为路由根本不存在
+- Cookie 不会被删除（因为没有触发 `cookies.remove`），但形同虚设
+
+### 6.7 典型场景的行为矩阵
 
 以下是几种常见配置改动场景的行为总结：
 
 | 场景 | 修改路径 | 路由是否可用 | 新登录行为 | 现有会话 | 备注 |
 |---|---|---|---|---|---|
-| **启动时无 ADMIN_TOKEN → 运行时设置 ADMIN_TOKEN** | 环境变量/配置文件 + 重启 | ✅ 重启后可用 | ✅ 新 token 生效 | N/A | 必须重启，路由只在启动时挂载 |
-| **启动时有 ADMIN_TOKEN → 运行时删除 ADMIN_TOKEN** | 管理面板 | ✅ 可用 | ❌ 无法登录 | ✅ 保持有效 | 路由已挂载，只是 validate_token 返回 false |
-| **运行时修改 ADMIN_TOKEN 值** | 管理面板 | ✅ 可用 | ❌ 旧 token 失败<br>✅ 新 token 成功 | ✅ 保持有效 | 已登录会话不受影响 |
+| **启动时无 ADMIN_TOKEN → 设置后重启** | 环境变量/配置文件 + 重启 | ✅ 重启后完整路由 | ✅ 新 token 生效 | N/A（之前无面板） | 必须重启，路由只在启动时挂载 |
+| **启动时有 ADMIN_TOKEN → 运行时删除 ADMIN_TOKEN** | 管理面板 | ✅ 完整路由不变 | ❌ 无法登录 | ✅ JWT 有效则通过 | 路由已挂载，只是 validate_token 返回 false |
+| **运行时修改 ADMIN_TOKEN 值** | 管理面板 | ✅ 完整路由不变 | ❌ 旧 token 失败<br>✅ 新 token 成功 | ✅ JWT 有效则通过 | 已登录会话不受影响 |
 | **修改 disable_admin_token 值** | 管理面板 | ❌ 无法修改 | - | - | 面板提交时会被 clear_non_editable 清除 |
-| **修改 disable_admin_token 值** | 环境变量 + 重启 | ✅ 可用 | 取决于新值 | ✅ Cookie 仍然有效 | disable_admin_token=true 时跳过认证<br>disable_admin_token=false 时验证 JWT（密钥/issuer 未变则通过） |
-| **运行时修改 admin_session_lifetime** | 管理面板 | ✅ 可用 | ✅ 新会话使用新值 | ✅ 旧会话仍用原值 | JWT 的 exp 在签发时确定 |
-| **运行时修改 admin_ratelimit 参数** | 环境变量 + 重启 | ✅ 可用 | ✅ 仍受原限流（运行时）<br>✅ 新限流（重启后） | ✅ 不受影响 | 限流器是 LazyLock 初始化的 |
+| **disable_admin_token: false→true + 重启** | 环境变量 + 重启 | ✅ 完整路由 | N/A 无需登录 | ✅ 直接通过（跳过认证） | 认证层不再检查 JWT |
+| **disable_admin_token: true→false + 重启** | 环境变量 + 重启 | 取决于 ADMIN_TOKEN | ✅ 用 token 登录 | ✅ JWT 有效则通过 | 如 ADMIN_TOKEN 已设置则完整路由；否则只有 admin_disabled |
+| **ADMIN_TOKEN 已设置→清空 + 重启（disable=false）** | 环境变量 + 重启 | ❌ 只有 admin_disabled | ❌ 无登录入口 | ❌ Cookie 无用（路由不存在） | 最安全的禁用方式：路由和认证同时失效 |
+| **运行时修改 admin_session_lifetime** | 管理面板 | ✅ 完整路由不变 | ✅ 新会话使用新值 | ✅ 旧会话仍用原值 | JWT 的 exp 在签发时确定 |
+| **运行时修改 admin_ratelimit 参数** | 环境变量 + 重启 | ✅ 完整路由不变 | ✅ 仍受原限流（运行时）<br>✅ 新限流（重启后） | ✅ 不受影响 | 限流器是 LazyLock 初始化的 |
 
-### 6.6 安全启示
+### 6.8 安全启示
 
 1. **真正使管理员会话失效的方法**：
    - 由于没有 JWT 吊销机制，只能等待 JWT 自然过期（默认 20 分钟）
