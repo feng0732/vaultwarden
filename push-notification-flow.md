@@ -662,3 +662,222 @@ Push Relay（Bitwarden 官方托管服务）收到推送请求后，会通过 FC
 ```
 
 **关键认知**：推送通知本身不携带完整的 Vault 数据，仅是一个"触发信号"。客户端收到推送后，通过 `/sync` 主动拉取最新数据。因此即使推送丢失，用户手动刷新也能恢复一致——只是时效性下降。
+
+---
+
+## 十二、设备定位：Token 上报与清理的双轨逻辑
+
+### 12.1 两个 API 的定位机制对比
+
+Vaultwarden 提供了两个与 Push Token 管理相关的 API，它们的设备定位逻辑**完全不同**：
+
+| API 端点 | 设备定位方式 | 用户校验 | 路径参数 `device_id` 的作用 |
+|---------|-------------|---------|---------------------------|
+| `PUT /devices/identifier/<device_id>/token` | 认证头 `headers.device.uuid` | ✓ JWT 认证 | **被忽略** |
+| `PUT /devices/identifier/<device_id>/clear-token` | 路径参数 `device_id` | ✗ 无认证 | **作为唯一依据** |
+
+---
+
+### 12.2 Token 上报：认证头优先，路径参数弃用
+
+**函数定义**：[accounts.rs#L1395-L1420](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/api/core/accounts.rs#L1395-L1420)
+
+```rust
+async fn put_device_token(
+    device_id: DeviceId,        // ← 路径参数，存在但不使用！
+    data: Json<PushToken>,
+    headers: Headers,           // ← 认证头，包含 device 和 user
+    conn: DbConn
+) -> EmptyResult {
+    let token = data.push_token;
+
+    // 🔴 关键：查询使用的是 headers.device.uuid，不是路径参数 device_id
+    let Some(mut device) = Device::find_by_uuid_and_user(
+        &headers.device.uuid,    // ← 来自 JWT token 的 device
+        &headers.user.uuid,      // ← 来自 JWT token 的 user
+        &conn
+    ).await else {
+        // 错误消息却显示路径参数的 device_id，造成误导
+        err!(format!("Error: device {device_id} should be present before a token can be assigned"))
+    };
+
+    // token 去重检查
+    if device.push_token.as_ref() == Some(&token) {
+        debug!("Device {device_id} for user {} is already registered and token is identical", ...);
+        return Ok(());
+    }
+
+    // 更新 token 并注册
+    device.push_token = Some(token);
+    device.save(true, &conn).await?;
+    register_push_device(&mut device, &conn).await?;
+
+    Ok(())
+}
+```
+
+#### 定位机制分析
+
+1. **认证头设备信息的来源**：
+   - `Headers` 是 Rocket 的 `FromRequest` 守卫，会从请求的 `Authorization: Bearer <JWT>` 中解析 token
+   - JWT 中包含 `device` claim，对应用户登录时的 `device_id`
+   - `Headers::from_request` 通过 `Device::find_by_uuid_and_user(&device_id, &user_id, &conn)` 查询设备
+   - 因此 `headers.device` 一定是**当前登录用户的有效设备**
+
+2. **路径参数的命运**：
+   - 路径 `device_id` 仅出现在错误消息和 debug 日志中
+   - 实际查询完全不使用路径参数
+   - **即使路径参数与认证头设备不一致，也不会报错**，静默使用认证头的设备
+
+3. **安全边界**：
+   - ✓ JWT 认证保证用户身份
+   - ✓ 设备必须属于当前用户
+   - ✗ 不校验路径参数与认证设备的一致性
+
+#### 实际影响
+
+客户端必须确保以下三点一致，否则会出现"操作了错误的设备"的问题：
+- 登录请求的 `device_identifier`
+- JWT token 中携带的 `device` claim
+- 上报 Token API 路径中的 `device_id`
+
+由于 Vaultwarden 静默使用认证头设备，即使路径参数写错，也只会静默给"当前登录设备"设置 token，不会报错。
+
+---
+
+### 12.3 Token 清理：路径参数优先，无认证
+
+**函数定义**：[accounts.rs#L1422-L1441](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/api/core/accounts.rs#L1422-L1441)
+
+```rust
+async fn put_clear_device_token(
+    device_id: DeviceId,    // ← 唯一的设备定位依据
+    conn: DbConn
+    // 🔴 关键：没有 headers: Headers 参数！
+) -> EmptyResult {
+    if !CONFIG.push_enabled() {
+        return Ok(());
+    }
+
+    // 🔴 关键：直接用 device_id 查询，不校验用户归属
+    if let Some(device) = Device::find_by_uuid(&device_id, &conn).await {
+        // 清空数据库中的 push_token
+        Device::clear_push_token_by_uuid(&device_id, &conn).await?;
+        // 向 Relay 发送注销请求
+        unregister_push_device(device.push_uuid.as_ref()).await?;
+    }
+
+    Ok(())
+}
+```
+
+#### 定位机制分析
+
+1. **没有认证守卫**：
+   - 函数参数中没有 `headers: Headers`
+   - Rocket 不会触发 `Headers::from_request` 的 JWT 认证
+   - **理论上任何人都可以调用此 API**
+
+2. **设备定位逻辑**：
+   - 直接使用 `Device::find_by_uuid(&device_id, &conn)` 查询
+   - `find_by_uuid` 只按 `device.uuid` 主键查询，**不校验用户归属**
+   - 只要 device_id 存在，就会清空其 push_token 并注销
+
+3. **代码注释的自我说明**：
+   ```rust
+   // This is somehow not implemented in any app, added it in case it is required
+   // 2025: Also, it looks like it only clears the first found device upstream, which is probably faulty.
+   //       This because currently multiple accounts could be on the same device/app and that would cause issues.
+   //       Vaultwarden removes the push-token for all devices, but this probably means we should also unregister all these devices.
+   ```
+   - 此 API **未被任何客户端实际使用**，仅为预留接口
+   - 上游 Bitwarden 也有类似问题（只清空第一个找到的设备）
+   - 注释本身就承认设计可能有缺陷
+
+4. **实际安全状态**：
+   - 虽然没有认证，但由于：
+     - `device_id` 是 UUID（熵足够高，难以暴力枚举）
+     - 仅能清空 push_token，无法访问或修改其他数据
+     - 影响有限（用户再次上报 token 即可恢复）
+   - 风险较低但设计不一致
+
+---
+
+### 12.4 两个 API 的定位逻辑差异汇总
+
+| 对比维度 | 设置 Token API | 清理 Token API |
+|---------|---------------|---------------|
+| 认证机制 | `Headers` JWT 认证 | 无认证 |
+| 设备定位依据 | `headers.device.uuid` | 路径参数 `device_id` |
+| 路径参数作用 | 仅用于日志/错误消息 | 唯一查询条件 |
+| 用户归属校验 | ✓ 设备必须属于当前用户 | ✗ 不校验 |
+| 实际使用状态 | ✓ 移动端登录后主动调用 | ✗ 无客户端使用（预留接口） |
+| 代码位置 | [accounts.rs#L1395-L1420](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/api/core/accounts.rs#L1395-L1420) | [accounts.rs#L1422-L1441](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/api/core/accounts.rs#L1422-L1441) |
+
+---
+
+### 12.5 对 push_uuid / push_token 校验边界的影响
+
+这种双轨定位设计导致了校验边界的不一致：
+
+#### 场景 A：设置 Token（认证头优先）
+
+```
+调用 PUT /devices/identifier/DEVICE_A/token
+    ↓
+Headers JWT 解析出设备为 DEVICE_B
+    ↓
+查询并设置 DEVICE_B 的 token ← 路径参数 DEVICE_A 被忽略
+    ↓
+register_push_device 使用 DEVICE_B 的 push_uuid 和 push_token
+```
+
+**校验边界**：在 `Headers::from_request` 阶段就确保了设备合法性，后续操作都在安全范围内。
+
+#### 场景 B：清理 Token（路径参数优先）
+
+```
+调用 PUT /devices/identifier/DEVICE_X/clear-token
+    ↓
+无 Headers，无认证
+    ↓
+直接查询 DEVICE_X
+    ↓
+清空 DEVICE_X 的 token 并注销其 push_uuid
+```
+
+**校验边界**：仅依赖 UUID 的不可预测性，没有业务层面的校验。
+
+#### 一致性问题
+
+1. **push_uuid 的一致性风险**：
+   - 设置 Token：push_uuid 由认证头设备提供，经过 JWT 校验
+   - 清理 Token：push_uuid 直接从查询到的设备读取，无校验
+
+2. **多用户共享设备场景**：
+   - 同一物理设备（同一 device.app）上登录多个账号时，会有多条 Device 记录共享相同的 `device.uuid`
+   - 设置 Token：只会给"当前登录用户的那条设备记录"设置
+   - 清理 Token：`find_by_uuid` 可能找到多个用户的设备，但实际只处理第一条（SQL 排序不确定）
+
+3. **潜在的错位**：
+   - 用户 A 登录设备 D → JWT 设备为 D_A（user=A, device=D）
+   - 用户 B 登录设备 D → JWT 设备为 D_B（user=B, device=D）
+   - 设备 D 的 app 调用清理 API 传入 `device_id=D`
+   - 会清空哪个用户的 token？取决于 `find_by_uuid` 的查询结果顺序
+
+---
+
+### 12.6 结论：为什么会有这种差异？
+
+从代码和注释可以推断出设计演进的历史原因：
+
+1. **设置 Token API** 是核心功能，需要严格认证，使用 JWT 中的设备信息确保安全
+2. **清理 Token API** 是预留/边缘功能，可能是：
+   - 为了方便设备端在无 JWT 上下文时调用（如 app 卸载/登出时）
+   - 或者想设计为全局设备标识的清理（一个 app 清理所有用户）
+   - 但最终没有被任何客户端实际使用，成为了半吊子实现
+
+**实际使用建议**：如果需要启用/使用清理 Token 的功能，应该：
+- 补充 `Headers` 认证守卫
+- 统一按用户 + 设备定位
+- 或者明确设计为"按 device.app 全局清理所有关联用户"的语义
