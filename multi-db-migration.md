@@ -24,23 +24,35 @@ Vaultwarden 使用 Diesel ORM 框架实现多数据库支持，通过**编译时
 
 ```
 migrations/
-├── sqlite/          # 57 个迁移脚本 (2018-01-14 ~ 2026-05-05)
+├── sqlite/          # 56 个迁移脚本 (2018-01-14 ~ 2026-05-05)
 │   ├── 2018-01-14-171611_create_tables/
 │   ├── ...
 │   └── 2026-05-05-120000_sso_auth_error/
-├── mysql/           # 56 个迁移脚本 (2018-01-14 ~ 2026-05-05)
+├── mysql/           # 55 个迁移脚本 (2018-01-14 ~ 2026-05-05)
 │   ├── 2018-01-14-171611_create_tables/
 │   ├── ...
 │   └── 2026-05-05-120000_sso_auth_error/
-└── postgresql/      # 47 个迁移脚本 (2019-09-12 ~ 2026-05-05)
+└── postgresql/      # 46 个迁移脚本 (2019-09-12 ~ 2026-05-05)
     ├── 2019-09-12-100000_create_tables/
     ├── ...
     └── 2026-05-05-120000_sso_auth_error/
 ```
 
 **数量差异原因**：
-- **PostgreSQL 起步较晚**：第一个迁移从 2019-09 开始，直接创建完整表结构，而非像 SQLite/MySQL 那样逐步演进，因此缺少 2018-01 至 2019-09 间的 10 个演进式迁移
-- **MySQL 缺少 `2021-03-15-163412_rename_send_key`**：MySQL 在 `2021-03-11-190243_add_sends` 创建 sends 表时直接使用 `akey` 列名，避免了后续改名
+
+SQLite 与 MySQL 差 1 个：
+- SQLite 有 `2021-03-15-163412_rename_send_key`，MySQL 没有
+- MySQL 在 `2021-03-11_add_sends` 创建 sends 表时直接使用 `akey` 列名，无需后续改名
+
+SQLite 与 PostgreSQL 差 10 个：
+- PostgreSQL 起步较晚（2019-09），用 1 个 `create_tables` 迁移替代了 SQLite 前 9 个演进式迁移
+- PostgreSQL 缺少 `2019-05-26-216651_rename_key_and_type_columns`（起步即用 `akey`/`atype`，无需改名）
+- PostgreSQL 独有 `2019-09-16-150000_fix_attachments`（CHAR→VARCHAR 修正）
+- 净差：SQLite 比 PostgreSQL 多 9 个演进迁移 + 1 个改名迁移，但 PG 多 2 个独有迁移 → 56 - 9 - 1 + 2 = 46 ✅
+
+同一迁移的目录名称在三种数据库间存在细微差异：
+- `change_time_stamp_data_type` 时间戳部分：SQLite=`140000`, MySQL=`135828`, PostgreSQL=`135953`
+- `sso_userscascade` 目录：SQLite=`2024-03-13_170000_sso_userscascade`（下划线分隔符），MySQL/PG=`2024-03-13-170000_sso_users_cascade`（横线分隔符+多下划线）
 
 ### 2.2 代码层面的迁移执行
 
@@ -365,7 +377,7 @@ db_run! { conn:
 | 维度 | SQLite | MySQL | PostgreSQL |
 |------|--------|-------|------------|
 | **迁移起点** | 2018-01 | 2018-01 | 2019-09 (跳过早期演进) |
-| **迁移数量** | 57 | 56 | 47 |
+| **迁移数量** | 56 | 55 | 46 |
 | **UUID 类型** | TEXT | CHAR(36) | CHAR(36) → VARCHAR(40) |
 | **时间类型** | DATETIME | DATETIME | TIMESTAMP |
 | **二进制类型** | BLOB | BLOB | BYTEA |
