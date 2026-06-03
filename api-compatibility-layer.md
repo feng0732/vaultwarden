@@ -240,7 +240,214 @@ async fn master_password_policy(user: &User, conn: &DbConn) -> Value {
 
 ---
 
-### 1.5 sync 端点的特殊混合：`"object"` + camelCase
+### 1.5 Connect Token 按 grant type 分支的响应差异
+
+`/identity/connect/token` 端点有 **5 条 grant type 分支**，每条分支的响应字段集合差异显著。`authenticated_response()` 函数是"用户登录"类分支的共享返回点，其他分支各自独立构建响应。
+
+#### 5 条 grant type 分支总览
+
+| grant_type | 处理函数 | 核心场景 |
+|---|---|---|
+| `"password"` | `password_login()` → `authenticated_response()` | 用户名+密码登录（含 2FA） |
+| `"authorization_code"` | `sso_login()` → `authenticated_response()` | SSO OIDC 登录 |
+| `"refresh_token"` | `refresh_login()` | 刷新访问令牌 |
+| `"client_credentials"` + scope=`"api"` | `user_api_key_login()` | 用户 API key 登录 |
+| `"client_credentials"` + scope=`"organization"` | `organization_api_key_login()` | 组织 API key 登录 |
+
+#### 共同返回点：`authenticated_response()` 函数（`api/identity.rs:472-568`）
+
+`password` 和 `authorization_code`（SSO）两条用户登录路径最终都调用此函数，因此响应结构**完全相同**：
+
+```rust
+async fn authenticated_response(
+    user: &User,
+    device: &mut Device,
+    auth_tokens: auth::AuthTokens,
+    twofactor_token: Option<String>,
+    conn: &DbConn,
+    ip: &ClientIp,
+) -> JsonResult {
+    // ... 发送新设备邮件、注册推送、保存设备 ...
+    
+    let master_password_policy = master_password_policy(user, conn).await;  // ← 调用策略生成函数
+
+    let has_master_password = !user.password_hash.is_empty();
+    let master_password_unlock = if has_master_password {
+        json!({
+            "Kdf": {
+                "KdfType": user.client_kdf_type,
+                "Iterations": user.client_kdf_iter,
+                "Memory": user.client_kdf_memory,
+                "Parallelism": user.client_kdf_parallelism
+            },
+            "MasterKeyEncryptedUserKey": user.akey,
+            "MasterKeyWrappedUserKey": user.akey,
+            "Salt": user.email
+        })
+    } else { Value::Null };
+
+    let account_keys = if user.private_key.is_some() {
+        json!({
+            "publicKeyEncryptionKeyPair": {
+                "wrappedPrivateKey": user.private_key,
+                "publicKey": user.public_key,
+                "Object": "publicKeyEncryptionKeyPair"  // 大写 Object
+            },
+            "Object": "privateKeys"  // 大写 Object
+        })
+    } else { Value::Null };
+
+    let mut result = json!({
+        "access_token": auth_tokens.access_token(),
+        "expires_in": auth_tokens.expires_in(),
+        "token_type": "Bearer",
+        "refresh_token": auth_tokens.refresh_token(),  // ← 有 refresh_token
+        "PrivateKey": user.private_key,
+        "Kdf": user.client_kdf_type,
+        "KdfIterations": user.client_kdf_iter,
+        "KdfMemory": user.client_kdf_memory,
+        "KdfParallelism": user.client_kdf_parallelism,
+        "ResetMasterPassword": false,
+        "ForcePasswordReset": false,
+        "MasterPasswordPolicy": master_password_policy,  // ← 有 MasterPasswordPolicy（含 Object）
+        "scope": auth_tokens.scope(),
+        "AccountKeys": account_keys,  // ← 有 AccountKeys（含 Object）
+        "UserDecryptionOptions": {    // ← 有 UserDecryptionOptions（含 Object）
+            "HasMasterPassword": has_master_password,
+            "MasterPasswordUnlock": master_password_unlock,
+            "Object": "userDecryptionOptions"  // 大写 Object
+        },
+    });
+
+    if !user.akey.is_empty() {
+        result["Key"] = Value::String(user.akey.clone());  // ← 有 Key
+    }
+
+    if let Some(token) = twofactor_token {
+        result["TwoFactorToken"] = Value::String(token);  // ← 2FA 成功后有 TwoFactorToken
+    }
+
+    Ok(Json(result))
+}
+```
+
+**关键点**：
+- `master_password_policy()` 函数**仅在此处被调用**，其他 3 条 grant type 分支均不调用
+- 返回的 JSON 包含 3 个嵌套对象，每个都带大写 `"Object"` 鉴别器：
+  1. `AccountKeys.publicKeyEncryptionKeyPair.Object = "publicKeyEncryptionKeyPair"`
+  2. `AccountKeys.Object = "privateKeys"`
+  3. `UserDecryptionOptions.Object = "userDecryptionOptions"`
+  4. `MasterPasswordPolicy.Object = "masterPasswordPolicy"`（由函数注入）
+
+---
+
+#### 分支一：`refresh_token`（`api/identity.rs:138-176`）
+
+最小响应，**无任何嵌套对象和 `Object` 鉴别器**：
+
+```rust
+let result = json!({
+    "refresh_token": auth_tokens.refresh_token(),
+    "access_token": auth_tokens.access_token(),
+    "expires_in": auth_tokens.expires_in(),
+    "token_type": "Bearer",
+    "scope": auth_tokens.scope(),
+});
+```
+
+**缺失字段**：无 MasterPasswordPolicy、无 AccountKeys、无 UserDecryptionOptions、无 Key、无 PrivateKey、无 Kdf*
+
+---
+
+#### 分支二：`client_credentials` + scope=`"api"`（用户 API key）（`api/identity.rs:570-712`）
+
+独立构建响应，不调用 `authenticated_response()`。**有 AccountKeys 和 UserDecryptionOptions，但无 MasterPasswordPolicy**，且**无 refresh_token**：
+
+```rust
+let result = json!({
+    "access_token": access_claims.token(),
+    "expires_in": access_claims.expires_in(),
+    "token_type": "Bearer",
+    "Key": user.akey,                          // ← 有 Key
+    "PrivateKey": user.private_key,            // ← 有 PrivateKey
+    "Kdf": user.client_kdf_type,
+    "KdfIterations": user.client_kdf_iter,
+    "KdfMemory": user.client_kdf_memory,
+    "KdfParallelism": user.client_kdf_parallelism,
+    "ResetMasterPassword": false,
+    "ForcePasswordReset": false,
+    "scope": AuthMethod::UserApiKey.scope(),
+    "AccountKeys": account_keys,               // ← 有 AccountKeys（含 Object）
+    "UserDecryptionOptions": {                 // ← 有 UserDecryptionOptions（含 Object）
+        "HasMasterPassword": has_master_password,
+        "MasterPasswordUnlock": master_password_unlock,
+        "Object": "userDecryptionOptions"      // 大写 Object
+    },
+    // ↑ 注意：无 MasterPasswordPolicy、无 refresh_token
+});
+```
+
+**关键点**：
+- 注释明确说明：`// Note: No refresh_token is returned. The CLI just repeats the client_credentials login flow when the existing token expires.`
+- 有 `Object` 嵌套（AccountKeys、UserDecryptionOptions），但**无 MasterPasswordPolicy**，因为 `master_password_policy()` 函数未被调用
+
+---
+
+#### 分支三：`client_credentials` + scope=`"organization"`（组织 API key）（`api/identity.rs:714-740`）
+
+最小响应，**无任何嵌套对象、无 `Object` 鉴别器、无用户相关字段**：
+
+```rust
+Ok(Json(json!({
+    "access_token": access_token,
+    "expires_in": 3600,  // 硬编码 1 小时
+    "token_type": "Bearer",
+    "scope": AuthMethod::OrgApiKey.scope(),
+})))
+```
+
+**缺失字段**：无 MasterPasswordPolicy、无 AccountKeys、无 UserDecryptionOptions、无 Key、无 PrivateKey、无 Kdf*、无 refresh_token
+
+**原因**：组织 API key 仅用于调用组织级管理 API，不需要用户解密所需的任何密钥或策略信息。
+
+---
+
+#### 5 条 grant type 响应字段对照表
+
+| 字段 | password | SSO (authorization_code) | refresh_token | user API key | org API key |
+|---|---|---|---|---|---|
+| `access_token` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `expires_in` | ✅ | ✅ | ✅ | ✅ | ✅ (3600) |
+| `token_type` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `refresh_token` | ✅ | ✅ | ✅ | ❌ | ❌ |
+| `Key` | ✅ (条件) | ✅ (条件) | ❌ | ✅ | ❌ |
+| `PrivateKey` | ✅ | ✅ | ❌ | ✅ | ❌ |
+| `Kdf` / `KdfIterations` / `KdfMemory` / `KdfParallelism` | ✅ | ✅ | ❌ | ✅ | ❌ |
+| `ResetMasterPassword` / `ForcePasswordReset` | ✅ | ✅ | ❌ | ✅ | ❌ |
+| `scope` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **`MasterPasswordPolicy`** (含 `Object`) | ✅ | ✅ | ❌ | ❌ | ❌ |
+| **`AccountKeys`** (含 2 个 `Object`) | ✅ | ✅ | ❌ | ✅ | ❌ |
+| **`UserDecryptionOptions`** (含 `Object`) | ✅ | ✅ | ❌ | ✅ | ❌ |
+| `TwoFactorToken` | ✅ (条件) | ✅ (条件) | ❌ | ❌ | ❌ |
+
+**`Object` 鉴别器数量对照表**
+
+| grant_type | 嵌套对象中的 `"Object"` 数量 | 具体位置 |
+|---|---|---|
+| password / SSO | **4 个** | `AccountKeys.publicKeyEncryptionKeyPair.Object`<br>`AccountKeys.Object`<br>`UserDecryptionOptions.Object`<br>`MasterPasswordPolicy.Object` |
+| user API key | **3 个** | `AccountKeys.publicKeyEncryptionKeyPair.Object`<br>`AccountKeys.Object`<br>`UserDecryptionOptions.Object`<br>（无 MasterPasswordPolicy.Object） |
+| refresh_token | **0 个** | 无嵌套对象 |
+| org API key | **0 个** | 无嵌套对象 |
+
+**核心取舍**：
+- 用户登录类（password/SSO）需要完整的解密上下文，所以返回所有嵌套对象和策略
+- 用户 API key 不需要密码策略（不是交互式登录），所以无 MasterPasswordPolicy
+- refresh_token 是令牌续期，客户端已缓存解密上下文，所以只返回令牌字段
+- 组织 API key 完全不涉及用户解密，所以返回最小组
+
+---
+
+### 1.6 sync 端点的特殊混合：`"object"` + camelCase
 
 `/api/sync` 属于普通 API 响应（`"object": "sync"` 小写），但其内部嵌套的 `userDecryption` 结构与 Token 响应的 `UserDecryptionOptions` 语义相同但**大小写完全不同**：
 
@@ -282,7 +489,7 @@ json!({
 
 ---
 
-### 1.6 错误响应的 `object` 使用
+### 1.7 错误响应的 `object` 使用
 
 标准错误响应（ApiErrorResponse 和 CompactApiErrorResponse）也使用**小写 `"object": "error"`**：
 
@@ -299,7 +506,7 @@ state.serialize_field("object", "error")?;  // 小写 object
 
 ---
 
-### 1.7 同一模型的多级响应
+### 1.8 同一模型的多级响应
 
 Bitwarden 上游对同一实体定义了信息密度递增的多级响应模型：
 
@@ -324,7 +531,7 @@ Bitwarden 上游对同一实体定义了信息密度递增的多级响应模型�
 
 ---
 
-### 1.8 Cipher 响应的双层结构
+### 1.9 Cipher 响应的双层结构
 
 Cipher 响应同时包含顶层字段和类型特定子对象，存在数据冗余设计：
 
@@ -362,7 +569,7 @@ json!({
 
 ---
 
-### 1.9 列表响应格式
+### 1.10 列表响应格式
 
 列表端点（如 `GET /api/ciphers`）使用 `"object": "list"` + `"data"` 数组 + `"continuationToken"` 的格式：
 
@@ -377,7 +584,7 @@ Ok(Json(json!({
 
 ---
 
-### 1.10 Membership 的 Manager → Custom 类型映射 HACK
+### 1.11 Membership 的 Manager → Custom 类型映射 HACK
 
 Bitwarden 有 Owner(0)/Admin(1)/User(2)/Manager(3)/Custom(4) 五种成员类型。Vaultwarden 将 Manager(3) 在输出时映射为 Custom(4)，因为需要利用 Custom 类型的 permissions 对象来模拟 Manager 的集合权限。这是一个有意的 HACK：
 
@@ -955,8 +1162,15 @@ Vaultwarden 的 API 兼容层设计可归纳为以下核心原则：
 
 2. **大小写不一致是常态**：sync 端点的 `userDecryption` 是 camelCase，Token 端点的 `UserDecryptionOptions` 是 PascalCase；`MasterPasswordPolicy` 对象内部字段是 camelCase（Serde 序列化），但鉴别器键名是 `"Object"`（大写 O），而 sync 策略数组中同一数据用 `"object"`（小写 o）。这是 Bitwarden 上游各模块独立演化的历史遗留。
 
-3. **字段容错的核心动机是防止客户端崩溃**：fields.type 为字符串→崩溃；type_data 为 null→崩溃；SecureNote 缺少 type→崩溃；SSH Key 缺必填字段→崩溃。这些修正不是"锦上添花"而是"不做就崩"，说明 Bitwarden 客户端在反序列化路径上缺乏防御性编程。
+3. **Connect Token 按 grant type 分支的响应是分层设计**：
+   - password/SSO 登录返回最完整的响应（4 个 `Object` 鉴别器），因为需要完整的解密上下文
+   - 用户 API key 返回中等响应（3 个 `Object` 鉴别器，无 MasterPasswordPolicy），因为不是交互式登录
+   - refresh_token 返回最小响应（0 个 `Object` 鉴别器），因为客户端已缓存解密上下文
+   - 组织 API key 返回最小组（0 个 `Object` 鉴别器），因为不涉及用户解密
+   - `master_password_policy()` 函数仅在 `authenticated_response()` 中被调用，确保只有交互式登录才返回密码策略
 
-4. **错误响应有四套互不兼容的格式**：ApiErrorResponse（9 字段）、CompactApiErrorResponse（6 字段）、OAuth2 风格的 2FA/refresh_token 错误、以及 404 Catcher 错误。客户端在四条不同代码路径上分别处理。
+4. **字段容错的核心动机是防止客户端崩溃**：fields.type 为字符串→崩溃；type_data 为 null→崩溃；SecureNote 缺少 type→崩溃；SSH Key 缺必填字段→崩溃。这些修正不是"锦上添花"而是"不做就崩"，说明 Bitwarden 客户端在反序列化路径上缺乏防御性编程。
 
-5. **客户端假设的取舍倾向于"安全优先"**：无法确定客户端版本时默认不显示 SSH Key；不支持的功能端点返回空数据而非 404；Premium 功能全部解锁以避免功能被错误禁用；版本号必须与上游同步以通过客户端的兼容性检查。
+5. **错误响应有四套互不兼容的格式**：ApiErrorResponse（9 字段）、CompactApiErrorResponse（6 字段）、OAuth2 风格的 2FA/refresh_token 错误、以及 404 Catcher 错误。客户端在四条不同代码路径上分别处理。
+
+6. **客户端假设的取舍倾向于"安全优先"**：无法确定客户端版本时默认不显示 SSH Key；不支持的功能端点返回空数据而非 404；Premium 功能全部解锁以避免功能被错误禁用；版本号必须与上游同步以通过客户端的兼容性检查。
