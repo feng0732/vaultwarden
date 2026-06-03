@@ -12,6 +12,7 @@ Organization (组织)
 ├── Membership (组织成员)
 │   └── CollectionUser (成员-集合直接关联)
 └── Collection (集合)
+    └── Cipher (密码条目)
 ```
 
 ### 1.2 关键模型定义
@@ -78,136 +79,263 @@ GroupUser::delete_all_by_group(&group_id, &org_id, &conn).await?;
 
 ---
 
-## 三、访问授权：直接授权 vs 组继承
+## 三、三层权限体系：可见性、展示、操作限制
 
-### 3.1 权限判定优先级
+### 3.1 第一层：Collection 可见性判定
 
-访问控制的核心判定在 `src/db/models/collection.rs` (L149-L156) (`can_access_collection` 函数)：
+**判定函数**：`src/db/models/collection.rs` (L149-L156) (`can_access_collection`)
 
 ```rust
 pub async fn can_access_collection(member: &Membership, col_id: &CollectionId, conn: &DbConn) -> bool {
     member.has_status(MembershipStatus::Confirmed)
-        && (member.has_full_access()  // 1. 成员全局访问权限
+        && (member.has_full_access()           // 1. 成员全局权限
             || CollectionUser::has_access_to_collection_by_user(...)  // 2. 直接授权
             || (CONFIG.org_groups_enabled()
-                && (GroupUser::has_full_access_by_member(...)  // 3. 所在组有 access_all
-                    || GroupUser::has_access_to_collection_by_member(...))))  // 4. 所在组关联了集合
+                && (GroupUser::has_full_access_by_member(...)         // 3. 组全局权限
+                    || GroupUser::has_access_to_collection_by_member(...))))  // 4. 组集合关联
 }
 ```
 
-**判定顺序**（OR 逻辑，任一满足即可）：
-1. **成员全局权限**：`membership.access_all = true` 或用户是 Owner/Admin
-2. **直接授权**：`users_collections` 表存在记录
-3. **组级全局权限**：用户所在任一 `group.access_all = true`
-4. **组级集合权限**：用户所在任一 group 与该 collection 有关联
-
-### 3.2 组级权限判定
-
-#### 3.2.1 组全局访问 (access_all)
-
-**判定函数**：`src/db/models/group.rs` (L593-L610) (`has_full_access_by_member`)
-
-```sql
-SELECT COUNT(*) > 0
-FROM groups_users
-INNER JOIN groups ON groups.uuid = groups_users.groups_uuid
-WHERE groups.organizations_uuid = ?org_uuid
-  AND groups.access_all = true
-  AND groups_users.users_organizations_uuid = ?member_uuid
-```
-
-只要成员所在的**任意一个组**设置了 `access_all = true`，该成员就拥有对组织所有集合的访问权。
-
-#### 3.2.2 组集合关联访问
-
-**判定函数**：`src/db/models/group.rs` (L569-L591) (`has_access_to_collection_by_member`)
-
-```sql
-SELECT COUNT(*) > 0
-FROM groups_users
-INNER JOIN collections_groups ON collections_groups.groups_uuid = groups_users.groups_uuid
-INNER JOIN groups ON groups.uuid = groups_users.groups_uuid
-INNER JOIN collections ON collections.uuid = collections_groups.collections_uuid
-WHERE collections_groups.collections_uuid = ?collection_uuid
-  AND groups_users.users_organizations_uuid = ?member_uuid
-```
-
-只要成员所在的**任意一个组**与目标集合有关联，该成员就获得该集合的访问权。
-
-### 3.3 直接授权 vs 组继承的差异
-
-| 维度 | 直接授权 (CollectionUser) | 组继承 (CollectionGroup) |
-|------|--------------------------|-------------------------|
-| 关联表 | `users_collections` | `collections_groups` |
-| 关联键 | user_uuid + collection_uuid | group_uuid + collection_uuid |
-| 权限传递 | 一对一 | 一对多（组内所有成员） |
-| 更新影响 | 仅影响单个用户 | 影响组内所有用户 |
-| 查询性能 | 直接查询 | 需多表 JOIN |
-
-**代码位置对比**：
-- 直接授权查询：`src/db/models/collection.rs` (L854-L856)
-- 组继承查询：`src/db/models/group.rs` (L569-L591)
+**规则**：
+- **OR 逻辑**：四个条件任一满足即可访问
+- 直接授权与组授权是**平等的 OR 关系**，没有优先级
+- 只判定 "能不能看到/访问"，不判定具体权限细节
 
 ---
 
-## 四、继承规则：权限合并与计算
+### 3.2 第二层：用户详情展示
 
-### 4.1 用户集合列表的获取
-
-**完整查询逻辑**：`src/db/models/collection.rs` (L225-L301) (`find_by_user_uuid`)
-
-用户可访问的集合来源有四个（OR 关系）：
-
-```sql
-WHERE 
-  -- 1. 直接授权
-  users_collections.user_uuid = ?user_uuid
-  OR
-  -- 2. 成员全局访问权限
-  users_organizations.access_all = true
-  OR
-  -- 3. 组全局访问权限
-  groups.access_all = true
-  OR
-  -- 4. 组集合关联
-  (groups_users.users_organizations_uuid = users_organizations.uuid 
-   AND collections_groups.collections_uuid IS NOT NULL)
-```
-
-### 4.2 权限字段的合并规则
-
-当用户通过多个途径获得同一集合的访问权时，权限字段的判定遵循 **"最宽松原则"**：
-
-以 `is_writable_by_user` 为例 `src/db/models/collection.rs` (L426-L504)：
-
-```sql
-WHERE
-  -- 任一条件满足即可写
-  users_organizations.atype <= Admin  -- 是 Owner/Admin
-  OR users_organizations.access_all = true  -- 成员全局访问
-  OR (users_collections.collection_uuid = ? 
-      AND users_collections.read_only = false)  -- 直接授权且非只读
-  OR groups.access_all = true  -- 组全局访问
-  OR (collections_groups.collections_uuid IS NOT NULL 
-      AND collections_groups.read_only = false)  -- 组关联且非只读
-```
-
-**合并规则总结**：
-- `read_only`: 任一授权途径为 `false`，最终为 `false`（可写）
-- `hide_passwords`: 任一授权途径为 `false`，最终为 `false`（可见密码）
-- `manage`: 任一授权途径为 `true`，最终为 `true`（可管理）
-
-### 4.3 特殊情况：Manager 角色的管理权限
-
-在 `to_json_details` 中 `src/db/models/collection.rs` (L107-L118)，Manager 角色有额外的权限判定：
+**处理逻辑**：`src/db/models/organization.rs` (L556-L605) (`to_json_user_details`)
 
 ```rust
-// Manager 类型用户，如果有读写权限（非 read_only 且非 hide_passwords）
-// 则默认拥有 manage 权限
-is_manager && (cu.manage || (!cu.read_only && !cu.hide_passwords))
+// 检查是否通过组获得 full_access
+let full_access_group = Group::is_in_full_access_group(...).await;
+
+// 如果有 full_access（成员或组），不返回单独的 collections 列表
+let collections: Vec<Value> = if include_collections && !(full_access_group || self.access_all) {
+    // 获取直接授权的集合
+    let cu: HashMap<CollectionId, CollectionUser> = ...;
+    // 获取组继承的集合（用于过滤）
+    let cg: HashSet<CollectionId> = CollectionGroup::find_by_user(...).await;
+    
+    Collection::find_by_organization_and_user_uuid(...)
+        .await
+        .into_iter()
+        .filter_map(|c| {
+            if self.has_full_access() {
+                // 成员全局权限
+                Some(...)
+            } else if let Some(cu) = cu.get(&c.uuid) {
+                // 直接授权 - 显示
+                Some(...)
+            } else if cg.contains(&c.uuid) {
+                // 组继承 - 不显示！跳过
+                return None;
+            } else {
+                Some(...)
+            }
+        })
+        .collect()
+} else {
+    Vec::with_capacity(0)
+};
 ```
 
-这是一个**前端展示层面**的逻辑，用于兼容 Bitwarden 的权限模型。
+**规则**：
+- **分离展示**：直接授权的集合在用户详情中列出，组继承的集合不列出
+- 组继承的权限需要通过专门的组接口获取
+- 如果成员或组有 `access_all = true`，则完全不返回 collections 字段
+
+---
+
+### 3.3 第三层：Cipher 操作权限限制（核心！）
+
+**核心函数**：`src/db/models/cipher.rs` (L601-L669) (`get_access_restrictions`)
+
+这是权限聚合最复杂也最重要的一层，决定了用户对具体密码条目的实际操作权限。
+
+#### 3.3.1 快速通道：完全访问
+
+```rust
+// 如果满足任一条件，直接返回 (read_only=false, hide_passwords=false, manage=true)
+if self.is_owned_by_user(user_uuid)                    // 1. 用户是 cipher 所有者
+    || self.is_in_full_access_org(...)                  // 2. 成员全局权限
+    || self.is_in_full_access_group(...)                // 3. 组全局权限
+{
+    return Some((false, false, true));
+}
+```
+
+以上任一条件满足，用户拥有完全控制权，无需进一步判定。
+
+#### 3.3.2 关键规则：直接授权覆盖组授权
+
+**代码位置**：`src/db/models/cipher.rs` (L631-L638)
+
+```rust
+let rows = if let Some(cipher_sync_data) = cipher_sync_data {
+    // ... 使用同步数据（见下一节）
+} else {
+    // 先查询直接授权
+    let user_permissions = self.get_user_collections_access_flags(user_uuid, conn).await;
+    
+    // 重要！直接授权覆盖组授权！
+    if user_permissions.is_empty() {
+        // 只有当没有直接授权时，才考虑组授权
+        self.get_group_collections_access_flags(user_uuid, conn).await
+    } else {
+        // 有直接授权，只使用直接授权，忽略组授权
+        user_permissions
+    }
+};
+```
+
+**代码注释明确说明**：
+```
+// Also, user permission overrule group permissions
+// and only user permissions are returned by the code above.
+```
+
+**结论**：**直接授权完全覆盖组授权**，不是取并集也不是聚合。如果用户对某个集合有直接授权，那么对该集合的组授权会被完全忽略。
+
+#### 3.3.3 多集合权限聚合方式
+
+当一个 cipher 属于多个集合时，需要聚合这些集合的权限：
+
+**代码位置**：`src/db/models/cipher.rs` (L645-L666)
+
+```rust
+// For a flag to be in effect for a cipher, upstream
+// requires all collections the cipher is in to have that flag set.
+// Therefore, we do a boolean AND of all values in each of the `read_only`
+// and `hide_passwords` columns.
+//
+// The only exception is for the `manage` flag, that needs a boolean OR!
+
+let mut read_only = true;
+let mut hide_passwords = true;
+let mut manage = false;
+for (ro, hp, mn) in &rows {
+    read_only &= ro;        // AND：所有集合都只读，才是只读
+    hide_passwords &= hp;   // AND：所有集合都隐藏密码，才隐藏密码
+    manage |= mn;           // OR：任一集合可管理，就可管理
+}
+```
+
+**聚合规则总结**：
+
+| 权限字段 | 聚合方式 | 说明 |
+|---------|---------|------|
+| `read_only` | **AND** | 所有集合都设为只读，最终才是只读<br>任一集合可写，最终就可写 |
+| `hide_passwords` | **AND** | 所有集合都设为隐藏密码，最终才隐藏<br>任一集合可见密码，最终就可见 |
+| `manage` | **OR** | 任一集合设为可管理，最终就可管理<br>所有集合都不可管理，最终才不可管理 |
+
+---
+
+### 3.4 CipherSyncData 中的组内权限聚合
+
+当使用 CipherSyncData 进行批量同步时，还有一层组内权限的预聚合：
+
+**代码位置**：`src/api/core/ciphers.rs` (L2175-L2190)
+
+```rust
+// 同一用户对同一集合可能通过多个组获得访问权限
+// 需要先把这些组的权限聚合起来
+let user_collections_groups: HashMap<CollectionId, CollectionGroup> = 
+    CollectionGroup::find_by_user(user_id, conn).await.into_iter().fold(
+        HashMap::new(),
+        |mut combined_permissions, cg| {
+            combined_permissions
+                .entry(cg.collections_uuid.clone())
+                .and_modify(|existing| {
+                    // 同一集合的多个组权限，取最宽松的设置
+                    existing.read_only &= cg.read_only;        // AND：任一组可写就可写
+                    existing.hide_passwords &= cg.hide_passwords;  // AND：任一组可见就可见
+                    existing.manage |= cg.manage;             // OR：任一组可管理就可管理
+                })
+                .or_insert(cg);
+            combined_permissions
+        },
+    );
+```
+
+**组内聚合规则**（对同一集合的多个组授权）：
+- `read_only`: AND → 任一组可写，最终可写
+- `hide_passwords`: AND → 任一组可见密码，最终可见
+- `manage`: OR → 任一组可管理，最终可管理
+
+这与多集合聚合的规则一致，都是**取最宽松**的权限。
+
+---
+
+### 3.5 三层权限体系对比总结
+
+| 层面 | 判定逻辑 | 直接授权 vs 组授权 | 聚合方式 |
+|------|---------|-------------------|---------|
+| **Collection 可见性** | OR 逻辑，任一途径即可访问 | 平等 OR 关系 | 不涉及 |
+| **用户详情展示** | 分离展示 | 分开显示，组继承的不列出 | 不涉及 |
+| **Cipher 操作限制** | 分层次判定 | **直接授权完全覆盖组授权** | read_only: AND<br>hide_passwords: AND<br>manage: OR |
+
+---
+
+## 四、权限冲突场景分析
+
+### 场景 1：直接授权 vs 组授权（同一集合）
+
+**情况**：
+- 用户 A 对集合 X 有直接授权：`read_only=true, hide_passwords=true, manage=false`
+- 用户 A 同时通过组 G 对集合 X 有授权：`read_only=false, hide_passwords=false, manage=true`
+
+**结果**：
+- **直接授权完全覆盖组授权**
+- 实际权限：`read_only=true, hide_passwords=true, manage=false`
+- 组授权的宽松权限被完全忽略
+
+---
+
+### 场景 2：同一 cipher 跨多个集合（均为直接授权）
+
+**情况**：
+- Cipher C 同时属于集合 X 和集合 Y
+- 用户对集合 X 的直接授权：`read_only=true, hide_passwords=true, manage=false`
+- 用户对集合 Y 的直接授权：`read_only=false, hide_passwords=false, manage=true`
+
+**结果**：
+- `read_only = true AND false = false` → 可写
+- `hide_passwords = true AND false = false` → 可见密码
+- `manage = false OR true = true` → 可管理
+- 最终权限最宽松：`(false, false, true)`
+
+---
+
+### 场景 3：同一 cipher 跨多个集合（混合授权）
+
+**情况**：
+- Cipher C 同时属于集合 X 和集合 Y
+- 用户对集合 X 有直接授权：`read_only=true, hide_passwords=true, manage=false`
+- 用户对集合 Y 只有组授权：`read_only=false, hide_passwords=false, manage=true`
+
+**结果**：
+- 集合 X 使用直接授权
+- 集合 Y：因为用户对 X 有直接授权，所以对 Y 的组授权**完全被忽略**
+- 最终只聚合直接授权：`(true, true, false)`
+- 注意：这可能导致比预期更严格的权限！
+
+---
+
+### 场景 4：同一集合通过多个组授权
+
+**情况**：
+- 用户 A 对集合 X 没有直接授权
+- 组 G1 对集合 X：`read_only=true, hide_passwords=true, manage=false`
+- 组 G2 对集合 X：`read_only=false, hide_passwords=true, manage=true`
+- 用户 A 同时属于 G1 和 G2
+
+**结果**（CipherSyncData 预聚合）：
+- `read_only = true AND false = false` → 可写
+- `hide_passwords = true AND true = true` → 隐藏密码
+- `manage = false OR true = true` → 可管理
+- 聚合后：`(false, true, true)`
 
 ---
 
@@ -408,25 +536,7 @@ pub async fn delete(&self, org_uuid: &OrganizationId, conn: &DbConn) -> EmptyRes
 
 ## 六、重要实现细节
 
-### 6.1 前端展示的过滤逻辑
-
-在 `to_json_user_details` 中 `src/db/models/organization.rs` (L558-L605)，有一个重要的过滤：
-
-```rust
-// 如果用户通过组获得了 full_access，或者本身就是 access_all
-// 则不返回单独的 collections 列表
-let full_access_group = Group::is_in_full_access_group(...).await;
-let collections: Vec<Value> = if include_collections && !(full_access_group || self.access_all) {
-    // ... 返回直接授权的集合
-    // 注意：通过组继承的集合不在此返回！
-} else {
-    Vec::with_capacity(0)
-};
-```
-
-**重要**：通过组继承的集合权限，不会在用户详情接口中单独列出。客户端需要通过专门的组接口获取。
-
-### 6.2 数据库 JOIN 链
+### 6.1 数据库 JOIN 链
 
 查询用户通过组获得的集合权限时，JOIN 链非常长：
 
@@ -436,17 +546,11 @@ users_organizations (成员表)
     ← groups (组表)
     ← collections_groups (组-集合关联)
       ← collections (集合表)
+        ← ciphers_collections (集合-密码关联)
+          ← ciphers (密码表)
 ```
 
-代码示例 `src/db/models/collection.rs` (L239-L251)：
-
-```rust
-.left_join(groups_users::table.on(...))
-.left_join(groups::table.on(...))
-.left_join(collections_groups::table.on(...))
-```
-
-### 6.3 配置开关
+### 6.2 配置开关
 
 所有组相关功能都受 `CONFIG.org_groups_enabled()` 开关控制，如果关闭则完全跳过组权限判定。
 
@@ -468,12 +572,21 @@ users_organizations (成员表)
 `access_all = true` 只授予**访问权**，不影响集合本身的存在性。如果集合被删除或移动，仍然不可见。
 
 ### Q4: 直接授权和组授权的权限冲突怎么办？
-遵循 **"最宽松原则"**：任一授权途径允许的权限，最终都会被允许。例如：
-- 直接授权是 read_only=true，但组授权是 read_only=false → 最终可写
-- 直接授权是 hide_passwords=false，但组授权是 hide_passwords=true → 最终密码可见
+**直接授权完全覆盖组授权**！如果用户对某个集合有直接授权，组授权会被完全忽略。这不是取并集，而是直接使用直接授权的权限。
 
 ### Q5: 为什么修改组名称后所有用户都需要重新同步？
 因为 `put_group` API 采用全量替换策略，先删除所有成员和集合关联再重新添加，这个过程会间接触发所有组内用户的 revision 更新。
+
+### Q6: 一个 cipher 属于多个集合时，权限怎么算？
+- `read_only` 和 `hide_passwords` 用 **AND** 聚合：所有集合都限制，才最终限制
+- `manage` 用 **OR** 聚合：任一集合允许管理，就最终可管理
+
+### Q7: 用户通过多个组访问同一集合，权限怎么算？
+在 CipherSyncData 预聚合阶段：
+- `read_only`: AND → 任一组可写，最终可写
+- `hide_passwords`: AND → 任一组可见密码，最终可见
+- `manage`: OR → 任一组可管理，最终可管理
+- 总体原则：**取最宽松**的权限
 
 ---
 
@@ -484,7 +597,12 @@ users_organizations (成员表)
 | 组模型定义 | `src/db/models/group.rs` | L18-L30 |
 | 组成员关联模型 | `src/db/models/group.rs` | L43-L49 |
 | 组-集合关联模型 | `src/db/models/group.rs` | L32-L41 |
-| 访问权限总判定 | `src/db/models/collection.rs` | L149-L156 |
+| Collection 可见性判定 | `src/db/models/collection.rs` | L149-L156 |
+| 用户详情展示（集合过滤） | `src/db/models/organization.rs` | L556-L605 |
+| Cipher 权限限制核心函数 | `src/db/models/cipher.rs` | L601-L669 |
+| 直接授权覆盖组授权逻辑 | `src/db/models/cipher.rs` | L631-L638 |
+| 多集合权限聚合规则 | `src/db/models/cipher.rs` | L645-L666 |
+| CipherSyncData 组权限预聚合 | `src/api/core/ciphers.rs` | L2175-L2190 |
 | 组全局权限判定 | `src/db/models/group.rs` | L593-L610 |
 | 组集合权限判定 | `src/db/models/group.rs` | L569-L591 |
 | 用户 revision 更新函数 | `src/db/models/group.rs` | L612-L617 |
