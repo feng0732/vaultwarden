@@ -732,19 +732,68 @@ pub fn decode_jwt<T: DeserializeOwned>(token: &str, issuer: String) -> Result<T,
 
 RSA 密钥的加载和生命周期：
 - [initialize_keys()](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/auth.rs#L63-L97) 在启动时调用一次
-- 密钥从 `rsa_key.pem` 文件读取（不存在则生成）
+- 密钥从 `rsa_key.pem` 文件读取（不存在则生成并写入文件）
 - 加载后存入 `OnceLock<EncodingKey>` 和 `OnceLock<DecodingKey>`，**运行时不可改变**
-- JWT 的 issuer `JWT_ADMIN_ISSUER` 是 `LazyLock<String>`，首次访问时初始化，之后不变
+- **密钥文件持久化到磁盘，重启后保持不变（除非手动删除）**
+
+JWT issuer 的生成：
+- `JWT_ADMIN_ISSUER` 是 `LazyLock::new(|| format!("{}|admin", CONFIG.domain_origin()))`
+- 首次访问时初始化，之后不变
+- **基于 domain_origin，domain 配置不变则 issuer 不变**
 
 **JWT 失效的唯一方式：**
 1. JWT 自然过期（`admin_session_lifetime` 分钟，默认 20 分钟）
-2. 服务器重启且 RSA 密钥文件被删除/替换（导致签名验证失败）
-3. `disable_admin_token` 从 `true` 改为 `false` 且 Cookie 丢失
-4. 管理员手动点击"注销"（删除 Cookie）
+2. 服务器重启且 **RSA 密钥文件被删除/替换**（导致签名验证失败）
+3. 服务器重启且 **domain 配置改变**（导致 issuer 验证失败）
+4. `disable_admin_token` 从 `true` 改为 `false` 且 Cookie 丢失
+5. 管理员手动点击"注销"（删除 Cookie）
 
 **ADMIN_TOKEN 只影响登录环节**，不影响已签发 JWT 的有效性。源码注释明确说明了这一点：
 
 > "Changing it here will not deauthorize the current session!"
+
+#### 重启后已有 Cookie 的有效性分析
+
+**关键结论：服务器重启本身不会使已有 Cookie 失效。**
+
+重启后 Cookie 是否有效取决于以下条件：
+
+| 条件 | 说明 | 是否失效 |
+|---|---|---|
+| RSA 密钥文件未删除 | 密钥持久化，重启后相同 | ✅ Cookie 有效 |
+| domain 配置未改变 | issuer 保持一致 | ✅ Cookie 有效 |
+| JWT 未过期 | exp 时间在未来 | ✅ Cookie 有效 |
+| disable_admin_token = true | 跳过认证，直接通过 | ✅ Cookie 甚至不需要 |
+| disable_admin_token = false | 验证 JWT，上述条件满足则通过 | ✅ Cookie 有效 |
+
+**只有当以下情况发生时，重启才会使 Cookie 失效：**
+- 手动删除了 `rsa_key.pem` 文件 → 新密钥生成，签名验证失败
+- 修改了 `domain` 配置 → issuer 改变，验证失败
+- JWT 在重启期间自然过期
+
+**AdminToken::from_request 的完整逻辑**（[admin.rs:830-866](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/api/admin.rs#L830-L866)）：
+
+```rust
+if !CONFIG.disable_admin_token() {  // 每次请求都读内存值
+    let access_token = cookies.get(COOKIE_NAME).map(|c| c.value());
+    if let Some(token) = access_token {
+        if decode_admin(token).is_err() {  // JWT 验证
+            cookies.remove(...);  // 验证失败才删除 Cookie
+            return Outcome::Error((Status::Unauthorized, "Session expired"));
+        }
+    } else {
+        // 无 Cookie 时返回 401 或 Forward
+    }
+}
+// disable_admin_token = true 时，不检查 Cookie，直接成功
+Outcome::Success(Self { ip })
+```
+
+**关键点：**
+- `disable_admin_token = true` 时，**不读取也不验证 Cookie**，所有请求直接通过
+- `disable_admin_token = false` 时，才验证 Cookie 中的 JWT
+- JWT 验证失败时才会删除 Cookie
+- 重启本身不删除 Cookie，也不改变密钥/issuer，所以 JWT 仍然有效
 
 ### 6.5 典型场景的行为矩阵
 
@@ -756,7 +805,7 @@ RSA 密钥的加载和生命周期：
 | **启动时有 ADMIN_TOKEN → 运行时删除 ADMIN_TOKEN** | 管理面板 | ✅ 可用 | ❌ 无法登录 | ✅ 保持有效 | 路由已挂载，只是 validate_token 返回 false |
 | **运行时修改 ADMIN_TOKEN 值** | 管理面板 | ✅ 可用 | ❌ 旧 token 失败<br>✅ 新 token 成功 | ✅ 保持有效 | 已登录会话不受影响 |
 | **修改 disable_admin_token 值** | 管理面板 | ❌ 无法修改 | - | - | 面板提交时会被 clear_non_editable 清除 |
-| **修改 disable_admin_token 值** | 环境变量 + 重启 | ✅ 可用 | 取决于新值 | ❌ 重启后全部失效 | 重启后 JWT 仍有效，但守卫行为改变 |
+| **修改 disable_admin_token 值** | 环境变量 + 重启 | ✅ 可用 | 取决于新值 | ✅ Cookie 仍然有效 | disable_admin_token=true 时跳过认证<br>disable_admin_token=false 时验证 JWT（密钥/issuer 未变则通过） |
 | **运行时修改 admin_session_lifetime** | 管理面板 | ✅ 可用 | ✅ 新会话使用新值 | ✅ 旧会话仍用原值 | JWT 的 exp 在签发时确定 |
 | **运行时修改 admin_ratelimit 参数** | 环境变量 + 重启 | ✅ 可用 | ✅ 仍受原限流（运行时）<br>✅ 新限流（重启后） | ✅ 不受影响 | 限流器是 LazyLock 初始化的 |
 
@@ -781,3 +830,10 @@ RSA 密钥的加载和生命周期：
    - ✅ **立即生效**：`ADMIN_TOKEN`（登录验证）、`admin_session_lifetime`（新会话）、所有业务逻辑配置（如 `signups_allowed`）
    - ❌ **需要重启**：路由列表、RSA 密钥、限流参数、数据库连接池、静态文件路径
    - ⚠️ **理论上可热更新**：`disable_admin_token`（内存值改变立即生效，但正常路径无法触发）
+   - ⚠️ **重启不失效**：已有 Cookie（RSA 密钥和 domain 不变的情况下）
+
+5. **关于重启与会话有效性的常见误区**：
+   - ❌ 错误："重启服务器会使所有管理员会话失效"
+   - ✅ 正确：**重启本身不会使会话失效**。只有当 RSA 密钥文件被删除、domain 配置改变，或 JWT 自然过期时，会话才会失效
+   - ❌ 错误："修改 disable_admin_token 后重启会踢掉所有管理员"
+   - ✅ 正确：修改 `disable_admin_token = false` 后重启，已有有效 Cookie 的管理员仍然可以访问，只是会验证 JWT（密钥/issuer 未变则通过）
