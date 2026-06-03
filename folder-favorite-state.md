@@ -933,23 +933,42 @@ Cipher JSON:
 - `favorite` 为 `false` 不代表用户"取消收藏"，仅表示当前不在收藏列表中
 - 同一共享密码对不同用户返回不同的 `folderId`、`favorite`、`archivedDate` 值
 
-### 8.5 数据库级 ON DELETE CASCADE 配置
+### 8.5 数据库级 ON DELETE CASCADE — 各表定义差异
 
-**迁移脚本定义**：三种数据库的 archives 表迁移脚本都明确定义了外键级联删除。
+**关键事实**：在整个迁移脚本中，`ON DELETE CASCADE` **只出现在 archives 和 sso_users 两个表**。旧表（favorites、folders_ciphers、attachments 等）**全部没有定义级联删除**。
 
-| 数据库 | 迁移脚本 | 外键配置 |
-|--------|---------|---------|
-| SQLite | [migrations/sqlite/.../add_archives/up.sql](file:///d:/fz/0601/solo-dogfeeding/code/17-vaultwarden/migrations/sqlite/2026-03-09-005927_add_archives/up.sql) | `user_uuid REFERENCES users (uuid) ON DELETE CASCADE`<br>`cipher_uuid REFERENCES ciphers (uuid) ON DELETE CASCADE` |
-| PostgreSQL | [migrations/postgresql/.../add_archives/up.sql](file:///d:/fz/0601/solo-dogfeeding/code/17-vaultwarden/migrations/postgresql/2026-03-09-005927_add_archives/up.sql) | `user_uuid CHAR(36) NOT NULL REFERENCES users (uuid) ON DELETE CASCADE`<br>`cipher_uuid CHAR(36) NOT NULL REFERENCES ciphers (uuid) ON DELETE CASCADE` |
-| MySQL | [migrations/mysql/.../add_archives/up.sql](file:///d:/fz/0601/solo-dogfeeding/code/17-vaultwarden/migrations/mysql/2026-03-09-005927_add_archives/up.sql) | `FOREIGN KEY (user_uuid) REFERENCES users (uuid) ON DELETE CASCADE`<br>`FOREIGN KEY (cipher_uuid) REFERENCES ciphers (uuid) ON DELETE CASCADE` |
+| 关联表 | 迁移脚本 | 是否定义 ON DELETE CASCADE | 说明 |
+|--------|---------|---------------------------|------|
+| `folders_ciphers` | [2018-04-27_create_users_ciphers/up.sql](file:///d:/fz/0601/solo-dogfeeding/code/17-vaultwarden/migrations/sqlite/2018-04-27-155151_create_users_ciphers/up.sql) | ✗ 无 | `REFERENCES ciphers(uuid)` 无 CASCADE |
+| `favorites` | [2020-08-02_add_favorites_table/up.sql](file:///d:/fz/0601/solo-dogfeeding/code/17-vaultwarden/migrations/sqlite/2020-08-02-025025_add_favorites_table/up.sql) | ✗ 无 | `REFERENCES users(uuid)` 无 CASCADE |
+| `attachments` | [2018-01-14_create_tables/up.sql](file:///d:/fz/0601/solo-dogfeeding/code/17-vaultwarden/migrations/sqlite/2018-01-14-171611_create_tables/up.sql) | ✗ 无 | `REFERENCES ciphers(uuid)` 无 CASCADE |
+| `ciphers_collections` | [2018-05-08_create_collection_cipher_map/up.sql](file:///d:/fz/0601/solo-dogfeeding/code/17-vaultwarden/migrations/sqlite/2018-05-08-161616_create_collection_cipher_map/up.sql) | ✗ 无 | 无 CASCADE |
+| `sso_users` | [2024-03-13_sso_userscascade/up.sql](file:///d:/fz/0601/solo-dogfeeding/code/17-vaultwarden/migrations/sqlite/2024-03-13_170000_sso_userscascade/up.sql) | ✓ 有 | `ON UPDATE CASCADE ON DELETE CASCADE` |
+| **`archives`** | [2026-03-09_add_archives/up.sql](file:///d:/fz/0601/solo-dogfeeding/code/17-vaultwarden/migrations/sqlite/2026-03-09-005927_add_archives/up.sql) | **✓ 有** | `ON DELETE CASCADE`（新增表，三个数据库都有） |
 
-**迁移时外键禁用**：迁移过程中所有数据库都临时禁用外键检查（[src/db/mod.rs:L488](file:///d:/fz/0601/solo-dogfeeding/code/17-vaultwarden/src/db/mod.rs#L488)）：
-- SQLite: `PRAGMA foreign_keys = OFF`
-- MySQL: `SET FOREIGN_KEY_CHECKS = 0`
+**archives 表的 CASCADE 定义**（三数据库一致）：
 
-但这仅影响迁移连接，不影响运行时连接。
+```sql
+-- SQLite
+user_uuid   CHAR(36) NOT NULL REFERENCES users (uuid) ON DELETE CASCADE,
+cipher_uuid CHAR(36) NOT NULL REFERENCES ciphers (uuid) ON DELETE CASCADE,
 
-### 8.6 SQLite 运行时未启用 foreign_keys — 级联删除不生效
+-- PostgreSQL
+user_uuid   CHAR(36) NOT NULL REFERENCES users (uuid) ON DELETE CASCADE,
+cipher_uuid CHAR(36) NOT NULL REFERENCES ciphers (uuid) ON DELETE CASCADE,
+
+-- MySQL
+FOREIGN KEY (user_uuid) REFERENCES users (uuid) ON DELETE CASCADE,
+FOREIGN KEY (cipher_uuid) REFERENCES ciphers (uuid) ON DELETE CASCADE
+```
+
+**历史背景**：
+- 2018 年创建的旧表（folders_ciphers、attachments、ciphers_collections）只写了 `REFERENCES` 不带 `CASCADE`，所有数据库都没有级联删除
+- 2020 年新增 favorites 表时，同样没有定义 `CASCADE`
+- 2024 年 sso_users 修复时，通过独立迁移脚本追加了 `ON DELETE CASCADE`
+- 2026 年新增 archives 表时，从一开始就定义了 `ON DELETE CASCADE`
+
+### 8.6 SQLite 运行时 foreign_keys 开关
 
 **代码路径**: [src/db/mod.rs#L310-L319](file:///d:/fz/0601/solo-dogfeeding/code/17-vaultwarden/src/db/mod.rs#L310-L319)
 
@@ -957,30 +976,32 @@ Cipher JSON:
 pub fn default_init_stmts(&self) -> String {
     match self {
         #[cfg(mysql)]
-        Self::Mysql => String::new(),           // MySQL 默认启用外键
+        Self::Mysql => String::new(),
         #[cfg(postgresql)]
-        Self::Postgresql => String::new(),      // PostgreSQL 默认启用外键
+        Self::Postgresql => String::new(),
         #[cfg(sqlite)]
         Self::Sqlite => "PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;".to_owned(),
-        // ⚠️  SQLite 没有 PRAGMA foreign_keys = ON！
+        // 注意：没有 PRAGMA foreign_keys = ON
     }
 }
 ```
 
-**各数据库运行时行为对比**：
+**SQLite 外键默认行为**：
+- SQLite 的 `PRAGMA foreign_keys` 默认为 `OFF`，这是 SQLite 的设计决定（[SQLite 官方文档](https://www.sqlite.org/pragma.html#pragma_foreign_keys)）
+- Vaultwarden 的连接池初始化语句**没有启用** `PRAGMA foreign_keys = ON`
+- 但用户可通过 `DATABASE_CONN_INIT` 环境变量（[src/config.rs#L755](file:///d:/fz/0601/solo-dogfeeding/code/17-vaultwarden/src/config.rs#L755)）自定义初始化语句，例如设置 `PRAGMA foreign_keys = ON`
+- 当 `DATABASE_CONN_INIT` 非空时，它**替代** `default_init_stmts` 而非追加
 
-| 数据库 | 外键默认状态 | 运行时是否启用 ON DELETE CASCADE | Archive 记录清理方式 |
-|--------|-------------|---------------------------------|---------------------|
-| **MySQL** | 默认 `FOREIGN_KEY_CHECKS = 1` | ✓ 启用 | 数据库自动级联删除 |
-| **PostgreSQL** | 默认启用 | ✓ 启用 | 数据库自动级联删除 |
-| **SQLite** | 默认 `foreign_keys = OFF` | ✗ 未启用 | **需要代码手动清理** |
+**各数据库运行时外键行为**：
 
-**关键问题**：
-- SQLite 的 `PRAGMA foreign_keys` 是**连接级别的设置**，默认为 `OFF`
-- 连接池初始化语句（`default_init_stmts`）中**没有设置 `PRAGMA foreign_keys = ON`**
-- 因此在 SQLite 下，即使迁移脚本定义了 `ON DELETE CASCADE`，运行时也**不会自动执行级联删除**
+| 数据库 | 外键默认状态 | 外键约束生效 | CASCADE 触发 |
+|--------|-------------|-------------|-------------|
+| MySQL | 默认 `FOREIGN_KEY_CHECKS = 1` | ✓ 生效 | ✓ 触发 |
+| PostgreSQL | 默认启用 | ✓ 生效 | ✓ 触发 |
+| SQLite（默认配置） | 默认 `foreign_keys = OFF` | ✗ 不生效 | ✗ 不触发 |
+| SQLite（手动启用） | `PRAGMA foreign_keys = ON` | ✓ 生效 | ✓ 触发 |
 
-### 8.7 密码删除时的个人状态清理 — 数据库与代码双重机制
+### 8.7 密码删除时各表清理的真实机制
 
 **代码路径**: [Cipher::delete](file:///d:/fz/0601/solo-dogfeeding/code/17-vaultwarden/src/db/models/cipher.rs#L476-L490)
 
@@ -988,28 +1009,27 @@ pub fn default_init_stmts(&self) -> String {
 pub async fn delete(&self, conn: &DbConn) -> EmptyResult {
     self.update_users_revision(conn).await;
 
-    FolderCipher::delete_all_by_cipher(&self.uuid, conn).await?;    // 代码手动清理
-    CollectionCipher::delete_all_by_cipher(&self.uuid, conn).await?; // 代码手动清理
-    Attachment::delete_all_by_cipher(&self.uuid, conn).await?;       // 代码手动清理
-    Favorite::delete_all_by_cipher(&self.uuid, conn).await?;         // 代码手动清理
-    // ⚠️  Archive::delete_all_by_cipher(&self.uuid, conn).await?;  // ✗ 缺失代码手动清理！
+    FolderCipher::delete_all_by_cipher(&self.uuid, conn).await?;
+    CollectionCipher::delete_all_by_cipher(&self.uuid, conn).await?;
+    Attachment::delete_all_by_cipher(&self.uuid, conn).await?;
+    Favorite::delete_all_by_cipher(&self.uuid, conn).await?;
+    // Archive 没有手动清理
 
     diesel::delete(ciphers::table.filter(ciphers::uuid.eq(&self.uuid)))...
-    // 数据库层面：
-    // - MySQL/PostgreSQL: ON DELETE CASCADE 自动触发 archives 记录删除
-    // - SQLite: 外键不生效，archives 记录残留！
 }
 ```
 
-**密码删除时 Archive 记录清理的真实行为**：
+**旧表（无 CASCADE）的清理**：必须由代码手动执行，否则所有数据库都会残留。
 
-| 数据库 | 数据库级联 | 代码手动清理 | 最终结果 |
-|--------|-----------|-------------|---------|
-| MySQL | ✓ 自动删除 | ✗ 未调用 | ✓ 正确清理 |
-| PostgreSQL | ✓ 自动删除 | ✗ 未调用 | ✓ 正确清理 |
-| SQLite | ✗ 不生效 | ✗ 未调用 | **✗ 残留孤儿记录** |
+| 关联表 | 迁移定义 CASCADE | 代码手动清理 | MySQL/PG 结果 | SQLite 结果 |
+|--------|-----------------|-------------|--------------|------------|
+| `folders_ciphers` | ✗ 无 | ✓ `delete_all_by_cipher` | ✓ 代码清理 | ✓ 代码清理 |
+| `ciphers_collections` | ✗ 无 | ✓ `delete_all_by_cipher` | ✓ 代码清理 | ✓ 代码清理 |
+| `attachments` | ✗ 无 | ✓ `delete_all_by_cipher` | ✓ 代码清理 | ✓ 代码清理 |
+| `favorites` | ✗ 无 | ✓ `delete_all_by_cipher` | ✓ 代码清理 | ✓ 代码清理 |
+| **`archives`** | **✓ 有** | **✗ 无** | **✓ 数据库级联** | **✗ 残留**（默认配置） |
 
-### 8.8 用户删除时的个人状态清理 — 同样的数据库差异
+### 8.8 用户删除时各表清理的真实机制
 
 **代码路径**: [User::delete](file:///d:/fz/0601/solo-dogfeeding/code/17-vaultwarden/src/db/models/user.rs#L324-L349)
 
@@ -1017,42 +1037,53 @@ pub async fn delete(&self, conn: &DbConn) -> EmptyResult {
 pub async fn delete(self, conn: &DbConn) -> EmptyResult {
     // ...
     Cipher::delete_all_by_user(&self.uuid, conn).await?;
-    Favorite::delete_all_by_user(&self.uuid, conn).await?;       // 代码手动清理
-    Folder::delete_all_by_user(&self.uuid, conn).await?;         // 代码手动清理
-    // ⚠️  Archive::delete_all_by_user(&self.uuid, conn).await?;  // ✗ 缺失代码手动清理！
+    Favorite::delete_all_by_user(&self.uuid, conn).await?;
+    Folder::delete_all_by_user(&self.uuid, conn).await?;
+    // Archive 没有手动清理
 
     diesel::delete(users::table.filter(users::uuid.eq(self.uuid)))...
-    // 数据库层面：
-    // - MySQL/PostgreSQL: ON DELETE CASCADE 自动触发 archives 记录删除
-    // - SQLite: 外键不生效，archives 记录残留！
 }
 ```
 
-**用户删除时 Archive 记录清理的真实行为**：
+| 关联表 | 迁移定义 CASCADE | 代码手动清理 | MySQL/PG 结果 | SQLite 结果 |
+|--------|-----------------|-------------|--------------|------------|
+| `favorites` | ✗ 无 | ✓ `delete_all_by_user` | ✓ 代码清理 | ✓ 代码清理 |
+| `folders` → `folders_ciphers` | ✗ 无 | ✓ `Folder::delete_all_by_user` | ✓ 代码清理 | ✓ 代码清理 |
+| `devices` | ✗ 无 | ✓ `delete_all_by_user` | ✓ 代码清理 | ✓ 代码清理 |
+| `twofactor` | ✗ 无 | ✓ `delete_all_by_user` | ✓ 代码清理 | ✓ 代码清理 |
+| **`archives`** | **✓ 有** | **✗ 无** | **✓ 数据库级联** | **✗ 残留**（默认配置） |
 
-| 数据库 | 数据库级联 | 代码手动清理 | 最终结果 |
-|--------|-----------|-------------|---------|
-| MySQL | ✓ 自动删除 | ✗ 未调用 | ✓ 正确清理 |
-| PostgreSQL | ✓ 自动删除 | ✗ 未调用 | ✓ 正确清理 |
-| SQLite | ✗ 不生效 | ✗ 未调用 | **✗ 残留孤儿记录** |
+### 8.9 两种设计策略的冲突
 
-### 8.9 为什么代码中有手动 delete_all_by_cipher/delete_all_by_user？
+**旧表的设计策略**：迁移脚本不定义 CASCADE → 代码手动清理 → **所有数据库行为一致**
 
-**原因分析**：为了 SQLite 兼容性！
+```
+旧表（favorites 等）:
+  迁移: REFERENCES users(uuid)           ← 无 CASCADE
+  代码: Favorite::delete_all_by_cipher()  ← 必须手动清理
+  结果: 所有数据库都通过代码清理，行为一致
+```
 
-因为 SQLite 默认不启用外键约束，数据库级 `ON DELETE CASCADE` 不生效，所以代码中必须提供手动清理方法：
+**archives 表的设计策略**：迁移脚本定义 CASCADE → 代码不手动清理 → **依赖数据库级联**
 
-| 模型 | 有 `delete_all_by_cipher` | 有 `delete_all_by_user` | 原因 |
-|------|--------------------------|-------------------------|------|
-| FolderCipher | ✓ | ✗（通过 Folder 删除） | SQLite 下不启用外键，必须手动清理 |
-| Favorite | ✓ | ✓ | SQLite 下不启用外键，必须手动清理 |
-| Attachment | ✓ | - | SQLite 下不启用外键，必须手动清理 |
-| CollectionCipher | ✓ | - | SQLite 下不启用外键，必须手动清理 |
-| **Archive** | **✗ 缺失** | **✗ 缺失** | **代码缺陷！与 Favorite 不一致** |
+```
+archives 表:
+  迁移: REFERENCES users(uuid) ON DELETE CASCADE  ← 有 CASCADE
+  代码: (无手动清理)                                ← 依赖数据库级联
+  结果: MySQL/PG 数据库级联生效，SQLite（默认配置）级联不生效 → 行为不一致
+```
 
-**结论**：
-- Archive 模型**缺少**与 Favorite 一致的 `delete_all_by_cipher` 和 `delete_all_by_user` 方法
-- 这导致 **SQLite 环境下**密码或用户被删除时，`archives` 表中会残留孤儿记录
+**核心冲突**：
+- archives 表的设计者选择了**依赖数据库 CASCADE**，而非沿用旧表的"代码手动清理"策略
+- 这在 MySQL/PostgreSQL 下工作正常，因为它们默认启用外键约束
+- 但在 SQLite 下（默认 `foreign_keys = OFF`），`ON DELETE CASCADE` 不触发，导致残留孤儿记录
+- 如果用户在 SQLite 下手动配置 `DATABASE_CONN_INIT="PRAGMA foreign_keys = ON"`，则级联生效，问题消失
+
+**这是设计决策还是缺陷？**
+- 从**设计意图**看，archives 表故意定义了 `ON DELETE CASCADE` 并省略了手动清理代码，这是一种有意为之的策略——让数据库负责级联清理，减少冗余代码
+- 从**兼容性**看，Vaultwarden 官方支持 SQLite 作为默认数据库，而 SQLite 默认不启用外键，这意味着 archives 的设计策略与项目整体 SQLite 支持存在不一致
+- 旧表因为不定义 CASCADE，所以**必须**代码手动清理，与 SQLite 兼容；archives 定义了 CASCADE 但 SQLite 不生效，导致**行为分歧**
+- 如果 archives 的设计意图确实是"依赖数据库 CASCADE"，那么应在 SQLite 默认初始化语句中加入 `PRAGMA foreign_keys = ON`，或在文档中说明 SQLite 用户需手动配置
 - **MySQL/PostgreSQL 环境下**不受影响，因为数据库级联生效
 - 修复方案：在 Archive 模型中添加这两个方法，并在 `Cipher::delete()` 和 `User::delete()` 中调用
 
@@ -1155,14 +1186,14 @@ if *delete_options == CipherDeleteOptions::SoftSingle || *delete_options == Ciph
 | **完整更新时间戳来源** | 无时间戳 | 无时间戳 | 客户端传入（可解析失败） |
 | **独立端点时间戳来源** | — | — | 服务器 `Utc::now()` |
 | **写入前状态检查** | ✓（`move_to_folder` 查当前 folder） | ✓（`set_favorite` 查当前状态） | ✗（直接 REPLACE INTO） |
-| **delete_all_by_cipher** | ✓ | ✓ | **✗ 缺失（仅 MySQL/PostgreSQL 靠数据库级联）** |
-| **delete_all_by_user** | ✓（通过 Folder 删除） | ✓ | **✗ 缺失（仅 MySQL/PostgreSQL 靠数据库级联）** |
-| **数据库级 ON DELETE CASCADE** | ✓ | ✓ | ✓（迁移脚本定义了） |
-| **SQLite 外键启用** | ✗ 默认不启用 | ✗ 默认不启用 | ✗ 默认不启用 |
+| **delete_all_by_cipher** | ✓ | ✓ | **✗ 无（依赖数据库 CASCADE）** |
+| **delete_all_by_user** | ✓（通过 Folder 删除） | ✓ | **✗ 无（依赖数据库 CASCADE）** |
+| **迁移定义 ON DELETE CASCADE** | ✗ 无 | ✗ 无 | **✓ 有**（唯一有 CASCADE 的个人状态表） |
+| **SQLite 外键启用** | ✗ 默认不启用（但不需要，靠代码清理） | ✗ 默认不启用（但不需要，靠代码清理） | ✗ 默认不启用（**需要但未启用**） |
 | **密码删除时清理（SQLite）** | ✓（代码手动） | ✓（代码手动） | **✗ 不清理，残留孤儿记录** |
-| **密码删除时清理（MySQL/PG）** | ✓（代码手动 + 数据库级联） | ✓（代码手动 + 数据库级联） | ✓（数据库级联自动） |
+| **密码删除时清理（MySQL/PG）** | ✓（代码手动） | ✓（代码手动） | ✓（数据库级联自动） |
 | **用户删除时清理（SQLite）** | ✓（`Folder::delete_all_by_user`） | ✓（`Favorite::delete_all_by_user`） | **✗ 不清理，残留孤儿记录** |
-| **用户删除时清理（MySQL/PG）** | ✓（`Folder::delete_all_by_user` + 数据库级联） | ✓（`Favorite::delete_all_by_user` + 数据库级联） | ✓（数据库级联自动） |
+| **用户删除时清理（MySQL/PG）** | ✓（`Folder::delete_all_by_user`） | ✓（`Favorite::delete_all_by_user`） | ✓（数据库级联自动） |
 | **触发用户修订更新** | ✓（`move_to_folder` 开头） | ✓（`set_favorite` 开头） | ✓（`Archive::save` / `delete_by_cipher` 开头） |
 | **数据库写入语义** | DELETE + INSERT | INSERT 或 DELETE | REPLACE INTO / ON CONFLICT UPDATE |
 | **是否触碰 cipher 表** | ✗ 只操作 folders_ciphers | ✗ 只操作 favorites | ✗ 只操作 archives |
