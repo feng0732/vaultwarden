@@ -168,18 +168,29 @@ if self.is_owned_by_user(user_uuid)                    // 1. 用户是 cipher �
 
 以上任一条件满足，用户拥有完全控制权，无需进一步判定。
 
-#### 3.3.2 关键规则：直接授权覆盖组授权
+#### 3.3.2 两条不同的查询路径
 
-**代码位置**：`src/db/models/cipher.rs` (L631-L638)
+**关键代码**：`src/db/models/cipher.rs` (L617-L638)
 
 ```rust
 let rows = if let Some(cipher_sync_data) = cipher_sync_data {
-    // ... 使用同步数据（见下一节）
+    // ========== 路径 A：同步数据路径 ==========
+    let mut rows: Vec<(bool, bool, bool)> = Vec::new();
+    if let Some(collections) = cipher_sync_data.cipher_collections.get(&self.uuid) {
+        for collection in collections {
+            // User permissions
+            if let Some(cu) = cipher_sync_data.user_collections.get(collection) {
+                rows.push((cu.read_only, cu.hide_passwords, cu.manage));
+            // Group permissions
+            } else if let Some(cg) = cipher_sync_data.user_collections_groups.get(collection) {
+                rows.push((cg.read_only, cg.hide_passwords, cg.manage));
+            }
+        }
+    }
+    rows
 } else {
-    // 先查询直接授权
+    // ========== 路径 B：普通查询路径 ==========
     let user_permissions = self.get_user_collections_access_flags(user_uuid, conn).await;
-    
-    // 重要！直接授权覆盖组授权！
     if user_permissions.is_empty() {
         // 只有当没有直接授权时，才考虑组授权
         self.get_group_collections_access_flags(user_uuid, conn).await
@@ -196,11 +207,78 @@ let rows = if let Some(cipher_sync_data) = cipher_sync_data {
 // and only user permissions are returned by the code above.
 ```
 
-**结论**：**直接授权完全覆盖组授权**，不是取并集也不是聚合。如果用户对某个集合有直接授权，那么对该集合的组授权会被完全忽略。
+---
 
-#### 3.3.3 多集合权限聚合方式
+#### 3.3.3 路径 A：同步数据路径（有 CipherSyncData）
 
-当一个 cipher 属于多个集合时，需要聚合这些集合的权限：
+**适用场景**：批量同步时使用，客户端拉取数据的主要路径
+
+**处理逻辑**：
+1. 遍历 cipher 所在的**每一个 collection**
+2. 对每个 collection 独立判断：
+   - 先查 `user_collections`（直接授权）→ 有就用直接授权
+   - 没有再查 `user_collections_groups`（组授权）→ 有就用组授权
+3. 每个 collection 的判定结果加入 rows 列表
+
+**关键特点**：
+- **按 collection 分别处理**，不同 collection 可以混合使用直接授权和组授权
+- 某个 collection 有直接授权不影响其他 collection 使用组授权
+
+---
+
+#### 3.3.4 路径 B：普通查询路径（无 CipherSyncData）
+
+**适用场景**：单独查询某个 cipher 权限时使用
+
+**查询函数 1**：`src/db/models/cipher.rs` (L671-L688) (`get_user_collections_access_flags`)
+
+```rust
+// INNER JOIN users_collections，只返回有直接授权的集合
+.inner_join(
+    users_collections::table.on(ciphers_collections::collection_uuid
+        .eq(users_collections::collection_uuid)
+        .and(users_collections::user_uuid.eq(user_uuid))),
+)
+```
+
+**查询函数 2**：`src/db/models/cipher.rs` (L690-L717) (`get_group_collections_access_flags`)
+
+```rust
+// INNER JOIN collections_groups，只返回有组授权的集合
+.inner_join(
+    collections_groups::table
+        .on(collections_groups::collections_uuid.eq(ciphers_collections::collection_uuid)),
+)
+```
+
+**处理逻辑**：
+1. 先调用 `get_user_collections_access_flags` 查询所有直接授权
+2. **如果直接授权结果非空**（即 cipher 所在的任一集合有直接授权）：
+   - 只使用直接授权的集合权限
+   - **完全忽略所有组授权**（即使某些集合只有组授权没有直接授权）
+3. 只有当直接授权结果为空时，才调用 `get_group_collections_access_flags` 查询组授权
+
+**关键特点**：
+- **整体覆盖**：任一集合有直接授权 → 所有集合的组授权都被忽略
+- 可能导致比预期更严格的权限（见场景 3）
+
+---
+
+#### 3.3.5 两条路径对比总结
+
+| 对比维度 | 同步数据路径（有 CipherSyncData） | 普通查询路径（无 CipherSyncData） |
+|---------|-------------------------------|-------------------------------|
+| 处理方式 | 按 collection 逐个判断 | 整体二选一 |
+| 直接授权覆盖范围 | 仅覆盖当前 collection 的组授权 | 覆盖所有 collection 的组授权 |
+| 混合授权 | 支持：不同 collection 可分别用直接/组授权 | 不支持：有直接授权就全用直接授权 |
+| 代码位置 | L618-L630 | L632-L638 |
+| 适用场景 | 批量同步（主要路径） | 单独查询（次要路径）|
+
+---
+
+#### 3.3.6 多集合权限聚合方式
+
+无论哪条路径，最终聚合规则相同：
 
 **代码位置**：`src/db/models/cipher.rs` (L645-L666)
 
@@ -232,7 +310,7 @@ for (ro, hp, mn) in &rows {
 
 ---
 
-### 3.4 CipherSyncData 中的组内权限聚合
+### 3.4 CipherSyncData 中的组内权限预聚合
 
 当使用 CipherSyncData 进行批量同步时，还有一层组内权限的预聚合：
 
@@ -274,7 +352,8 @@ let user_collections_groups: HashMap<CollectionId, CollectionGroup> =
 |------|---------|-------------------|---------|
 | **Collection 可见性** | OR 逻辑，任一途径即可访问 | 平等 OR 关系 | 不涉及 |
 | **用户详情展示** | 分离展示 | 分开显示，组继承的不列出 | 不涉及 |
-| **Cipher 操作限制** | 分层次判定 | **直接授权完全覆盖组授权** | read_only: AND<br>hide_passwords: AND<br>manage: OR |
+| **Cipher 操作限制（同步路径）** | 按 collection 逐个判定 | 按 collection 分别覆盖 | read_only: AND<br>hide_passwords: AND<br>manage: OR |
+| **Cipher 操作限制（普通路径）** | 整体二选一 | 整体覆盖，有直接授权就忽略组授权 | 同上 |
 
 ---
 
@@ -286,8 +365,8 @@ let user_collections_groups: HashMap<CollectionId, CollectionGroup> =
 - 用户 A 对集合 X 有直接授权：`read_only=true, hide_passwords=true, manage=false`
 - 用户 A 同时通过组 G 对集合 X 有授权：`read_only=false, hide_passwords=false, manage=true`
 
-**结果**：
-- **直接授权完全覆盖组授权**
+**结果**（两条路径一致）：
+- 对集合 X，直接授权覆盖组授权
 - 实际权限：`read_only=true, hide_passwords=true, manage=false`
 - 组授权的宽松权限被完全忽略
 
@@ -300,7 +379,7 @@ let user_collections_groups: HashMap<CollectionId, CollectionGroup> =
 - 用户对集合 X 的直接授权：`read_only=true, hide_passwords=true, manage=false`
 - 用户对集合 Y 的直接授权：`read_only=false, hide_passwords=false, manage=true`
 
-**结果**：
+**结果**（两条路径一致）：
 - `read_only = true AND false = false` → 可写
 - `hide_passwords = true AND false = false` → 可见密码
 - `manage = false OR true = true` → 可管理
@@ -315,11 +394,24 @@ let user_collections_groups: HashMap<CollectionId, CollectionGroup> =
 - 用户对集合 X 有直接授权：`read_only=true, hide_passwords=true, manage=false`
 - 用户对集合 Y 只有组授权：`read_only=false, hide_passwords=false, manage=true`
 
-**结果**：
-- 集合 X 使用直接授权
-- 集合 Y：因为用户对 X 有直接授权，所以对 Y 的组授权**完全被忽略**
-- 最终只聚合直接授权：`(true, true, false)`
-- 注意：这可能导致比预期更严格的权限！
+#### 路径 A（同步数据路径）结果：
+- 集合 X：有直接授权，使用 `(true, true, false)`
+- 集合 Y：无直接授权，使用组授权 `(false, false, true)`
+- 聚合：
+  - `read_only = true AND false = false` → 可写
+  - `hide_passwords = true AND false = false` → 可见密码
+  - `manage = false OR true = true` → 可管理
+- **最终结果**：`(false, false, true)`（最宽松）
+
+#### 路径 B（普通查询路径）结果：
+- `get_user_collections_access_flags` 返回集合 X 的权限 `(true, true, false)`（非空）
+- 因为直接授权非空，**完全忽略集合 Y 的组授权**
+- 只聚合直接授权：`(true, true, false)`
+- **最终结果**：`(true, true, false)`（最严格）
+
+**关键结论**：两条路径在混合授权场景下结果可能不同！
+- 同步路径（主要路径）：混合使用，取最宽松
+- 普通查询路径（次要路径）：整体覆盖，可能更严格
 
 ---
 
@@ -331,7 +423,7 @@ let user_collections_groups: HashMap<CollectionId, CollectionGroup> =
 - 组 G2 对集合 X：`read_only=false, hide_passwords=true, manage=true`
 - 用户 A 同时属于 G1 和 G2
 
-**结果**（CipherSyncData 预聚合）：
+**结果**（CipherSyncData 预聚合，两条路径一致）：
 - `read_only = true AND false = false` → 可写
 - `hide_passwords = true AND true = true` → 隐藏密码
 - `manage = false OR true = true` → 可管理
@@ -572,7 +664,9 @@ users_organizations (成员表)
 `access_all = true` 只授予**访问权**，不影响集合本身的存在性。如果集合被删除或移动，仍然不可见。
 
 ### Q4: 直接授权和组授权的权限冲突怎么办？
-**直接授权完全覆盖组授权**！如果用户对某个集合有直接授权，组授权会被完全忽略。这不是取并集，而是直接使用直接授权的权限。
+**按 collection 分别覆盖**（同步路径）或**整体覆盖**（普通查询路径）：
+- 同步路径：对每个 collection，有直接授权就用直接授权，没有才用组授权
+- 普通查询路径：任一 collection 有直接授权 → 所有 collection 的组授权都被忽略
 
 ### Q5: 为什么修改组名称后所有用户都需要重新同步？
 因为 `put_group` API 采用全量替换策略，先删除所有成员和集合关联再重新添加，这个过程会间接触发所有组内用户的 revision 更新。
@@ -588,6 +682,12 @@ users_organizations (成员表)
 - `manage`: OR → 任一组可管理，最终可管理
 - 总体原则：**取最宽松**的权限
 
+### Q8: 混合授权场景下，同步路径和普通查询路径结果不同？
+是的，这是已知的实现特性：
+- 同步路径（主要）：按 collection 分别处理，混合使用直接/组授权，取最宽松
+- 普通查询路径（次要）：整体二选一，有直接授权就忽略所有组授权，可能更严格
+- 实际使用中客户端主要走同步路径，普通查询路径较少直接调用
+
 ---
 
 ## 八、代码快速索引
@@ -600,7 +700,11 @@ users_organizations (成员表)
 | Collection 可见性判定 | `src/db/models/collection.rs` | L149-L156 |
 | 用户详情展示（集合过滤） | `src/db/models/organization.rs` | L556-L605 |
 | Cipher 权限限制核心函数 | `src/db/models/cipher.rs` | L601-L669 |
-| 直接授权覆盖组授权逻辑 | `src/db/models/cipher.rs` | L631-L638 |
+| 两条查询路径分流逻辑 | `src/db/models/cipher.rs` | L617-L638 |
+| 同步数据路径实现 | `src/db/models/cipher.rs` | L618-L630 |
+| 普通查询路径实现 | `src/db/models/cipher.rs` | L632-L638 |
+| 直接授权查询函数 | `src/db/models/cipher.rs` | L671-L688 |
+| 组授权查询函数 | `src/db/models/cipher.rs` | L690-L717 |
 | 多集合权限聚合规则 | `src/db/models/cipher.rs` | L645-L666 |
 | CipherSyncData 组权限预聚合 | `src/api/core/ciphers.rs` | L2175-L2190 |
 | 组全局权限判定 | `src/db/models/group.rs` | L593-L610 |
