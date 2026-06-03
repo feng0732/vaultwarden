@@ -1053,3 +1053,505 @@ POST /emergency-access/{emer_id}/reinvite
 | 上游调用方捕获 | `error!` | 触发点使用 if let Err 记录 |
 
 代码位置：[mail.rs#L653-L701](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/mail.rs#L653-L701)
+
+---
+
+## 14. 发送失败后的数据库记录变化
+
+### 14.1 四类结果分类
+
+| 结果类型 | 说明 | 典型场景 |
+|----------|------|----------|
+| **🔴 清理记录（回滚删除）** | 发送失败后主动删除已创建的数据库记录，恢复到发送前状态 | 组织邀请创建新用户后发送失败 |
+| **🟡 不落库（无持久化）** | 没有任何数据库记录需要保存，发送失败无影响 | 欢迎邮件、通知类邮件 |
+| **🟢 保留给定时任务重试** | 记录保留在数据库中，下次定时任务执行时会再次尝试 | 2FA 未完成提醒 |
+| **🔵 更新时间后发送失败** | 先更新了状态/时间戳记录，再发送邮件失败 | 紧急访问定时任务 |
+
+---
+
+### 14.2 清理记录（回滚删除）场景
+
+#### 14.2.1 组织邀请用户（新用户）
+**代码位置**：[organizations.rs#L1113-L1130](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1113-L1130)
+
+```
+发送前：
+1. 创建用户记录（如果不存在）
+2. 创建成员关系记录（Membership）
+        ↓
+发送失败 → 回滚清理：
+├─ 如果是新创建的用户 → user.delete(&conn).await?
+└─ 否则 → new_member.delete(&conn).await?
+```
+
+**关键点**：
+- 先保存记录，再发送邮件
+- 发送失败后根据 `user_created` 标志决定删除用户还是仅删除成员关系
+- 删除操作使用 `?` 传播，删除失败则整体失败
+
+---
+
+#### 14.2.2 管理端邀请用户
+**代码位置**：[admin.rs#L307-L335](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L307-L335)
+
+```
+发送前：
+1. 调用 generate_invite() 发送邮件
+2. 发送成功后才保存用户记录
+        ↓
+发送失败 → 不保存用户，直接返回错误
+```
+
+**关键点**：
+- 邮件发送在用户保存**之前**
+- 发送失败不会创建垃圾数据
+- 顺序：`generate_invite() → user.save()`
+
+---
+
+### 14.3 不落库（无持久化）场景
+
+#### 14.3.1 邮箱验证请求（主动触发）
+**代码位置**：[accounts.rs#L1057-L1070](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1057-L1070)
+
+```rust
+if let Err(e) = mail::send_verify_email(&user.email, &user.uuid).await {
+    error!("Error sending verify_email email: {e:#?}");
+}
+Ok(())
+```
+
+**记录变化**：
+- ❌ 不创建任何新记录
+- ❌ 不更新任何现有记录
+- ✅ 仅记录错误日志，接口仍返回成功
+
+---
+
+#### 14.3.2 登录时自动发送验证邮件
+**代码位置**：[identity.rs#L443-L447](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L443-L447)
+
+```rust
+if let Err(e) = mail::send_verify_email(&user.email, &user.uuid).await {
+    error!("Error auto-sending email verification email: {e:#?}");
+}
+// 登录流程继续，即使邮件发送失败
+```
+
+**记录变化**：
+- ❌ 无记录变更
+- ✅ 登录不受影响
+
+---
+
+#### 14.3.3 欢迎邮件（注册后）
+**代码位置**：[accounts.rs#L318-L326](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L318-L326)
+
+```rust
+if CONFIG.signups_verify() && !email_verified {
+    if let Err(e) = mail::send_welcome_must_verify(&user.email, &user.uuid).await {
+        error!("Error sending welcome email: {e:#?}");
+    }
+    user.last_verifying_at = Some(user.created_at);  // 更新字段，与邮件发送无关
+} else if let Err(e) = mail::send_welcome(&user.email).await {
+    error!("Error sending welcome email: {e:#?}");
+}
+user.save(&conn).await?;  // 用户始终会保存
+```
+
+**记录变化**：
+- ✅ `user.last_verifying_at` 会被设置（与发送成功与否无关）
+- ✅ 用户记录始终保存
+- ❌ 发送失败不回滚用户创建
+
+---
+
+#### 14.3.4 删除账户确认邮件
+**代码位置**：[accounts.rs#L1113-L1119](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1113-L1119)
+
+```rust
+if let Some(user) = User::find_by_mail(&data.email, &conn).await
+    && let Err(e) = mail::send_delete_account(&user.email, &user.uuid).await
+{
+    error!("Error sending delete account email: {e:#?}");
+}
+Ok(())  // 即使发送失败也返回成功
+```
+
+**记录变化**：
+- ❌ 无记录变更
+- ✅ 用户不会被自动删除
+
+---
+
+#### 14.3.5 新设备登录通知
+**代码位置**：[identity.rs#L478-L490](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L478-L490)
+
+```rust
+if let Err(e) = mail::send_new_device_logged_in(...).await {
+    error!("Error sending new device email: {e:#?}");
+    if CONFIG.require_device_email() {
+        // 只有配置严格模式才失败
+        err!("Could not send login notification email...");
+    }
+}
+// 默认模式：登录继续
+```
+
+**记录变化**：
+- ✅ 设备记录已保存
+- ❌ 发送失败默认不影响登录
+
+---
+
+#### 14.3.6 邀请被接受/确认通知
+- **邀请被接受**：[core/mod.rs#L296](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/mod.rs#L296)
+- **邀请被确认**：[organizations.rs#L1320](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1320)
+- **移出组织通知**：[organizations.rs#L2099](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L2099)
+
+**记录变化**：
+- ❌ 无相关记录需要保存
+- ✅ 发送失败仅记录日志
+
+---
+
+#### 14.3.7 紧急访问非关键通知
+- 邀请被接受：[emergency_access.rs#L377](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L377)
+- 恢复请求发起/批准/拒绝：[emergency_access.rs#L472, L510, L543](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L472)
+
+**记录变化**：
+- ❌ 无额外记录
+- ✅ 状态更新已在发送前完成
+
+---
+
+### 14.4 保留给定时任务重试场景
+
+#### 14.4.1 2FA 未完成提醒
+**代码位置**：[two_factor/mod.rs#L255-L283](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/mod.rs#L255-L283)
+
+```
+定时任务执行流程：
+
+1. 查询条件：TwoFactorIncomplete::find_logins_before(now - time_limit)
+        ↓
+2. 遍历每条记录，发送邮件
+        ↓
+3. 发送结果处理：
+   ├─ ✅ 成功 → login.delete(&conn).await （删除记录，不再重试）
+   └─ ❌ 失败 → 记录保留在数据库中
+                     下次任务执行时会再次查询到并重试
+```
+
+**关键逻辑**：
+```rust
+match mail::send_incomplete_2fa_login(...).await {
+    Ok(()) => {
+        if let Err(e) = login.delete(&conn).await {
+            error!("Error deleting incomplete 2FA record: {e:#?}");
+        }
+    }
+    Err(e) => {
+        error!("Error sending incomplete 2FA email: {e:#?}");
+        // 不删除，记录保留用于下次重试
+    }
+}
+```
+
+**记录变化**：
+| 状态 | TwoFactorIncomplete 表 |
+|------|-----------------------|
+| 发送成功 | 记录删除 |
+| 发送失败 | 记录保留，下次重试 |
+
+**重试机制**：
+- 每分钟执行一次任务
+- 只要记录存在，每次都会重试
+- 没有重试次数限制
+- 没有指数退避
+
+---
+
+### 14.5 更新时间后发送失败场景
+
+#### 14.5.1 紧急访问恢复超时（定时任务）
+**代码位置**：[emergency_access.rs#L727-L775](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L727-L775)
+
+```
+处理顺序（关键：先更新状态，再发送邮件）：
+
+1. 检查 recovery_initiated_at + wait_time_days <= now
+        ↓
+2. 更新状态为 RecoveryApproved 并保存
+   emer.update_access_status_and_save(RecoveryApproved, now, &conn)
+        ↓
+3. 发送邮件（使用 .expect()）
+   ├─ send_emergency_access_recovery_timed_out → grantor
+   └─ send_emergency_access_recovery_approved → grantee
+        ↓
+4. 发送失败 → panic，程序崩溃
+```
+
+**关键点**：
+- 🔴 **先更新状态，再发邮件**
+- 状态更新已持久化到数据库
+- 邮件发送失败不会回滚状态更新
+- `.expect()` 导致程序直接崩溃
+- **需要手动重启服务**
+
+**记录变化**：
+| 阶段 | EmergencyAccess 状态 |
+|------|---------------------|
+| 发送前 | RecoveryInitiated |
+| 发送邮件前 | RecoveryApproved（已保存）|
+| 发送失败 | 状态保持 RecoveryApproved，程序崩溃 |
+
+---
+
+#### 14.5.2 紧急访问恢复提醒（定时任务）
+**代码位置**：[emergency_access.rs#L777-L834](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L777-L834)
+
+```
+处理顺序：
+
+1. 检查是否需要发送提醒
+        ↓
+2. 更新 last_notification_at = now 并保存
+   emer.update_last_notification_date_and_save(&now, &conn)
+        ↓
+3. 发送邮件（使用 .expect()）
+   send_emergency_access_recovery_reminder → grantor
+        ↓
+4. 发送失败 → panic，程序崩溃
+```
+
+**记录变化**：
+| 阶段 | last_notification_at |
+|------|---------------------|
+| 发送前 | 上一次发送时间 或 None |
+| 发送邮件前 | 当前时间（已保存）|
+| 发送失败 | 保持当前时间，程序崩溃 |
+
+**后果**：
+- 即使邮件发送失败，`last_notification_at` 也已更新
+- 程序崩溃重启后，当天不会再次触发提醒
+- 相当于「静默失败」，用户收不到邮件但系统认为已发送
+
+---
+
+### 14.6 必须成功但不落库场景
+
+#### 14.6.1 2FA 令牌发送（登录时）
+**代码位置**：[email.rs#L109-L123](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/email.rs#L109-L123)
+
+```
+处理顺序：
+
+1. 查询 TwoFactor 记录
+        ↓
+2. 生成新令牌
+        ↓
+3. 更新 TwoFactor.data 并保存（twofactor.save(conn).await?）
+        ↓
+4. 发送邮件（mail::send_token(...).await?）
+        ↓
+5. 发送失败 → 令牌已更新但邮件没发出
+           → 用户无法登录，但令牌已失效（下次重新生成）
+```
+
+**记录变化**：
+- ✅ TwoFactor 记录中的令牌已更新
+- ❌ 发送失败不回滚令牌更新
+- 🔄 下次请求会重新生成令牌并覆盖
+
+---
+
+#### 14.6.2 2FA 邮箱配置验证
+**代码位置**：[email.rs#L158-L191](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/email.rs#L158-L191)
+
+```
+处理顺序：
+
+1. 删除旧的 TwoFactor 记录（如果存在）
+        ↓
+2. 创建新的 TwoFactor 记录（EmailVerificationChallenge 类型）
+        ↓
+3. 保存记录（twofactor.save(&conn).await?）
+        ↓
+4. 发送邮件（mail::send_token(...).await?）
+        ↓
+5. 发送失败 → 记录已保存但邮件没发出
+           → 用户无法验证，需要重新配置
+```
+
+**记录变化**：
+- ✅ TwoFactor 记录已创建（EmailVerificationChallenge 类型）
+- ❌ 发送失败不删除记录
+- 用户重新配置时会先删除旧记录
+
+---
+
+#### 14.6.3 受保护操作令牌
+**代码位置**：[protected_actions.rs#L87-L96](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/protected_actions.rs#L87-L96)
+
+```
+处理顺序：
+
+1. 删除旧的 ProtectedActions 记录（如果存在）
+        ↓
+2. 创建新的 TwoFactor 记录（ProtectedActions 类型）
+        ↓
+3. 保存记录（twofactor.save(&conn).await?）
+        ↓
+4. 发送邮件（mail::send_protected_action_token(...).await?）
+        ↓
+5. 发送失败 → 记录已保存，操作无法继续
+```
+
+**记录变化**：
+- ✅ TwoFactor 记录已创建
+- ❌ 发送失败不回滚
+
+---
+
+#### 14.6.4 注册验证邮件
+**代码位置**：[identity.rs#L1061-L1075](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L1061-L1075)
+
+```
+处理顺序：
+
+1. 生成注册 token（不落库，JWT 自包含）
+        ↓
+2. 发送邮件（mail::send_register_verify_email(...).await?）
+        ↓
+3. 发送失败 → 返回错误，注册流程中断
+```
+
+**记录变化**：
+- ❌ 无数据库记录
+- ❌ JWT token 已生成但未使用（会过期）
+
+---
+
+#### 14.6.5 SSO 邮箱变更通知
+**代码位置**：[identity.rs#L328-L331](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L328-L331)
+
+```
+处理顺序：
+
+1. 检测到 SSO 邮箱变更
+        ↓
+2. 发送邮件（mail::send_sso_change_email(...).await?）
+        ↓
+3. 发送失败 → 登录失败
+```
+
+**记录变化**：
+- ❌ 无相关记录
+- ❌ 用户邮箱尚未更新
+
+---
+
+#### 14.6.6 组织移除 2FA 通知
+**代码位置**：[two_factor/mod.rs#L184-L187](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/mod.rs#L184-L187)
+
+```
+处理顺序：
+
+1. 删除用户的 2FA 记录
+        ↓
+2. 发送邮件通知（mail::send_2fa_removed_from_org(...).await?）
+        ↓
+3. 发送失败 → 2FA 已删除，但用户收不到通知
+```
+
+**记录变化**：
+- ✅ TwoFactor 记录已删除
+- ❌ 发送失败不回滚（无法恢复已删除的 2FA）
+
+---
+
+#### 14.6.7 邮箱变更系列邮件
+**代码位置**：[accounts.rs#L945-L995](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L945-L995)
+
+```
+发送变更验证邮件 → 失败：邮箱不变更
+发送变更通知邮件 → 失败：变更已生效但无通知
+```
+
+---
+
+### 14.7 邀请失败结果核对表
+
+| 邀请场景 | 发送前保存 | 失败后清理 | 最终状态 | 代码位置 |
+|----------|-----------|-----------|----------|----------|
+| **组织邀请（新用户）** | ✅ 用户+成员 | ✅ 删除用户/成员 | 恢复原状 | [organizations.rs#L1113-L1130](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1113-L1130) |
+| **组织邀请（已存在）** | ✅ 成员 | ✅ 删除成员 | 恢复原状 | 同上 |
+| **管理端邀请** | ❌ 先发送再保存 | ❌ 不保存用户 | 无用户记录 | [admin.rs#L307-L335](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L307-L335) |
+| **管理端重发邀请** | ❌ 用户已存在 | ❌ 无记录变更 | 用户存在 | [admin.rs#L516-L538](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/admin.rs#L516-L538) |
+| **组织单个重发** | ❌ 成员已存在 | ❌ 无记录变更 | 成员保持 Invited | [organizations.rs#L1208-L1219](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1208-L1219) |
+| **组织批量重发** | ❌ 成员已存在 | ❌ 错误记录在响应 | 成员状态不变 | [organizations.rs#L1173-L1206](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/organizations.rs#L1173-L1206) |
+| **紧急访问邀请** | ✅ 紧急访问记录 | ❌ 不清理 | 记录保持 Invited | [emergency_access.rs#L260-L276](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L260-L276) |
+| **紧急访问重发** | ❌ 记录已存在 | ❌ 无记录变更 | 状态不变 | [emergency_access.rs#L281-L323](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/emergency_access.rs#L281-L323) |
+
+---
+
+### 14.8 验证邮件失败结果核对表
+
+| 验证场景 | 触发方式 | 失败策略 | 记录变化 | 代码位置 |
+|----------|---------|---------|----------|----------|
+| **邮箱验证（主动）** | 用户点击按钮 | 宽松捕获 | 无变化 | [accounts.rs#L1057-L1070](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1057-L1070) |
+| **邮箱验证（自动）** | 登录时触发 | 宽松捕获 | 无变化 | [identity.rs#L443-L447](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L443-L447) |
+| **注册验证** | 注册流程 | 必须成功 | 中断注册 | [identity.rs#L1061-L1075](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/identity.rs#L1061-L1075) |
+| **欢迎邮件（需验证）** | 注册后 | 宽松捕获 | 用户已创建 | [accounts.rs#L318-L324](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L318-L324) |
+| **删除账户验证** | 删除请求 | 宽松捕获 | 无变化 | [accounts.rs#L1113-L1119](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/accounts.rs#L1113-L1119) |
+| **2FA 令牌（登录）** | 登录时 | 必须成功 | 令牌已更新 | [email.rs#L109-L123](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/email.rs#L109-L123) |
+| **2FA 邮箱配置** | 配置时 | 必须成功 | 记录已创建 | [email.rs#L158-L191](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/email.rs#L158-L191) |
+| **受保护操作令牌** | 操作前 | 必须成功 | 记录已创建 | [protected_actions.rs#L87-L96](file:///d:/fz/0601/solo-dogfeeding/code/10-vaultwarden/src/api/core/two_factor/protected_actions.rs#L87-L96) |
+
+---
+
+### 14.9 设计模式总结
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    发送顺序设计模式                              │
+├─────────────────────────────────────────────────────────────────┤
+│ 🔴 模式 A：先保存，再发送，失败回滚                              │
+│    组织邀请（新用户）                                            │
+│    优点：原子性，失败不残留垃圾数据                              │
+│    缺点：需要实现回滚逻辑                                        │
+├─────────────────────────────────────────────────────────────────┤
+│ 🟡 模式 B：先发送，再保存                                      │
+│    管理端邀请                                                    │
+│    优点：实现简单，无回滚需求                                    │
+│    缺点：极端情况（发送成功但保存失败）可能导致邮件已发但数据丢失 │
+├─────────────────────────────────────────────────────────────────┤
+│ 🟢 模式 C：先保存，再发送，失败不回滚（必须成功）                │
+│    2FA 令牌、邮箱配置                                            │
+│    优点：数据一致性由 ? 保证                                     │
+│    缺点：发送失败时数据已更新，可能需要手动清理                   │
+├─────────────────────────────────────────────────────────────────┤
+│ 🔵 模式 D：先保存，再发送，失败不回滚（宽松捕获）                │
+│    欢迎邮件、通知类邮件                                          │
+│    优点：不影响主流程                                            │
+│    缺点：用户可能收不到邮件                                      │
+├─────────────────────────────────────────────────────────────────┤
+│ 🟣 模式 E：先更新状态，再发送，失败 panic                      │
+│    紧急访问定时任务                                              │
+│    优点：关键状态必须持久化                                      │
+│    缺点：程序崩溃，需要人工介入                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 14.10 风险点与建议
+
+| 风险场景 | 问题 | 建议 |
+|----------|------|------|
+| **紧急访问定时任务 panic** | 邮件发送失败导致整个服务崩溃 | 改为记录错误并继续，不要使用 `.expect()` |
+| **紧急访问提醒静默失败** | `last_notification_at` 已更新但邮件没发 | 发送成功后再更新时间，或发送失败回滚时间 |
+| **2FA 令牌已更新但邮件未发** | 用户无法登录但令牌已失效 | 考虑发送成功后再更新令牌 |
+| **2FA 未完成无限重试** | 失败邮件每分钟发送一次，无退避机制 | 增加重试次数限制或指数退避 |
+| **组织移除 2FA 通知失败** | 2FA 已删除但用户不知情 | 可考虑先发送邮件再删除 |
