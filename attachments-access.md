@@ -404,6 +404,162 @@ if 条目属于组织 { log_event(CipherAttachmentCreated, ...) }  ← 事件日
 
 这就是为什么上传失败和删除失败的残留，在用户感知上有的看得到、有的看不到，但系统本身没有全自动修复。如果要做一致性治理，核心方向就是加两个扫描：一是扫数据库找文件不存在的记录，二是扫存储目录找数据库里没引用的文件。
 
+## 8b. 本地存储与对象存储的残留差异
+
+第 8 节分析的所有失败场景，在数据库层面两种存储后端完全一致——因为数据库操作和存储操作是解耦的。差异集中在"缺文件时的下载失败路径""写入残留的形态"和"孤儿文件的外部清理方式"这三个地方。
+
+### 8b.1 下载失败的位置和错误表现
+
+下载地址的生成在 `src/db/models/attachment.rs` → `Attachment::get_url`，会先判断当前 operator 是不是本地文件系统（`src/storage.rs` → `is_fs_operator`，判断 scheme 是否为 `FS_SCHEME`）。两种后端的下载路径完全不同：
+
+#### 本地文件系统：站内 token 下载
+
+```
+客户端拿元数据 → get_url() 返回 /attachments/{cipher_id}/{file_id}?token=xxx
+    ↓
+客户端请求站内地址 → src/api/web.rs → attachments() 路由
+    ↓
+校验 token（JWT 签名 + 有效期 + sub/file_id 绑定）
+    ↓
+NamedFile::open(本地路径) → 成功返回文件 / 失败返回 None
+```
+
+**缺文件时的表现**：
+
+- `NamedFile::open()` 失败，`.ok()` 把错误吞成 `None`。
+- Rocket 把 `None` 当作"路由不匹配"，返回 HTTP 404。
+- 客户端看到的不是 Vaultwarden 自己的错误消息，而是 Rocket 的默认 404 页面。
+- 没有日志记录这次打开失败（`NamedFile::open` 的错误被 `.ok()` 丢弃了），服务端无感知。
+
+#### 对象存储：预签名地址下载
+
+```
+客户端拿元数据 → get_url() 返回 S3 预签名 URL（5 分钟有效）
+    ↓
+客户端直接请求 S3（不再经过 Vaultwarden）
+    ↓
+S3 校验预签名 → 成功返回文件 / 失败返回 S3 自身的错误码
+```
+
+**缺文件时的表现**：
+
+- 预签名地址生成阶段不会失败——`presign_read()` 只是算签名，不检查对象是否存在。
+- 客户端拿到 URL 后请求 S3，如果对象不存在，S3 返回 `NoSuchKey` 错误（HTTP 404），附带 S3 自己的 XML 错误消息。
+- 错误完全由 S3 返回，Vaultwarden 根本不参与这次请求，服务端日志里没有任何记录。
+- 如果预签名过期（5 分钟），S3 返回 `AccessDenied`（HTTP 403），和文件不存在是不同的错误码，客户端理论上可以区分"签名过期"和"文件没了"。
+
+#### 对比表
+
+| 维度 | 本地文件系统 | 对象存储 |
+|------|------------|----------|
+| 下载请求经过 Vaultwarden | ✅ 经过 | ❌ 不经过 |
+| 生成下载地址时检查文件存在 | ❌ 不检查 | ❌ 不检查 |
+| 缺文件时的 HTTP 状态码 | 404（Rocket 默认） | 404（S3 返回 `NoSuchKey`） |
+| 缺文件时的错误体 | Rocket 404 页面 | S3 XML 错误消息 |
+| 签名过期时的表现 | token 过期 → 404（token 校验失败返回 None） | S3 返回 403 `AccessDenied` |
+| 服务端是否有日志 | ❌ 无（`.ok()` 丢弃错误） | ❌ 无（请求不经过服务端） |
+
+### 8b.2 写入残留的形态差异
+
+写入都走 OpenDAL 的统一接口 `save_temp_file()`，但底层行为不同：
+
+#### 本地文件系统
+
+- `save_temp_file()` 最终调用 OpenDAL 的 FS backend 写文件。
+- FS backend 的写入是"先写临时文件、再 rename"模式（OpenDAL 内部的原子写入策略）。
+- 如果写入中途失败（磁盘满、权限不足），临时文件可能残留在附件目录里，文件名通常是 OpenDAL 内部的临时命名格式，不是 `{cipher_id}/{attachment_id}` 的正常路径。
+- 这种残留临时文件不会被 Vaultwarden 识别为有效附件（因为路径格式不匹配），也不会被 `Attachment::delete()` 清理（因为 delete 只删 `get_file_path()` 拼出来的路径），但会占用磁盘空间。
+- 如果 FS backend 在 rename 之前就失败了，正常路径下不会有任何文件，表现和场景 A 一样。
+
+#### 对象存储
+
+- `save_temp_file()` 调用 OpenDAL 的 S3 backend，S3 的写入是"全部上传完成后才生成对象"的语义（multipart upload 或单次 PUT）。
+- 如果上传中途失败，S3 可能留下未完成的 multipart upload，这些碎片不会以完整对象的形式出现在 bucket 里，不会影响正常路径的 GET 请求。
+- 但未完成的 multipart 会占用存储空间（S3 按 uploaded parts 计费），而且不会自动过期——需要通过 S3 的 lifecycle 规则或手动清理 multipart upload 来释放。
+- 如果 S3 PUT 成功但后续 `attachment.save()` 或大小校验失败，S3 上的对象已经存在，但数据库记录可能已经被场景 C 的回滚删掉了，形成另一种孤儿文件。
+
+#### 对比表
+
+| 维度 | 本地文件系统 | 对象存储 |
+|------|------------|----------|
+| 写入方式 | 临时文件 + rename | multipart upload / 单次 PUT |
+| 写入中途失败的残留 | 临时文件（非正常路径） | 未完成的 multipart parts |
+| 正常路径下是否有部分文件 | ❌ rename 未完成则无 | ❌ PUT 未完成则无完整对象 |
+| 残留是否影响正常附件路径 | ❌ 不影响 | ❌ 不影响 |
+| 残留是否占用存储空间 | ✅ 占用 | ✅ 占用（按 parts 计费） |
+| 残留的自动清理 | ❌ 无（需手动删临时文件） | ⚠️ 可通过 S3 lifecycle 规则自动清理过期 multipart |
+
+### 8b.3 删除残留的形态差异
+
+删除都走 `Attachment::delete()` 里的 `operator.delete(&file_path)`，但底层行为不同：
+
+#### 本地文件系统
+
+- `operator.delete()` 调用 FS backend，直接 `std::fs::remove_file`。
+- 如果文件不存在，OpenDAL 返回 `NotFound`，代码只打 debug 日志，当成功处理。
+- 如果文件被其他进程占用（Windows 上常见），删除会失败，返回非 NotFound 错误，产生本地孤儿文件。
+- 孤儿文件就在 `{attachments_folder}/{cipher_id}/{attachment_id}` 路径下，文件名就是 attachment_id，可直接 `ls` 找到。
+- 当条目下所有附件都删完后，`{attachments_folder}/{cipher_id}/` 目录可能变成空目录，OpenDAL 的 FS backend 不会自动清理空目录。
+
+#### 对象存储
+
+- `operator.delete()` 调用 S3 backend，发送 DELETE 请求。
+- 如果对象不存在，S3 的行为取决于版本控制配置：未开启版本控制时，删除不存在的对象返回 204（当作成功）；开启版本控制时，会插入一个删除标记。
+- OpenDAL 统一将"S3 对象不存在"映射为 `NotFound`，代码处理逻辑和本地一样——打 debug 日志，当成功。
+- 如果 S3 删除失败（权限不足、网络中断等），会产生 S3 上的孤儿对象。
+- S3 上的孤儿对象就是 `{cipher_id}/{attachment_id}` 这个 key，没有目录层级概念，只是一段前缀。
+
+#### 对比表
+
+| 维度 | 本地文件系统 | 对象存储 |
+|------|------------|----------|
+| 删除不存在文件的行为 | `NotFound` → debug 日志 | `NotFound` → debug 日志（S3 可能返回 204） |
+| 删除失败的典型原因 | 文件被占用（Windows）、权限不足 | S3 权限不足、网络中断 |
+| 孤儿文件的存在形式 | 本地磁盘上的常规文件 | S3 bucket 中的对象 |
+| 空目录残留 | ✅ 可能有空目录 | ❌ 无目录概念 |
+| 删除失败后重试的难度 | 低（重新调 `operator.delete()`） | 低（同样重新调用） |
+
+### 8b.4 外部清理方式差异
+
+目前 Vaultwarden 没有内置的孤儿文件清理机制，所以只能靠外部手段。两种后端的清理难度和可用工具差别很大：
+
+#### 本地文件系统的外部清理
+
+1. **发现孤儿文件**：列出 `{attachments_folder}/` 下所有文件，提取 `{cipher_id}/{attachment_id}` 路径，与数据库 `attachments` 表对比。路径不在数据库里的就是孤儿文件。
+2. **发现悬空记录**：反过来，查数据库里所有附件记录，对每条记录检查 `{attachments_folder}/{cipher_id}/{attachment_id}` 是否存在。文件不存在但记录还在的就是悬空记录。
+3. **清理空目录**：删除条目后，`{attachments_folder}/{cipher_id}/` 可能变成空目录，可以用 `find -type d -empty` 清理。
+4. **工具**：shell 脚本即可完成，不需要额外依赖。
+
+#### 对象存储的外部清理
+
+1. **发现孤儿对象**：列出 S3 bucket 下所有对象（S3 ListObjectsV2），提取 key 中的 `{cipher_id}/{attachment_id}` 部分，与数据库对比。这要求 S3 list 权限，且对象数量多时 list 操作有性能和费用开销。
+2. **发现悬空记录**：和本地一样，查数据库后对每条记录检查 S3 对象是否存在（HEAD 请求）。对象数量多时大量 HEAD 请求会有延迟和费用。
+3. **清理未完成的 multipart**：S3 的 ListMultipartUploads 可以找到所有未完成的分片上传，配合 AbortMultipartUpload 清理。也可以配置 bucket lifecycle 规则，自动中止超过指定天数的未完成 multipart。
+4. **工具**：需要 AWS CLI 或 S3 SDK，比本地 shell 脚本复杂。
+
+#### 对比表
+
+| 维度 | 本地文件系统 | 对象存储 |
+|------|------------|----------|
+| 发现孤儿文件的方式 | `ls` + 数据库对比 | S3 ListObjectsV2 + 数据库对比 |
+| 发现悬空记录的方式 | `test -f` 本地路径 | S3 HEAD 请求逐个检查 |
+| 清理空目录/碎片 | `find -type d -empty -delete` | S3 lifecycle 规则清理过期 multipart |
+| 所需权限 | 本地文件系统读写 | S3 List + Get + Delete 权限 |
+| 费用 | 无 | List/HEAD/DELETE 请求有 API 调用费用 |
+| 复杂度 | 低（shell 脚本） | 中（需要 S3 CLI 或 SDK） |
+
+### 8b.5 小结：存储后端如何影响残留问题的严重程度
+
+两个后端的数据库层行为完全一致——悬空记录和孤儿文件的判定标准相同，配额影响也相同。差异只在"发现和清理的难易程度"上：
+
+- **本地文件系统**：残留容易发现（`ls` 就能看到），容易清理（`rm` 即可），但没有自动化；空目录残留是本地独有的小问题。
+- **对象存储**：残留不容易发现（需要 list + 对比），清理需要 S3 权限和工具，但有 S3 lifecycle 这种平台级补偿手段（自动清理过期 multipart）；而且 S3 对"删除不存在的对象"更宽容（返回 204 而非报错），减少了因 NotFound 导致的误报。
+
+如果要做一致性治理，最务实的思路是：
+
+- 本地存储：加一个定时任务，扫目录比数据库，删孤儿文件和空目录，删数据库里的悬空记录。
+- 对象存储：配置 S3 lifecycle 规则清理过期 multipart，再用类似的定时任务扫 S3 list 比数据库。
+
 ## 9. 一张心智图串起来
 
 可以把整套逻辑理解成下面这条链：
