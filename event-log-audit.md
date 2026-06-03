@@ -458,7 +458,7 @@ organizationId     = "组织ID"
 
 ---
 
-## 6. 成员事件查询逻辑
+## 6. 成员事件查询逻辑：审计边界修正
 
 ### 6.1 查询端点
 
@@ -470,24 +470,47 @@ organizationId     = "组织ID"
 | `GET /api/organizations/{org_id}/users/{member_id}/events` | 管理员 | 查询组织内某成员的事件 |
 | `GET /api/ciphers/{cipher_id}/events` | 密码库管理员 | 查询某密码库的事件 |
 
-### 6.2 成员事件查询：双字段匹配设计
+### 6.2 关键区分：org_user_uuid 的角色
+
+首先澄清一个重要概念：**`org_user_uuid`（API输出为 `organizationUserId`）只负责"记录"，不参与"查询过滤"**。
+
+| 字段 | 作用 | 是否用于查询过滤 | 代码证据 |
+|------|------|----------------|----------|
+| `org_user_uuid` | 记录**目标成员是谁**（哪个成员关系被操作） | ❌ **不参与** | 存储时填充，查询WHERE条件中未使用 |
+| `user_uuid` | 记录**主体用户是谁**（仅限用户类事件） | ✅ 参与过滤 | WHERE 条件第一部分 |
+| `act_user_uuid` | 记录**操作者是谁** | ✅ 参与过滤 | WHERE 条件第二部分 |
+
+**代码证据** - 组织用户事件记录时填充 org_user_uuid：
+```rust
+// 组织用户事件 (1500-1599): org_user_uuid = source_uuid
+// [src/api/core/events.rs:306-308]
+1500..=1599 => {
+    event.org_user_uuid = Some(source_uuid.to_owned().into());
+}
+```
+
+**但查询时 org_user_uuid 完全不参与过滤**，见下文分析。
+
+### 6.3 成员事件查询：双字段过滤设计
 
 **核心查询方法**：`find_by_org_and_member` 定义在 [src/db/models/event.rs:292-316](src/db/models/event.rs#L292-L316)
 
 ```rust
 pub async fn find_by_org_and_member(
     org_uuid: &OrganizationId,
-    member_uuid: &MembershipId,  // 注意：传入的是成员关系ID，不是用户ID
+    member_uuid: &MembershipId,  // 输入：成员关系ID (注意：不是UserId)
     start: &NaiveDateTime,
     end: &NaiveDateTime,
     conn: &DbConn,
 ) -> Vec<Self> {
     conn.run(move |conn| {
         event::table
+            // 步骤1：通过成员关系ID JOIN，找到对应的用户ID
             .inner_join(users_organizations::table
                 .on(users_organizations::uuid.eq(member_uuid)))
             .filter(event::org_uuid.eq(org_uuid))
             .filter(event::event_date.between(start, end))
+            // 步骤2：只用用户ID匹配两个字段，**不涉及 org_user_uuid**
             .filter(
                 event::user_uuid
                     .eq(users_organizations::user_uuid.nullable())
@@ -509,39 +532,53 @@ pub async fn find_by_org_and_member(
 SELECT event.* 
 FROM event
 INNER JOIN users_organizations 
-    ON users_organizations.uuid = '成员关系ID'  -- 通过成员关系找到用户ID
+    ON users_organizations.uuid = '输入的成员关系ID'  -- 目的：获取该成员关系对应的 user_uuid
 WHERE event.org_uuid = '组织ID'
   AND event.event_date BETWEEN start AND end
   AND (
-    -- 条件1：该用户作为事件主体
+    -- 过滤条件1：该用户作为事件主体 (user_uuid 字段)
     event.user_uuid = users_organizations.user_uuid
     OR 
-    -- 条件2：该用户作为事件操作者
+    -- 过滤条件2：该用户作为事件操作者 (act_user_uuid 字段)
     event.act_user_uuid = users_organizations.user_uuid
   )
+-- 注意：WHERE 条件中 **完全没有** event.org_user_uuid 的判断！
 ORDER BY event.event_date DESC
 LIMIT 30
 ```
 
-**关键点说明**：
+### 6.4 审计边界：实际覆盖范围
 
-1. **输入参数是成员关系ID**：接口传入 `member_id`（MembershipId），不是 UserId
-2. **JOIN 表获取真实用户ID**：通过 `users_organizations.uuid = member_uuid` 关联，获取 `user_uuid`
-3. **OR 双条件匹配**：同时匹配 `user_uuid`（主体）和 `act_user_uuid`（操作者）
+| 匹配条件 | 字段 | 覆盖的事件类型 | 示例事件 |
+|----------|------|--------------|----------|
+| 条件1 | `event.user_uuid = 用户ID` | 用户类事件 (1000-1099) | 用户登录、改密码 |
+| 条件2 | `event.act_user_uuid = 用户ID` | 所有类型事件 | 用户创建集合、邀请成员、批准设备等 |
 
-### 6.3 设计意图：审计的全面性
+**⚠️ 重要边界说明**：
 
-成员事件审计需包含两类事件，缺一不可：
+对于**组织用户事件**（如 OrganizationUserInvited = 1500）：
+- 记录时：`org_user_uuid = 被邀请成员的关系ID`，`act_user_uuid = 邀请者用户ID`
+- 查询时：过滤条件**不看 org_user_uuid**，只看 `user_uuid` 和 `act_user_uuid`
+- 结果：当管理员A邀请成员B加入时：
+  - 查询**成员B**的事件：能查到吗？→ 看B的 `act_user_uuid` 有没有匹配（B是被邀请者，不是操作者，所以查不到）
+  - 查询**管理员A**的事件：能查到吗？→ 能，因为A的 `act_user_uuid` 匹配
+  - ❌ **成员B的审计列表看不到"自己被邀请"这个事件**
 
-| 匹配条件 | 包含的事件类型 | 示例 |
-|----------|--------------|------|
-| `event.user_uuid = 用户ID` | 用户作为**主体**被操作的事件 | 管理员重置该用户的密码、用户登录事件 |
-| `event.act_user_uuid = 用户ID` | 用户作为**操作者**执行的事件 | 该用户修改了共享密码、该用户批准了设备登录 |
+**查询逻辑的设计意图**：
+- 以"用户身份"为中心，追踪该用户**做了什么**（act_user_uuid）和**什么事情发生在他身上**（user_uuid）
+- 不是以"成员关系"为中心，不追踪"针对该成员关系的所有操作"
+- org_user_uuid 仅用于事件详情展示（告诉客户端这个事件是针对哪个成员关系的），不用于过滤
 
-**为什么必须同时包含？**
-- 仅查 `user_uuid`：漏掉该用户作为管理员对他人/组织的操作
-- 仅查 `act_user_uuid`：漏掉对该用户自身的操作（如被重置密码）
-- 双条件 OR 匹配：完整还原该用户在组织中的所有活动轨迹
+### 6.5 字段角色总结表
+
+| 字段 | 存储时 | 查询过滤时 | API输出字段 |
+|------|--------|-----------|------------|
+| `org_user_uuid` | 填充目标成员关系ID | ❌ 不参与 | `organizationUserId`（仅展示用） |
+| `user_uuid` | 填充主体用户ID（仅限用户事件） | ✅ 条件1 | `userId` |
+| `act_user_uuid` | 始终填充操作者用户ID | ✅ 条件2 | `actingUserId` |
+
+**一句话总结**：
+> `organizationUserId` 是事件的"描述信息"，告诉你这个事件影响了谁；但查询过滤时，系统只认 `userId` 和 `actingUserId` 这两个用户身份字段。
 
 ---
 
