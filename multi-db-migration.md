@@ -331,7 +331,7 @@ pub fn default_init_stmts(&self) -> String {
 
 ```toml
 [features]
-default = []  # 默认不启用任何数据库
+default = []  # 默认不启用任何数据库（需显式指定）
 
 mysql = ["diesel/mysql", "diesel_migrations/mysql"]
 postgresql = ["diesel/postgres", "diesel_migrations/postgres"]
@@ -339,12 +339,23 @@ sqlite_system = ["diesel/sqlite", "diesel_migrations/sqlite"]  # 动态链接
 sqlite = ["sqlite_system", "libsqlite3-sys/bundled"]          # 静态链接
 ```
 
+**多个特性可以同时启用**：`mysql`、`postgresql`、`sqlite` 三个特性之间没有互斥关系，可以同时编译进同一个二进制文件。运行时通过 `DATABASE_URL` 决定实际使用哪个后端。
+
+Docker 构建默认启用全部三种数据库（见 `docker/Dockerfile.debian` 和 `docker/Dockerfile.alpine`）：
+```dockerfile
+# Debian 默认
+ARG DB=sqlite,mysql,postgresql
+
+# Alpine 默认（额外带 mimalloc）
+ARG DB=sqlite,mysql,postgresql,enable_mimalloc
+```
+
 ### 4.2 构建脚本配置
 
-在 `build.rs` 中：
+在 `build.rs` 中，将 Cargo feature 转换为 `#[cfg]` 标记：
 
 ```rust
-// 将 feature 转换为 cfg 标记，简化代码中的条件编译
+// 每个 feature 独立转换为 cfg 标记，互不排斥
 #[cfg(feature = "sqlite_system")]
 println!("cargo:rustc-cfg=sqlite");
 #[cfg(feature = "mysql")]
@@ -352,10 +363,29 @@ println!("cargo:rustc-cfg=mysql");
 #[cfg(feature = "postgresql")]
 println!("cargo:rustc-cfg=postgresql");
 
-// 至少启用一个数据库
+// 仅当所有数据库 feature 都未启用时才报错
 #[cfg(not(any(feature = "sqlite_system", feature = "mysql", feature = "postgresql")))]
 compile_error!("You need to enable one DB backend. To build with previous defaults do: cargo build --features sqlite");
 ```
+
+### 4.3 运行时数据库选择机制
+
+编译时启用多个特性后，运行时根据 `DATABASE_URL` 的协议前缀选择实际后端：
+
+```
+DATABASE_URL 前缀          →  选择的数据库后端
+─────────────────────────────────────────────
+mysql:                     →  MySQL
+postgresql: / postgres:    →  PostgreSQL
+sqlite:                    →  SQLite
+<无前缀的已有文件路径>      →  SQLite（向后兼容）
+```
+
+选择逻辑在 `DbConnType::from_url()` 中实现：
+- URL 匹配到某种数据库协议，但对应 feature 未启用 → 运行时报错（如 `"DATABASE_URL is a MySQL URL, but the 'mysql' feature is not enabled"`）
+- URL 匹配到某种数据库协议，且对应 feature 已启用 → 正常使用
+
+这意味着：**一个编译了全部三种数据库特性的二进制文件，可以在不同环境下通过修改 `DATABASE_URL` 无缝切换后端**，无需重新编译。
 
 ---
 
@@ -410,35 +440,51 @@ db_run! { conn:
 启动
   │
   ▼
-解析 DATABASE_URL
+读取 DATABASE_URL
   │
-  ├─► mysql:     ──► 检查 mysql feature ──► mysql_migrations::run_migrations()
-  │                                                  │
-  │                                                  ├─ SET FOREIGN_KEY_CHECKS = 0
-  │                                                  └─ run_pending_migrations
-  ├─► postgres:  ──► 检查 postgresql feature ──► postgresql_migrations::run_migrations()
-  │                                                  │
-  │                                                  └─ run_pending_migrations (不禁用外键)
-  └─► sqlite:    ──► 检查 sqlite feature ──► sqlite_migrations::run_migrations()
-                                                     │
-                                                     ├─ PRAGMA foreign_keys = OFF
-                                                     ├─ 可选 PRAGMA journal_mode=wal
-                                                     └─ run_pending_migrations
-                                                          │
-                                                          ▼
-                                          diesel_migrations::embed_migrations!()
-                                                          │
-                                                          ▼
-                                          执行 __diesel_schema_migrations 表检查
-                                                          │
-                                                          ▼
-                                          按时间戳顺序执行未执行的迁移
-                                                          │
-                                                          ▼
-                                          创建连接池 + 设置 ACTIVE_DB_TYPE
-                                                          │
-                                                          ▼
-                                                        就绪
+  ▼
+DbConnType::from_url() 解析协议前缀
+  │
+  ├─► "mysql:"       → DbConnType::Mysql
+  ├─► "postgres:"    → DbConnType::Postgresql
+  │    "postgresql:"
+  └─► "sqlite:"      → DbConnType::Sqlite
+       或已有文件路径
+  │
+  ▼
+检查对应 cfg 特性是否已启用
+  │
+  ├─► 未启用 → 运行时报错
+  │     ("DATABASE_URL is a MySQL URL, but the 'mysql' feature is not enabled")
+  │
+  └─► 已启用 → 继续
+        │
+        ▼
+  match conn_type 选择迁移模块
+  │
+  ├─► Mysql:        mysql_migrations::run_migrations()
+  │                   ├─ SET FOREIGN_KEY_CHECKS = 0
+  │                   └─ run_pending_migrations(embed_migrations!("migrations/mysql"))
+  │
+  ├─► Postgresql:   postgresql_migrations::run_migrations()
+  │                   └─ run_pending_migrations(embed_migrations!("migrations/postgresql"))
+  │
+  └─► Sqlite:       sqlite_migrations::run_migrations()
+                      ├─ PRAGMA foreign_keys = OFF
+                      ├─ 可选 PRAGMA journal_mode=wal
+                      └─ run_pending_migrations(embed_migrations!("migrations/sqlite"))
+  │
+  ▼
+执行 __diesel_schema_migrations 表检查
+  │
+  ▼
+按时间戳顺序执行未执行的迁移
+  │
+  ▼
+创建连接池 + 设置 ACTIVE_DB_TYPE
+  │
+  ▼
+就绪
 ```
 
 ---
@@ -500,7 +546,7 @@ db_run! { conn:
 
 1. **跨数据库数据迁移不支持**：三种数据库的迁移脚本完全独立，没有提供从一种数据库迁移到另一种数据库的工具
 
-2. **编译时单数据库**：每个编译产物只能包含一种数据库支持，需在编译时通过 `--features` 指定
+2. **多数据库特性可同时编译**：`mysql`、`postgresql`、`sqlite` 三个 Cargo feature 互不排斥，可以同时编译进同一个二进制文件。Docker 官方镜像默认启用全部三种（`DB=sqlite,mysql,postgresql`）。运行时通过 `DATABASE_URL` 决定实际使用哪个后端。如果编译时只启用了部分特性，则只有启用的后端可用，使用未启用的后端会在运行时报错
 
 3. **回滚支持**：每个迁移目录都有 `down.sql`，但生产环境通常不建议回滚
 
