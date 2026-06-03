@@ -8,7 +8,7 @@
 
 ### 1.1 Event 结构体
 
-事件记录的核心数据结构定义在 [event.rs](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/db/models/event.rs#L26-L44)：
+事件记录的核心数据结构定义在 [src/db/models/event.rs](src/db/models/event.rs#L26-L44)：
 
 ```rust
 pub struct Event {
@@ -42,7 +42,7 @@ pub struct Event {
 
 ### 1.2 EventType 事件类型枚举
 
-事件类型按数值范围分类，定义在 [event.rs](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/db/models/event.rs#L48-L142)：
+事件类型按数值范围分类，定义在 [src/db/models/event.rs](src/db/models/event.rs#L48-L142)：
 
 | 数值范围 | 类别 | 示例事件 |
 |----------|------|----------|
@@ -104,18 +104,75 @@ pub enum EventType {
 
 ---
 
-## 2. 事件记录写入机制
+## 2. 事件日志开关机制
 
-### 2.1 两大记录入口
+### 2.1 配置项定义
 
-事件记录通过两个独立的函数入口处理，定义在 [events.rs](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/core/events.rs#L222-L323)：
+事件日志功能由全局配置控制，定义在 [src/config.rs](src/config.rs#L629)：
+
+```rust
+/// Enable event logging |> Enables event logging for organizations.
+org_events_enabled:     bool,   false,  def,    false;
+```
+
+- **默认值**：`false`（关闭）
+- **配置方式**：环境变量 `ORG_EVENTS_ENABLED=true` 或 config.json 中设置
+
+### 2.2 开关检查点（全链路覆盖）
+
+`CONFIG.org_events_enabled()` 在以下 6 个关键位置进行检查，确保开关关闭时完全不产生事件记录：
+
+| 检查位置 | 文件 | 作用 |
+|----------|------|------|
+| 记录入口1 | [src/api/core/events.rs:223](src/api/core/events.rs#L223) | `log_user_event()` 函数入口，用户事件第一道防线 |
+| 记录入口2 | [src/api/core/events.rs:272](src/api/core/events.rs#L272) | `log_event()` 函数入口，组织事件第一道防线 |
+| 客户端上报 | [src/api/core/events.rs:166](src/api/core/events.rs#L166) | `/events/collect` 端点入口，直接返回空成功 |
+| 查询接口1 | [src/api/core/events.rs:41](src/api/core/events.rs#L41) | 组织事件查询，返回空数组避免客户端报错 |
+| 查询接口2 | [src/api/core/events.rs:69](src/api/core/events.rs#L69) | 密码库事件查询，返回空数组 |
+| 查询接口3 | [src/api/core/events.rs:104](src/api/core/events.rs#L104) | 成员事件查询，返回空数组 |
+
+**开关检查代码示例**：
+```rust
+// 记录函数入口检查
+pub async fn log_user_event(...) {
+    if !CONFIG.org_events_enabled() {
+        return;  // 直接返回，不执行任何后续逻辑
+    }
+    log_user_event_impl(...).await;
+}
+
+// 查询接口检查
+let events_json: Vec<Value> = if CONFIG.org_events_enabled() {
+    // 执行查询...
+} else {
+    Vec::with_capacity(0)  // 返回空数组，不报错
+};
+```
+
+### 2.3 客户端感知开关
+
+组织是否启用事件日志通过 `useEvents` 字段告知客户端，定义在 [src/db/models/organization.rs](src/db/models/organization.rs#L209)：
+
+```rust
+"useEvents": CONFIG.org_events_enabled(),
+```
+
+客户端据此决定是否启用本地事件收集和上报功能。
+
+---
+
+## 3. 事件记录写入机制
+
+### 3.1 两大记录入口
+
+事件记录通过两个独立的函数入口处理，定义在 [src/api/core/events.rs](src/api/core/events.rs#L222-L323)：
 
 | 函数 | 适用场景 | 特点 |
 |------|----------|------|
 | `log_user_event()` | **用户类事件** (1000-1099) | 批量写入，每个用户所属组织各存一条 |
 | `log_event()` | **组织类事件** (1100-1799) | 单条写入，只关联目标组织 |
 
-### 2.2 用户事件记录流程 (log_user_event)
+### 3.2 用户事件记录流程 (log_user_event)
 
 **函数签名：**
 ```rust
@@ -128,7 +185,7 @@ pub async fn log_user_event(
 )
 ```
 
-**实现流程：** [log_user_event_impl](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/core/events.rs#L229-L261)
+**实现流程：** [log_user_event_impl](src/api/core/events.rs#L229-L261)
 
 ```
 用户事件触发 (如登录成功)
@@ -160,7 +217,7 @@ pub async fn log_user_event(
 
 **代码示例** - 登录成功记录：
 ```rust
-// [identity.rs:117-124]
+// [src/api/identity.rs:117-124]
 log_user_event(
     EventType::UserLoggedIn as i32,
     &user_id,
@@ -170,7 +227,7 @@ log_user_event(
 ).await;
 ```
 
-### 2.3 组织事件记录流程 (log_event)
+### 3.3 组织事件记录流程 (log_event)
 
 **函数签名：**
 ```rust
@@ -185,7 +242,7 @@ pub async fn log_event(
 )
 ```
 
-**实现流程：** [log_event_impl](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/core/events.rs#L279-L323)
+**实现流程：** [log_event_impl](src/api/core/events.rs#L279-L323)
 
 ```
 组织事件触发 (如创建集合)
@@ -216,7 +273,7 @@ pub async fn log_event(
 
 **代码示例** - 创建集合：
 ```rust
-// [organizations.rs:515-522]
+// [src/api/core/organizations.rs:515-522]
 log_event(
     EventType::CollectionCreated as i32,
     &collection.uuid,       // source_uuid = 集合ID
@@ -228,20 +285,100 @@ log_event(
 ).await;
 ```
 
-### 2.4 数据库写入方法
+### 3.4 数据库写入方法
 
 | 方法 | 用途 | 特性 |
 |------|------|------|
 | `Event::save()` | 单条保存 | UPSERT 模式，冲突则更新 |
 | `Event::save_user_event()` | 用户事件批量保存 | INSERT OR IGNORE，跳过重复 |
 
-SQLite/MySQL/PostgreSQL 的写入差异在 [event.rs:203-256](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/db/models/event.rs#L203-L256) 中通过 `db_run!` 宏统一处理。
+SQLite/MySQL/PostgreSQL 的写入差异在 [src/db/models/event.rs:203-256](src/db/models/event.rs#L203-L256) 中通过 `db_run!` 宏统一处理。
 
 ---
 
-## 3. 操作者归属详解
+## 4. 客户端事件收集与日期处理
 
-### 3.1 归属矩阵
+### 4.1 收集端点与数据结构
+
+客户端（浏览器扩展、移动应用）通过 `/events/collect` 端点上报客户端侧事件，定义在 [src/api/core/events.rs:164-220](src/api/core/events.rs#L164-L220)：
+
+```rust
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EventCollection {
+    // 必选字段
+    r#type: i32,      // 事件类型
+    date: String,     // 客户端上报的事件时间 (RFC3339格式)
+
+    // 可选字段
+    cipher_id: Option<CipherId>,
+    organization_id: Option<OrganizationId>,
+}
+```
+
+### 4.2 客户端日期处理机制
+
+**日期解析函数** 定义在 [src/util.rs:487-489](src/util.rs#L487-L489)：
+
+```rust
+pub fn parse_date(date: &str) -> NaiveDateTime {
+    DateTime::parse_from_rfc3339(date).unwrap().naive_utc()
+}
+```
+
+**处理流程**：
+1. 客户端上报的 `date` 字段必须是 **RFC3339 格式**（如 `2024-01-15T10:30:00Z`）
+2. 服务端调用 `parse_date()` 解析为 UTC 时间
+3. 解析后的日期直接透传给 `log_user_event_impl` 或 `log_event_impl`
+4. 通过 `Some(event_date)` 传入，覆盖默认的"当前时间"
+
+**代码证据** - [src/api/core/events.rs:171-178](src/api/core/events.rs#L171-L178)：
+```rust
+for event in data.iter() {
+    let event_date = parse_date(&event.date);  // 解析客户端日期
+    match event.r#type {
+        1000..=1099 => {
+            log_user_event_impl(
+                event.r#type,
+                &headers.user.uuid,
+                headers.device.atype,
+                Some(event_date),  // 传入客户端日期，而非服务端当前时间
+                &headers.ip.ip,
+                &conn,
+            ).await;
+        }
+        // ... 其他类型处理
+    }
+}
+```
+
+**设计意图**：
+- 保留事件在**客户端实际发生**的时间，而非服务端接收时间
+- 解决网络延迟、批量上报导致的时间偏差问题
+- 确保审计时间线的准确性
+
+### 4.3 客户端上报的事件类型路由
+
+| 类型范围 | 处理方式 | 示例 |
+|----------|----------|------|
+| 1000-1099 | 调用 `log_user_event_impl()`，传入客户端日期 | UserClientExportedVault (1007) |
+| 1600-1699 | 调用 `log_event_impl()`，以 organization_id 为源 | OrganizationClientExportedVault (1602) |
+| 其他 (1100等) | 通过 cipher_id 查询所属组织，再调用 `log_event_impl()` | CipherClientViewed (1107) |
+
+**客户端事件示例** - 查看密码字段：
+```
+客户端上报事件: { type: 1108, cipherId: "xxx", date: "2024-01-15T10:30:00Z" }
+    ↓
+服务端通过 cipherId 查询所属组织
+    ↓
+调用 log_event_impl，传入客户端日期 2024-01-15T10:30:00Z
+```
+
+---
+
+## 5. 操作者归属与API输出
+
+### 5.1 归属矩阵
 
 | 事件类别 | user_uuid (主体) | act_user_uuid (操作者) | 示例场景 |
 |----------|------------------|------------------------|----------|
@@ -252,82 +389,80 @@ SQLite/MySQL/PostgreSQL 的写入差异在 [event.rs:203-256](file:///d:/fz/0601
 | **组织用户事件** (1500-1599) | ❌ None | ✅ 操作者 | 管理员B邀请用户C加入 |
 | **组织事件** (1600-1699) | ❌ None | ✅ 修改者 | 所有者A修改组织设置 |
 
-### 3.2 归属场景示例
+### 5.2 操作者字段的API输出映射
+
+`act_user_uuid` 字段在 JSON 输出中映射为 `actingUserId`，定义在 [src/db/models/event.rs:172-193](src/db/models/event.rs#L172-L193)：
+
+```rust
+pub fn to_json(&self) -> Value {
+    json!({
+        "type": self.event_type,
+        "userId": self.user_uuid,           // 事件主体 (可能为null)
+        "actingUserId": self.act_user_uuid, // 操作者 (始终有值)
+        "organizationId": self.org_uuid,
+        "cipherId": self.cipher_uuid,
+        "collectionId": self.collection_uuid,
+        "groupId": self.group_uuid,
+        "organizationUserId": self.org_user_uuid,
+        "date": format_date(&self.event_date),
+        "deviceType": self.device_type,
+        "ipAddress": self.ip_address,
+        "policyId": self.policy_uuid,
+        // ... 其他字段
+    })
+}
+```
+
+**输出字段对照表**：
+
+| 数据库字段 | JSON输出字段 | 说明 |
+|------------|--------------|------|
+| `user_uuid` | `userId` | 事件主体用户ID，非用户事件时为null |
+| `act_user_uuid` | `actingUserId` | 实际执行者ID，始终有值 |
+| `org_user_uuid` | `organizationUserId` | 组织成员关系ID |
+| `org_uuid` | `organizationId` | 组织ID |
+
+### 5.3 归属场景示例
 
 **场景1：用户自己修改密码** (UserChangedPassword = 1001)
 ```
-user_uuid    = 用户A (目标主体)
-act_user_uuid = 用户A (操作者是自己)
-org_uuid     = None / 用户A所属组织
+userId        = "用户A" (事件主体)
+actingUserId  = "用户A" (操作者是自己)
+organizationId = null / 所属组织ID
 ```
-来源：[accounts.rs:400-401](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/core/accounts.rs#L400-L401)
+来源：[src/api/core/accounts.rs:400-401](src/api/core/accounts.rs#L400-L401)
 
 **场景2：管理员重置成员密码** (OrganizationUserAdminResetPassword = 1508)
 ```
-org_user_uuid = 成员A的组织关系ID (目标主体)
-act_user_uuid = 管理员B (实际执行者)
-org_uuid      = 组织X
-user_uuid     = None (注意：此字段为空！)
+organizationUserId = "成员A的关系ID" (事件主体)
+actingUserId       = "管理员B" (实际执行者)
+organizationId     = "组织X"
+userId             = null (注意：此字段为空！)
 ```
 
 **场景3：管理员删除用户成员关系** (OrganizationUserRemoved = 1503)
 ```
-org_user_uuid = 被删除成员的关系ID
-act_user_uuid = 执行删除的管理员
-org_uuid      = 组织ID
+organizationUserId = "被删除成员的关系ID"
+actingUserId       = "执行删除的管理员"
+organizationId     = "组织ID"
 ```
-来源：[organizations.rs:1703-1706](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/core/organizations.rs#L1703-L1706)
+来源：[src/api/core/organizations.rs:1703-1706](src/api/core/organizations.rs#L1703-L1706)
 
 **场景4：用户主动离开组织** (OrganizationUserLeft = 1516)
 ```
-org_user_uuid = 离开用户的关系ID
-act_user_uuid = 离开的用户 (自操作)
-org_uuid      = 组织ID
+organizationUserId = "离开用户的关系ID"
+actingUserId       = "离开的用户" (自操作)
+organizationId     = "组织ID"
 ```
-来源：[organizations.rs:270-273](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/core/organizations.rs#L270-L273)
+来源：[src/api/core/organizations.rs:270-273](src/api/core/organizations.rs#L270-L273)
 
 ---
 
-## 4. 客户端事件收集
+## 6. 成员事件查询逻辑
 
-### 4.1 收集端点
+### 6.1 查询端点
 
-客户端（浏览器扩展、移动应用）通过 `/events/collect` 端点上报客户端侧事件：
-
-```rust
-// [events.rs:164-220]
-#[post("/collect", format = "application/json", data = "<data>")]
-async fn post_events_collect(
-    data: Json<Vec<EventCollection>>, 
-    headers: Headers, 
-    conn: DbConn
-) -> EmptyResult
-```
-
-### 4.2 客户端上报的事件类型
-
-| 类型范围 | 处理方式 | 示例 |
-|----------|----------|------|
-| 1000-1099 | 调用 `log_user_event()` | UserClientExportedVault (1007) |
-| 1600-1699 | 调用 `log_event()`，以组织为源 | OrganizationClientExportedVault (1602) |
-| 其他 (1100等) | 通过 cipher_id 关联到组织 | CipherClientViewed (1107) |
-
-**客户端事件示例** - 查看密码字段：
-```
-客户端上报事件: { type: 1108, cipherId: "xxx", date: "..." }
-    ↓
-服务端通过 cipherId 查询所属组织
-    ↓
-调用 log_event 写入组织事件日志
-```
-
----
-
-## 5. 事件查询接口
-
-### 5.1 查询端点
-
-所有查询接口定义在 [events.rs](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/core/events.rs#L33-L126)：
+所有查询接口定义在 [src/api/core/events.rs](src/api/core/events.rs#L33-L126)：
 
 | 端点 | 权限 | 说明 |
 |------|------|------|
@@ -335,104 +470,203 @@ async fn post_events_collect(
 | `GET /api/organizations/{org_id}/users/{member_id}/events` | 管理员 | 查询组织内某成员的事件 |
 | `GET /api/ciphers/{cipher_id}/events` | 密码库管理员 | 查询某密码库的事件 |
 
-### 5.2 成员事件查询逻辑
+### 6.2 成员事件查询：双字段匹配设计
 
-**关键点：** 查询成员事件时，同时匹配 `user_uuid` 和 `act_user_uuid`
+**核心查询方法**：`find_by_org_and_member` 定义在 [src/db/models/event.rs:292-316](src/db/models/event.rs#L292-L316)
+
+```rust
+pub async fn find_by_org_and_member(
+    org_uuid: &OrganizationId,
+    member_uuid: &MembershipId,  // 注意：传入的是成员关系ID，不是用户ID
+    start: &NaiveDateTime,
+    end: &NaiveDateTime,
+    conn: &DbConn,
+) -> Vec<Self> {
+    conn.run(move |conn| {
+        event::table
+            .inner_join(users_organizations::table
+                .on(users_organizations::uuid.eq(member_uuid)))
+            .filter(event::org_uuid.eq(org_uuid))
+            .filter(event::event_date.between(start, end))
+            .filter(
+                event::user_uuid
+                    .eq(users_organizations::user_uuid.nullable())
+                    .or(event::act_user_uuid.eq(users_organizations::user_uuid.nullable())),
+            )
+            .select(event::all_columns)
+            .order_by(event::event_date.desc())
+            .limit(Self::PAGE_SIZE)
+            .load::<Self>(conn)
+            .expect("Error filtering events")
+    })
+    .await
+}
+```
+
+**SQL 逻辑拆解**：
 
 ```sql
--- [event.rs:292-316] find_by_org_and_member
 SELECT event.* 
 FROM event
 INNER JOIN users_organizations 
-    ON users_organizations.uuid = member_uuid
-WHERE event.org_uuid = org_uuid
+    ON users_organizations.uuid = '成员关系ID'  -- 通过成员关系找到用户ID
+WHERE event.org_uuid = '组织ID'
   AND event.event_date BETWEEN start AND end
   AND (
-    event.user_uuid = users_organizations.user_uuid   -- 作为事件主体
+    -- 条件1：该用户作为事件主体
+    event.user_uuid = users_organizations.user_uuid
     OR 
-    event.act_user_uuid = users_organizations.user_uuid  -- 作为操作者
+    -- 条件2：该用户作为事件操作者
+    event.act_user_uuid = users_organizations.user_uuid
   )
+ORDER BY event.event_date DESC
+LIMIT 30
 ```
 
-**设计意图：** 成员事件审计需同时包含：
-1. 该用户作为**主体**被操作的事件（如被管理员重置密码）
-2. 该用户作为**操作者**执行的事件（如用户修改了共享密码）
+**关键点说明**：
+
+1. **输入参数是成员关系ID**：接口传入 `member_id`（MembershipId），不是 UserId
+2. **JOIN 表获取真实用户ID**：通过 `users_organizations.uuid = member_uuid` 关联，获取 `user_uuid`
+3. **OR 双条件匹配**：同时匹配 `user_uuid`（主体）和 `act_user_uuid`（操作者）
+
+### 6.3 设计意图：审计的全面性
+
+成员事件审计需包含两类事件，缺一不可：
+
+| 匹配条件 | 包含的事件类型 | 示例 |
+|----------|--------------|------|
+| `event.user_uuid = 用户ID` | 用户作为**主体**被操作的事件 | 管理员重置该用户的密码、用户登录事件 |
+| `event.act_user_uuid = 用户ID` | 用户作为**操作者**执行的事件 | 该用户修改了共享密码、该用户批准了设备登录 |
+
+**为什么必须同时包含？**
+- 仅查 `user_uuid`：漏掉该用户作为管理员对他人/组织的操作
+- 仅查 `act_user_uuid`：漏掉对该用户自身的操作（如被重置密码）
+- 双条件 OR 匹配：完整还原该用户在组织中的所有活动轨迹
 
 ---
 
-## 6. 事件清理机制
+## 7. 事件清理机制
 
-### 6.1 保留天数配置
+### 7.1 保留天数配置
 
-通过 `CONFIG.events_days_retain()` 配置事件保留天数。
-
-### 6.2 清理任务
+配置项定义在 [src/config.rs:658-659](src/config.rs#L658-L659)：
 
 ```rust
-// [events.rs:325-337] event_cleanup_job
+/// Events days retain |> Number of days to retain events stored in the database. If unset, events are kept indefinitely.
+events_days_retain:     i64,    false,   option;
+```
+
+- 未设置时：事件永久保留
+- 设置为 N 时：仅保留最近 N 天的事件
+
+### 7.2 清理任务
+
+清理任务定义在 [src/api/core/events.rs:325-337](src/api/core/events.rs#L325-L337)，由主程序调度：
+
+```rust
 pub async fn event_cleanup_job(pool: DbPool) {
+    debug!("Start events cleanup job");
+    if CONFIG.events_days_retain().is_none() {
+        debug!("events_days_retain is not configured, abort");
+        return;
+    }
+
+    if let Ok(conn) = pool.get().await {
+        Event::clean_events(&conn).await.ok();
+    } else {
+        error!("Failed to get DB connection while trying to cleanup the events table");
+    }
+}
+```
+
+清理方法定义在 [src/db/models/event.rs:336-348](src/db/models/event.rs#L336-L348)：
+
+```rust
+pub async fn clean_events(conn: &DbConn) -> EmptyResult {
     if let Some(days_to_retain) = CONFIG.events_days_retain() {
         let dt = Utc::now().naive_utc() - TimeDelta::try_days(days_to_retain).unwrap();
-        diesel::delete(event::table.filter(event::event_date.lt(dt)))
-            .execute(conn)
+        conn.run(move |conn| {
+            diesel::delete(event::table.filter(event::event_date.lt(dt)))
+                .execute(conn)
+                .map_res("Error cleaning old events")
+        })
+        .await
+    } else {
+        Ok(())
     }
 }
 ```
 
 ---
 
-## 7. 事件记录触发点汇总
+## 8. 事件记录触发点汇总
 
-### 7.1 用户事件触发点 (1000-1099)
-
-| 事件 | 触发文件/位置 | 说明 |
-|------|--------------|------|
-| UserLoggedIn (1000) | [identity.rs:117](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/identity.rs#L117) | 登录成功 |
-| UserFailedLogIn (1005) | [identity.rs:128](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/identity.rs#L128) | 登录失败 |
-| UserChangedPassword (1001) | [accounts.rs:400](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/core/accounts.rs#L400) | 修改主密码 |
-| UserRecovered2fa (1004) | [identity.rs:870](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/identity.rs#L870) | 恢复2FA |
-| UserRequestedDeviceApproval (1010) | [accounts.rs:1500](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/core/accounts.rs#L1500) | 请求设备批准 |
-
-### 7.2 组织事件触发点 (1500-1599)
+### 8.1 用户事件触发点 (1000-1099)
 
 | 事件 | 触发文件/位置 | 说明 |
 |------|--------------|------|
-| OrganizationUserInvited (1500) | [organizations.rs:1133](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/core/organizations.rs#L1133) | 邀请成员 |
-| OrganizationUserConfirmed (1501) | [organizations.rs:1429](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/core/organizations.rs#L1429) | 成员确认加入 |
-| OrganizationUserRemoved (1503) | [organizations.rs:1703](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/core/organizations.rs#L1703) | 移除成员 |
-| OrganizationUserLeft (1516) | [organizations.rs:270](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/core/organizations.rs#L270) | 用户主动离开 |
-| OrganizationUserApprovedAuthRequest (1513) | [accounts.rs:1594](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/core/accounts.rs#L1594) | 批准设备登录 |
-| OrganizationUserRejectedAuthRequest (1514) | [accounts.rs:1605](file:///d:/fz/0601/solo-dogfeeding/code/13-vaultwarden/src/api/core/accounts.rs#L1605) | 拒绝设备登录 |
+| UserLoggedIn (1000) | [src/api/identity.rs:117](src/api/identity.rs#L117) | 登录成功 |
+| UserFailedLogIn (1005) | [src/api/identity.rs:128](src/api/identity.rs#L128) | 登录失败 |
+| UserChangedPassword (1001) | [src/api/core/accounts.rs:400](src/api/core/accounts.rs#L400) | 修改主密码 |
+| UserRecovered2fa (1004) | [src/api/identity.rs:870](src/api/identity.rs#L870) | 恢复2FA |
+| UserRequestedDeviceApproval (1010) | [src/api/core/accounts.rs:1500](src/api/core/accounts.rs#L1500) | 请求设备批准 |
+
+### 8.2 组织事件触发点 (1500-1599)
+
+| 事件 | 触发文件/位置 | 说明 |
+|------|--------------|------|
+| OrganizationUserInvited (1500) | [src/api/core/organizations.rs:1133](src/api/core/organizations.rs#L1133) | 邀请成员 |
+| OrganizationUserConfirmed (1501) | [src/api/core/organizations.rs:1429](src/api/core/organizations.rs#L1429) | 成员确认加入 |
+| OrganizationUserRemoved (1503) | [src/api/core/organizations.rs:1703](src/api/core/organizations.rs#L1703) | 移除成员 |
+| OrganizationUserLeft (1516) | [src/api/core/organizations.rs:270](src/api/core/organizations.rs#L270) | 用户主动离开 |
+| OrganizationUserApprovedAuthRequest (1513) | [src/api/core/accounts.rs:1594](src/api/core/accounts.rs#L1594) | 批准设备登录 |
+| OrganizationUserRejectedAuthRequest (1514) | [src/api/core/accounts.rs:1605](src/api/core/accounts.rs#L1605) | 拒绝设备登录 |
 
 ---
 
-## 8. 总结
+## 9. 总结
 
-### 8.1 设计核心原则
+### 9.1 设计核心原则
 
 1. **双轨记录**：用户事件采用"全局+组织副本"双轨模式，确保审计完整性
 2. **角色分离**：`user_uuid`（主体）与 `act_user_uuid`（操作者）分离，支持管理员操作审计
 3. **类型驱动**：通过事件类型数值范围自动路由到不同处理逻辑
 4. **上下文完整**：每条事件记录设备类型和IP地址，便于安全分析
+5. **全链路开关**：`org_events_enabled` 在所有入口点检查，关闭时完全无性能损耗
+6. **客户端时间保留**：上报事件使用客户端日期，确保审计时间线准确
+7. **全面审计查询**：成员查询同时匹配主体和操作者字段，不遗漏任何相关事件
 
-### 8.2 审计查询建议
+### 9.2 审计查询建议
 
 | 审计目标 | 查询方式 | 关键字段 |
 |----------|----------|----------|
-| 用户所有操作 | 按 `act_user_uuid` 查询 | act_user_uuid, event_date |
-| 用户被操作历史 | 按 `user_uuid` 或 `org_user_uuid` 查询 | user_uuid, org_user_uuid |
-| 组织安全审计 | 按 `org_uuid` 分页查询 | org_uuid, event_type |
-| 敏感操作追踪 | 按 `event_type` 过滤特定事件 | event_type, ip_address |
+| 用户所有操作 | 按 `act_user_uuid` 查询 | actingUserId, event_date |
+| 用户被操作历史 | 按 `user_uuid` 或 `org_user_uuid` 查询 | userId, organizationUserId |
+| 组织安全审计 | 按 `org_uuid` 分页查询 | organizationId, event_type |
+| 敏感操作追踪 | 按 `event_type` 过滤特定事件 | type, ipAddress |
+| 指定成员完整轨迹 | 调用成员事件查询接口 | 内部匹配 user_uuid OR act_user_uuid |
 
-### 8.3 代码溯源路径
+### 9.3 代码溯源路径
 
 ```
-事件枚举定义: src/db/models/event.rs (EventType)
-事件记录入口: src/api/core/events.rs (log_user_event, log_event)
-事件触发点: 
-  - 用户类: src/api/identity.rs, src/api/core/accounts.rs
-  - 组织类: src/api/core/organizations.rs
-  - 密码库: src/api/core/ciphers.rs
-  - 2FA类: src/api/core/two_factor/*.rs
-事件查询API: src/api/core/events.rs (get_org_events, get_user_events)
+配置定义:
+  src/config.rs (org_events_enabled, events_days_retain)
+
+数据模型:
+  src/db/models/event.rs (Event 结构体, EventType 枚举, 查询方法)
+
+记录入口:
+  src/api/core/events.rs (log_user_event, log_event, 客户端收集)
+
+事件触发点:
+  用户类:     src/api/identity.rs, src/api/core/accounts.rs
+  组织类:     src/api/core/organizations.rs
+  密码库类:   src/api/core/ciphers.rs
+  2FA类:      src/api/core/two_factor/*.rs
+
+查询API:
+  src/api/core/events.rs (get_org_events, get_user_events, get_cipher_events)
+
+工具函数:
+  src/util.rs (parse_date)
 ```
