@@ -9,7 +9,7 @@
 | 策略类型 | 值 | 服务端强制执行 | 说明 |
 |---------|----|--------------|------|
 | TwoFactorAuthentication | 0 | ✅ 是 | 双因素认证强制策略 |
-| MasterPassword | 1 | ✅ 是 | 主密码复杂度策略（多组织合并） |
+| MasterPassword | 1 | ⚠️ 部分 | 主密码复杂度策略（服务端合并后返回客户端，无强制执行） |
 | PasswordGenerator | 2 | ❌ 否 | 密码生成器策略（仅客户端执行） |
 | SingleOrg | 3 | ✅ 是 | 单一组织限制策略 |
 | PersonalOwnership | 5 | ✅ 是 | 个人所有权限制策略 |
@@ -202,9 +202,12 @@ if policy.enabled && TwoFactor::find_by_user(user_uuid).await.is_empty() {
 
 **执行位置：** [enforce_personal_ownership_policy](file:///d:/fz/0601/solo-dogfeeding/code/12-vaultwarden/src/api/core/ciphers.rs#L384-L393)
 
-**触发时机：**
-- 创建/更新密码条目时 [update_cipher_from_data](file:///d:/fz/0601/solo-dogfeeding/code/12-vaultwarden/src/api/core/ciphers.rs#L418)
-- 创建/更新 Send 时
+**触发时机（仅密码条目相关，不涉及 Send）：**
+- [分享密码时](file:///d:/fz/0601/solo-dogfeeding/code/12-vaultwarden/src/api/core/ciphers.rs#L339)
+- [创建/更新密码条目时](file:///d:/fz/0601/solo-dogfeeding/code/12-vaultwarden/src/api/core/ciphers.rs#L418) ([update_cipher_from_data])
+- [导入密码时](file:///d:/fz/0601/solo-dogfeeding/code/12-vaultwarden/src/api/core/ciphers.rs#L597)
+
+**⚠️ 重要校正：** Send 路径不执行 PersonalOwnership 策略检查。Send 的创建/更新仅检查 `DisableSend` 和 `SendOptions` 策略。
 
 **状态约束：** 使用 `is_applicable_to_user`
 - 策略查询：Accepted/Confirmed 用户
@@ -292,6 +295,8 @@ if hide_email && OrgPolicy::is_hide_email_disabled(user_id, conn).await {
 
 **执行位置：** [master_password_policy](file:///d:/fz/0601/solo-dogfeeding/code/12-vaultwarden/src/api/mod.rs#L93-L125)
 
+**服务端处理：** ⚠️ 仅合并后返回客户端，无强制执行
+
 **策略合并逻辑：**
 - 收集用户所属所有组织的已启用主密码策略
 - 调用 `find_accepted_and_confirmed_by_user_and_active_policy`（Accepted/Confirmed 用户）
@@ -299,7 +304,17 @@ if hide_email && OrgPolicy::is_hide_email_disabled(user_id, conn).await {
   - 数值型：取最大值（min_complexity, min_length）
   - 布尔型：取逻辑或（require_lower, require_upper, require_numbers, require_special, enforce_on_login）
 
+**返回时机：**
+- 在 [identity.rs](file:///d:/fz/0601/solo-dogfeeding/code/12-vaultwarden/src/api/identity.rs#L502-L548) 登录响应中返回给客户端
+- 客户端在用户修改主密码时本地强制执行复杂度要求
+
 **配置覆盖：** SSO 启用时，全局配置 `sso_master_password_policy` 可作为兜底策略。
+
+**⚠️ 重要说明：**
+- 服务端没有任何校验主密码复杂度的执行点
+- 完全依赖客户端在修改密码时执行检查
+- 用户可通过修改客户端或直接调用 API 绕过策略
+- 属于"服务端存储 + 合并 + 返回客户端"模式，无服务端强制执行
 
 **策略启用后的存量影响：**
 - 客户端会收到合并后的策略配置
@@ -404,7 +419,7 @@ if hide_email && OrgPolicy::is_hide_email_disabled(user_id, conn).await {
 | PersonalOwnership | ❌ 否 | 仅阻止新操作，存量条目保留 |
 | DisableSend | ❌ 否 | 仅阻止新操作，存量Send保留 |
 | SendOptions | ❌ 否 | 仅阻止新设置，存量配置保留 |
-| MasterPassword | ❌ 否 | 仅影响后续密码修改 |
+| MasterPassword | ❌ 否 | 仅返回客户端，无服务端强制执行 |
 | ResetPassword | ❌ 否 | 仅影响新用户接受邀请 |
 | PasswordGenerator | ❌ 否 | 仅客户端策略 |
 | RemoveUnlockWithPin | ❌ 否 | 仅客户端策略 |
@@ -541,9 +556,10 @@ if hide_email && OrgPolicy::is_hide_email_disabled(user_id, conn).await {
 - MasterPassword 策略支持多组织合并，取最严格值
 
 ### 7.4 客户端与服务端策略分离
-- **服务端强制策略**：7 种（TwoFactor, SingleOrg, PersonalOwnership, DisableSend, SendOptions, MasterPassword, ResetPassword）
+- **服务端强制策略**：6 种（TwoFactor, SingleOrg, PersonalOwnership, DisableSend, SendOptions, ResetPassword）
+- **服务端存储+返回策略**：1 种（MasterPassword，服务端合并后返回客户端，无强制执行）
 - **客户端仅策略**：4 种（PasswordGenerator, RemoveUnlockWithPin, RestrictedItemTypes, UriMatchDefaults）
-- 客户端策略完全依赖客户端执行，存在绕过风险
+- 客户端策略和 MasterPassword 完全依赖客户端执行，存在绕过风险
 
 ### 7.5 配置优先级
 - 全局配置可覆盖组织策略（如 `sends_allowed`）
