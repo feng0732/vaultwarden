@@ -86,11 +86,14 @@ Vaultwarden API 兼容层存在三套互不兼容的响应鉴别器体系，分�
 | `"privateKeys"` | AccountKeys 容器类型 | `api/identity.rs:530, 681` |
 | `"publicKeyEncryptionKeyPair"` | 公私钥对类型 | `api/identity.rs:528, 679` |
 | `"userDecryptionOptions"` | 用户解密选项 | `api/identity.rs:554, 707` |
-| `"masterPasswordPolicy"` | 主密码策略 | `api/identity.rs:912` |
+| `"masterPasswordPolicy"` | 主密码策略 | `api/mod.rs:124`（生成），`api/identity.rs:548`（Token），`api/identity.rs:912`（2FA） |
 
 **Token 响应的完整 PascalCase 风格：**
 
 ```rust
+// api/identity.rs:502 — 调用 master_password_policy() 函数生成策略对象
+let master_password_policy = master_password_policy(user, conn).await;
+
 let mut result = json!({
     "access_token": auth_tokens.access_token(),  // OAuth2 标准字段（下划线）
     "expires_in": auth_tokens.expires_in(),      // OAuth2 标准字段
@@ -105,9 +108,7 @@ let mut result = json!({
     "KdfParallelism": user.client_kdf_parallelism,
     "ResetMasterPassword": false,
     "ForcePasswordReset": false,
-    "MasterPasswordPolicy": {
-        "Object": "masterPasswordPolicy"  // 注意：大写 Object
-    },
+    "MasterPasswordPolicy": master_password_policy,  // ← 函数返回值，含大写 Object
     "scope": auth_tokens.scope(),
     "AccountKeys": {
         "publicKeyEncryptionKeyPair": {
@@ -124,13 +125,122 @@ let mut result = json!({
     },
 });
 ```
-— `api/identity.rs:526-556`
+— `api/identity.rs:536-556`
 
 **关键设计取舍**：OAuth2 标准字段使用下划线（`access_token`, `expires_in`, `token_type`, `refresh_token`），Bitwarden 扩展字段全部使用 PascalCase，这是 OAuth2 规范与 Bitwarden 私有扩展的分界线。
 
 ---
 
-### 1.4 sync 端点的特殊混合：`"object"` + camelCase
+### 1.4 `MasterPasswordPolicy` 的三处用法与大小写对照
+
+`MasterPasswordPolicy` 是整个兼容层中大小写问题最复杂的对象，它在三处出现，每处的数据来源和字段大小写都不同：
+
+#### 来源：`master_password_policy()` 函数（`api/mod.rs:93-126`）
+
+```rust
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]  // ← 序列化字段为 camelCase
+pub struct MasterPasswordPolicy {
+    min_complexity: Option<u8>,    // → 序列化为 minComplexity
+    min_length: Option<u32>,       // → 序列化为 minLength
+    require_lower: bool,           // → 序列化为 requireLower
+    require_upper: bool,           // → 序列化为 requireUpper
+    require_numbers: bool,         // → 序列化为 requireNumbers
+    require_special: bool,         // → 序列化为 requireSpecial
+    enforce_on_login: bool,        // → 序列化为 enforceOnLogin
+}
+
+async fn master_password_policy(user: &User, conn: &DbConn) -> Value {
+    // ... 合并策略 ...
+    let mut mpp_json = if !master_password_policies.is_empty() {
+        json!(reduced_policy)  // Serde 序列化 → camelCase 字段
+    } else if CONFIG.sso_enabled() {
+        CONFIG.sso_master_password_policy_value().unwrap_or(json!({}))
+    } else {
+        json!({})
+    };
+    // NOTE: Upstream still uses PascalCase here for `Object`!
+    mpp_json["Object"] = json!("masterPasswordPolicy");  // ← 手动注入大写 Object
+    mpp_json
+}
+```
+
+**关键**：结构体通过 `#[serde(rename_all = "camelCase")]` 序列化为 camelCase 字段名，但 `Object` 键是手动注入的，不受 Serde 控制。最终输出的 JSON 内部字段是 camelCase，但鉴别器是大写 `Object`。
+
+#### 用法一：Token 响应（`api/identity.rs:548`）
+
+```rust
+"MasterPasswordPolicy": master_password_policy,  // 调用函数的返回值
+```
+
+输出示例（有策略时）：
+```json
+{
+    "MasterPasswordPolicy": {         // PascalCase 外壳键名
+        "minComplexity": 3,           // camelCase（Serde 序列化）
+        "minLength": 12,              // camelCase
+        "requireLower": false,        // camelCase
+        "requireUpper": false,        // camelCase
+        "requireNumbers": false,      // camelCase
+        "requireSpecial": false,      // camelCase
+        "enforceOnLogin": false,      // camelCase
+        "Object": "masterPasswordPolicy"  // 大写 Object（手动注入）
+    }
+}
+```
+
+输出示例（无策略时）：
+```json
+{
+    "MasterPasswordPolicy": {         // PascalCase 外壳键名
+        "Object": "masterPasswordPolicy"  // 大写 Object，无策略字段
+    }
+}
+```
+
+#### 用法二：2FA 错误响应（`api/identity.rs:911-912`）
+
+```rust
+"MasterPasswordPolicy": {
+    "Object": "masterPasswordPolicy"
+}
+```
+
+**硬编码空对象**，不调用 `master_password_policy()` 函数。2FA 验证流程此时尚未完成登录，不提供策略细节，仅提供鉴别器让客户端能正确解析。
+
+输出：
+```json
+{
+    "error": "invalid_grant",
+    "error_description": "Two factor required.",
+    "TwoFactorProviders": ["0", "1"],
+    "TwoFactorProviders2": { "0": null, "1": null },
+    "MasterPasswordPolicy": {              // PascalCase 外壳键名
+        "Object": "masterPasswordPolicy"   // 大写 Object，硬编码空策略
+    }
+}
+```
+
+#### 用法三：`MasterPasswordPolicy` 不出现在 sync 响应中
+
+`/api/sync` 端点不返回 `MasterPasswordPolicy`。密码策略通过 `policies` 数组（`OrgPolicy::to_json()`）传递，该数组内每个策略对象使用小写 `"object": "policy"` 鉴别器（见 1.2 节），格式与 Token 响应完全不同。
+
+#### 三处用法大小写对照表
+
+| 维度 | Token 响应 | 2FA 错误 | sync 策略数组 |
+|---|---|---|---|
+| **外壳键名** | `"MasterPasswordPolicy"` (PascalCase) | `"MasterPasswordPolicy"` (PascalCase) | N/A（在 policies 数组内） |
+| **数据来源** | `master_password_policy()` 函数 | 硬编码空对象 | `OrgPolicy::to_json()` |
+| **内部字段大小写** | camelCase（Serde 序列化） | 无内部字段 | camelCase（`#[serde(rename_all)]`） |
+| **鉴别器键名** | `"Object"`（大写 O） | `"Object"`（大写 O） | `"object"`（小写 o） |
+| **鉴别器值** | `"masterPasswordPolicy"` | `"masterPasswordPolicy"` | `"policy"` |
+| **代码位置** | `api/identity.rs:548` | `api/identity.rs:911-912` | `db/models/org_policy.rs:94` |
+
+**核心规律**：同一数据在不同响应格式中使用不同大小写的鉴别器——Token/2FA 错误的大写 `"Object"` 是 Identity 模块（OAuth2 上下文）的约定；sync 的策略数组使用小写 `"object"` 是普通 API 响应的约定。`masterPasswordPolicy` 这个鉴别器**值**本身（不是键名）始终是 camelCase 首字母小写，即使在 PascalCase 上下文中也是如此。
+
+---
+
+### 1.5 sync 端点的特殊混合：`"object"` + camelCase
 
 `/api/sync` 属于普通 API 响应（`"object": "sync"` 小写），但其内部嵌套的 `userDecryption` 结构与 Token 响应的 `UserDecryptionOptions` 语义相同但**大小写完全不同**：
 
@@ -172,7 +282,7 @@ json!({
 
 ---
 
-### 1.5 错误响应的 `object` 使用
+### 1.6 错误响应的 `object` 使用
 
 标准错误响应（ApiErrorResponse 和 CompactApiErrorResponse）也使用**小写 `"object": "error"`**：
 
@@ -189,7 +299,7 @@ state.serialize_field("object", "error")?;  // 小写 object
 
 ---
 
-### 1.6 同一模型的多级响应
+### 1.7 同一模型的多级响应
 
 Bitwarden 上游对同一实体定义了信息密度递增的多级响应模型：
 
@@ -214,7 +324,7 @@ Bitwarden 上游对同一实体定义了信息密度递增的多级响应模型�
 
 ---
 
-### 1.7 Cipher 响应的双层结构
+### 1.8 Cipher 响应的双层结构
 
 Cipher 响应同时包含顶层字段和类型特定子对象，存在数据冗余设计：
 
@@ -252,7 +362,7 @@ json!({
 
 ---
 
-### 1.8 列表响应格式
+### 1.9 列表响应格式
 
 列表端点（如 `GET /api/ciphers`）使用 `"object": "list"` + `"data"` 数组 + `"continuationToken"` 的格式：
 
@@ -267,7 +377,7 @@ Ok(Json(json!({
 
 ---
 
-### 1.9 Membership 的 Manager → Custom 类型映射 HACK
+### 1.10 Membership 的 Manager → Custom 类型映射 HACK
 
 Bitwarden 有 Owner(0)/Admin(1)/User(2)/Manager(3)/Custom(4) 五种成员类型。Vaultwarden 将 Manager(3) 在输出时映射为 Custom(4)，因为需要利用 Custom 类型的 permissions 对象来模拟 Manager 的集合权限。这是一个有意的 HACK：
 
@@ -581,7 +691,7 @@ make_error! {
 
 ### 3.5 OAuth2 风格错误（2FA 要求）
 
-2FA 错误使用 `err_json!` 绕过标准错误格式，发送 OAuth2 风格的响应：
+2FA 错误使用 `err_json!` 绕过标准错误格式，发送 OAuth2 风格的响应。注意 `MasterPasswordPolicy` 是**硬编码空对象**，不调用 `master_password_policy()` 函数（见 1.4 节用法二）：
 
 ```rust
 json!({
@@ -590,7 +700,7 @@ json!({
     "TwoFactorProviders" : [...],
     "TwoFactorProviders2" : { ... },
     "MasterPasswordPolicy": {
-        "Object": "masterPasswordPolicy"  // 注意：大写 Object！
+        "Object": "masterPasswordPolicy"  // 硬编码空策略，非函数返回值
     }
 })
 ```
@@ -843,7 +953,7 @@ Vaultwarden 的 API 兼容层设计可归纳为以下核心原则：
    - Token 响应内部嵌套对象 → `"Object"`（大写 O）
    - OAuth2 风格错误 → 无鉴别器，靠 `error: "invalid_grant"` 识别
 
-2. **大小写不一致是常态**：sync 端点的 `userDecryption` 是 camelCase，Token 端点的 `UserDecryptionOptions` 是 PascalCase；`masterPasswordPolicy` 在普通 API 中用小写 `"object"`，在 2FA 错误中用大写 `"Object"`。这是 Bitwarden 上游各模块独立演化的历史遗留。
+2. **大小写不一致是常态**：sync 端点的 `userDecryption` 是 camelCase，Token 端点的 `UserDecryptionOptions` 是 PascalCase；`MasterPasswordPolicy` 对象内部字段是 camelCase（Serde 序列化），但鉴别器键名是 `"Object"`（大写 O），而 sync 策略数组中同一数据用 `"object"`（小写 o）。这是 Bitwarden 上游各模块独立演化的历史遗留。
 
 3. **字段容错的核心动机是防止客户端崩溃**：fields.type 为字符串→崩溃；type_data 为 null→崩溃；SecureNote 缺少 type→崩溃；SSH Key 缺必填字段→崩溃。这些修正不是"锦上添花"而是"不做就崩"，说明 Bitwarden 客户端在反序列化路径上缺乏防御性编程。
 
