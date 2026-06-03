@@ -671,19 +671,50 @@ pub async fn clean_events(conn: &DbConn) -> EmptyResult {
 4. **上下文完整**：每条事件记录设备类型和IP地址，便于安全分析
 5. **全链路开关**：`org_events_enabled` 在所有入口点检查，关闭时完全无性能损耗
 6. **客户端时间保留**：上报事件使用客户端日期，确保审计时间线准确
-7. **全面审计查询**：成员查询同时匹配主体和操作者字段，不遗漏任何相关事件
+7. **⚠️ 成员查询边界**：成员接口只覆盖 `user_uuid` 和 `act_user_uuid` 身份轨迹，**不覆盖** `organizationUserId` 目标成员维度
 
 ### 9.2 审计查询建议
 
-| 审计目标 | 查询方式 | 关键字段 |
-|----------|----------|----------|
-| 用户所有操作 | 按 `act_user_uuid` 查询 | actingUserId, event_date |
-| 用户被操作历史 | 按 `user_uuid` 或 `org_user_uuid` 查询 | userId, organizationUserId |
-| 组织安全审计 | 按 `org_uuid` 分页查询 | organizationId, event_type |
-| 敏感操作追踪 | 按 `event_type` 过滤特定事件 | type, ipAddress |
-| 指定成员完整轨迹 | 调用成员事件查询接口 | 内部匹配 user_uuid OR act_user_uuid |
+| 审计目标 | 查询方式 | 关键字段 | 覆盖范围说明 |
+|----------|----------|----------|-------------|
+| 用户主动操作历史 | 按 `act_user_uuid` 查询 | `actingUserId`, `event_date` | ✅ 该用户执行的所有操作 |
+| 用户被操作历史 | 按 `user_uuid` 查询 | `userId`, `event_date` | ✅ 该用户作为主体的用户类事件（登录、改密码等） |
+| ⚠️ 针对某成员的操作历史 | **不能**通过成员查询接口，需直接查 `org_user_uuid` | `organizationUserId` | ❌ 成员查询接口不覆盖此字段，需自行SQL查询 |
+| 组织安全审计 | 按 `org_uuid` 分页查询 | `organizationId`, `event_type` | ✅ 组织内所有事件 |
+| 敏感操作追踪 | 按 `event_type` 过滤特定事件 | `type`, `ipAddress` | ✅ 所有类型的特定事件 |
+| ⚠️ 指定成员轨迹查询 | 调用成员事件查询接口 | 内部匹配 `user_uuid` OR `act_user_uuid` | ✅ 该用户做了什么 + 该用户作为主体的用户事件<br>❌ **不包含** 针对该成员的组织用户操作（如被邀请、被移除） |
 
-### 9.3 代码溯源路径
+### 9.3 成员接口覆盖边界详解
+
+**代码证据**：[src/db/models/event.rs:292-316](src/db/models/event.rs#L292-L316)
+
+```rust
+// 成员事件查询的WHERE条件：
+.filter(
+    event::user_uuid                         // 条件1：用户身份（主体）
+        .eq(users_organizations::user_uuid.nullable())
+        .or(event::act_user_uuid              // 条件2：用户身份（操作者）
+            .eq(users_organizations::user_uuid.nullable())),
+)
+// 注意：没有 event.org_user_uuid 的判断！
+```
+
+**覆盖矩阵**：
+
+| 事件场景 | 记录字段 | 成员接口能查到吗？ | 原因 |
+|----------|----------|-------------------|------|
+| 用户A自己登录 | `user_uuid=A` | ✅ 能 | 匹配条件1 |
+| 用户A改密码 | `user_uuid=A`, `act_user_uuid=A` | ✅ 能 | 匹配条件1或2 |
+| 管理员B邀请用户A加入 | `org_user_uuid=A的成员关系ID`, `act_user_uuid=B` | ❌ 查A：不能<br>✅ 查B：能 | A既不是user_uuid也不是act_user_uuid |
+| 管理员B移除用户A | `org_user_uuid=A的成员关系ID`, `act_user_uuid=B` | ❌ 查A：不能<br>✅ 查B：能 | 同上 |
+| 用户A主动离开组织 | `org_user_uuid=A的成员关系ID`, `act_user_uuid=A` | ✅ 能 | 匹配条件2（act_user_uuid=A） |
+| 用户A创建集合 | `act_user_uuid=A` | ✅ 能 | 匹配条件2 |
+
+**关键结论**：
+> 成员查询接口是以"**用户身份**"为中心的活动追踪，不是以"**成员关系**"为中心的操作追踪。
+> 如果需要审计"针对某成员的所有操作"（如谁邀请了他、谁移除了他），必须直接查询 `org_user_uuid` 字段，当前API不提供此能力。
+
+### 9.4 代码溯源路径
 
 ```
 配置定义:
@@ -691,19 +722,43 @@ pub async fn clean_events(conn: &DbConn) -> EmptyResult {
 
 数据模型:
   src/db/models/event.rs (Event 结构体, EventType 枚举, 查询方法)
+    - 注意 find_by_org_and_member 只过滤 user_uuid 和 act_user_uuid
 
 记录入口:
   src/api/core/events.rs (log_user_event, log_event, 客户端收集)
+    - log_user_event: 填充 user_uuid 和 act_user_uuid
+    - log_event: 组织用户事件填充 org_user_uuid 和 act_user_uuid，不填充 user_uuid
 
 事件触发点:
   用户类:     src/api/identity.rs, src/api/core/accounts.rs
-  组织类:     src/api/core/organizations.rs
+  组织类:     src/api/core/organizations.rs (邀请/移除成员等事件填充 org_user_uuid)
   密码库类:   src/api/core/ciphers.rs
   2FA类:      src/api/core/two_factor/*.rs
 
 查询API:
-  src/api/core/events.rs (get_org_events, get_user_events, get_cipher_events)
+  src/api/core/events.rs
+    - get_org_events: 组织全部事件
+    - get_user_events: ⚠️  只覆盖 user_uuid 和 act_user_uuid
+    - get_cipher_events: 密码库事件
 
 工具函数:
   src/util.rs (parse_date)
+```
+
+### 9.5 审计工作流程图
+
+```
+记录阶段:
+  事件触发 → log_user_event/log_event → 填充各字段 → 写入DB
+    用户类事件: user_uuid=用户, act_user_uuid=用户
+    组织用户事件: org_user_uuid=成员关系, act_user_uuid=操作者 (user_uuid=None)
+
+查询阶段 (成员接口):
+  输入 member_id → JOIN users_organizations → 得到 user_id
+    → WHERE user_uuid = user_id OR act_user_uuid = user_id
+    → 返回结果
+
+查询阶段 (缺失能力):
+  若需查"针对该成员的操作" → 需 WHERE org_user_uuid = member_id
+  → 当前无此API，需自行实现
 ```
