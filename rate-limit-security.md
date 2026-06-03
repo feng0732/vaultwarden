@@ -93,13 +93,11 @@ pub fn check_limit_admin(ip: &IpAddr) -> Result<(), Error>
 let refresh_claims = match decode_refresh(refresh_token) {
     Err(err) => {
         error!("Failed to decode {} refresh_token: {refresh_token}: {err:?}", ip.ip);
-        // If the token failed to decode, it was probably one of the old style tokens 
-        // that was just a Base64 string.
         RefreshJwtClaims {
             nbf: 0,
             exp: 0,
             iss: String::new(),
-            sub: AuthMethod::Password,
+            sub: AuthMethod::Password,   // ← 硬编码为 Password
             device_token: refresh_token.into(),  // ← 直接使用原始 token
             token: None,
         }
@@ -107,45 +105,110 @@ let refresh_claims = match decode_refresh(refresh_token) {
     Ok(claims) => claims,
 };
 
-// Get device by refresh token ← 真正的验证在这里
 let Some(mut device) = Device::find_by_refresh_token(&refresh_claims.device_token, conn).await else {
     err!("Invalid refresh token")
 };
 ```
 
+**`decode_refresh` 的验证逻辑**（auth.rs:106-127）：
+
+```rust
+pub fn decode_jwt<T: DeserializeOwned>(token: &str, issuer: String) -> Result<T, Error> {
+    let mut validation = jsonwebtoken::Validation::new(JWT_ALGORITHM);
+    validation.leeway = 30;
+    validation.validate_exp = true;   // ← 验证过期
+    validation.validate_nbf = true;   // ← 验证生效时间
+    validation.set_issuer(&[issuer]); // ← 验证签发者
+    // RSA 签名验证内置在 jsonwebtoken::decode 中
+}
+```
+
+**`Device::find_by_refresh_token` 的查询逻辑**（db/models/device.rs:222-224）：
+
+```rust
+pub async fn find_by_refresh_token(refresh_token: &str, conn: &DbConn) -> Option<Self> {
+    conn.run(move |conn| devices::table
+        .filter(devices::refresh_token.eq(refresh_token))
+        .first::<Self>(conn).ok())
+    .await
+}
+```
+
+**关键发现：数据库查询的参数来源不同！**
+
+| 格式 | `refresh_claims.device_token` 的值 | 数据库匹配的字段 |
+|------|-------------------------------------|----------------|
+| **新 JWT** | JWT claims 中的 `device_token`（可能是加密/哈希后的值） | `devices.refresh_token` |
+| **旧 Base64** | 原始 token 字符串本身（`refresh_token.into()`） | `devices.refresh_token` |
+
+- 新格式：JWT 解码成功 → 取 claims 中携带的 `device_token` → 用它匹配数据库
+- 旧格式：JWT 解码失败 → 直接用原始 token 字符串匹配数据库
+- 无论哪种格式，最终都是 `WHERE refresh_token = ?` 查询数据库，这是**共同的底线防线**
+
+**AuthMethod 分支的影响**：
+
+旧格式 token 的 `sub` 硬编码为 `AuthMethod::Password`，这会在后续 AuthMethod 匹配中产生安全决策：
+
+```rust
+let auth_tokens = match refresh_claims.sub {
+    AuthMethod::Sso if CONFIG.sso_enabled() && CONFIG.sso_auth_only_not_session() => { ... }
+    AuthMethod::Sso if CONFIG.sso_enabled() => { sso::exchange_refresh_token(...) }
+    AuthMethod::Sso => err!("SSO is now disabled, Login again using email and master password"),
+    AuthMethod::Password if CONFIG.sso_enabled() && CONFIG.sso_only() => err!("SSO is now required, Login again"),
+    AuthMethod::Password => AuthTokens::new(&device, &user, refresh_claims.sub, client_id),
+    _ => err!("Invalid auth method, cannot refresh token"),
+};
+```
+
+**重要安全行为：**
+- 旧格式 token（`sub=Password`）在 `sso_only=true` 时会被拒绝 → 管理员切换为 SSO Only 模式后旧 token 立即失效
+- 旧格式 token 永远不会走 SSO 分支 → 即使数据库中的 Device 是通过 SSO 登录创建的，旧格式 token 也走 Password 分支
+- 这意味着旧格式 token 在 SSO 环境下的行为可能与预期不符，但偏向**更安全**（SSO Only 会拒绝旧 token）
+
 **安全边界分析：**
 
 | 验证阶段 | 新 JWT 格式 | 旧 Base64 格式 | 说明 |
 |----------|------------|---------------|------|
-| JWT 签名 | ✓ 验证 | ✗ 跳过 | 旧格式直接构造 claims |
-| JWT 过期 | ✓ 验证 | ✗ 跳过 | `exp: 0` 表示不过期 |
-| JWT 签发者 | ✓ 验证 | ✗ 跳过 | `iss: ""` 空字符串 |
-| 数据库 Device 查询 | ✓ 验证 | ✓ 验证 | **两者都必须通过** |
-| 关联 User 查询 | ✓ 验证 | ✓ 验证 | **两者都必须通过** |
+| RSA 签名 | ✓ 验证 | ✗ 跳过 | 旧格式直接构造 claims |
+| 过期时间 | ✓ 验证 | ✗ 跳过 | `exp: 0` 不会被检查 |
+| 生效时间 | ✓ 验证 | ✗ 跳过 | `nbf: 0` 不会被检查 |
+| 签发者 | ✓ 验证 | ✗ 跳过 | `iss: ""` 不会被检查 |
+| 数据库 Device 查询 | ✓ 通过 `device_token` | ✓ 通过原始 token | **共同底线** |
+| 关联 User 查询 | ✓ 验证 | ✓ 验证 | **共同底线** |
+| AuthMethod 匹配 | 使用 JWT 中的真实值 | 硬编码 `Password` | 旧格式可能被 `sso_only` 拒绝 |
 
-**关键设计决策：** 旧格式 token 的安全完全依赖数据库查询。这意味着：
-- 即使攻击者构造任意字符串作为 token，也必须在数据库中存在对应 Device 记录才能通过
-- 旧 token 一旦被数据库记录引用，就无法伪造（除非数据库泄露）
-- 这是一个典型的"新旧过渡"安全设计：新格式增加了 JWT 保护层，但旧格式的数据库防线依然有效
-
-**潜在风险：** 旧格式 token 没有过期时间检查（`exp: 0`），理论上永久有效。但实际上当用户修改密码、重新登录或清除设备时，对应的 Device 记录会被更新或删除，旧 token 随之失效。
+**潜在风险：** 旧格式 token 没有过期时间检查，理论上永久有效。但实际上：
+- 用户修改密码 → security_stamp 变更 → 旧 token 对应的 Device 刷新 → 旧 token 失效
+- 管理员启用 `sso_only` → `sub=Password` 被拒绝 → 旧 token 失效
+- 用户主动清除设备 → Device 记录删除 → 旧 token 失效
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  refresh_tokens 验证流程                                         │
-│                                                                   │
-│  refresh_token 输入                                               │
-│       │                                                           │
-│       ├─→ JWT 解码尝试                                            │
-│       │    ├─ 成功 → 使用 JWT claims                              │
-│       │    └─ 失败 → 构造假 claims（nbf=0, exp=0, iss=""） ★      │
-│       │                                                           │
-│       └─→ Device::find_by_refresh_token(claims.device_token)      │
-│            ├─ 找到 → 继续 → User 查询 → 成功                       │
-│            └─ 没找到 → "Invalid refresh token"                    │
-│                                                                   │
-│  ★ 旧格式兼容：数据库查询是两道防线的共同点                        │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  refresh_tokens 验证流程                                             │
+│                                                                       │
+│  refresh_token 输入                                                   │
+│       │                                                               │
+│       ├─→ decode_refresh(JWT 解码)                                    │
+│       │    ├─ 成功 → claims = JWT 签名验证过的 claims                  │
+│       │    │   device_token = JWT 内嵌值                               │
+│       │    │   sub = JWT 内嵌的 AuthMethod（Password 或 Sso）          │
+│       │    │                                                           │
+│       │    └─ 失败 → claims = 构造假 claims                            │
+│       │        device_token = 原始 token 字符串本身 ★                  │
+│       │        sub = AuthMethod::Password（硬编码）★                   │
+│       │                                                               │
+│       └─→ Device::find_by_refresh_token(claims.device_token)          │
+│            │  新格式用 JWT 内嵌的 device_token 查数据库                 │
+│            │  旧格式用原始 token 字符串直接查数据库                     │
+│            │                                                           │
+│            ├─ 没找到 → "Invalid refresh token"                        │
+│            └─ 找到 → User 查询                                         │
+│                 └─→ AuthMethod 分支匹配                                │
+│                      sub=Password + sso_only → 拒绝                   │
+│                      sub=Password → 生成 AuthTokens                    │
+│                      sub=Sso + sso_enabled → SSO 交换                 │
+│                      sub=Sso + !sso_enabled → 拒绝                    │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -237,9 +300,19 @@ if !(res.headers().get_one("Content-Type").is_some_and(|v| v.starts_with("image/
 
 ## 四、CORS 跨域配置——精确实现（修正版）
 
-### 4.1 Cors Fairing（util.rs）
+### 4.1 Cors Fairing 的执行时机
+
+Cors 是 **Response Fairing**（`Kind::Response`），在 Rocket 完成**路由匹配、请求守卫执行、业务逻辑处理**之后，构造响应时才执行。这意味着：
+
+1. **Cors 不阻止请求进入路由处理函数**
+2. **数据库查询、业务逻辑在 Cors 之前已经执行**
+3. **Cors 只在响应上添加或修改 Header**
+4. **浏览器根据这些 Header 决定是否将响应暴露给 JavaScript**
+
+### 4.2 Origin 匹配逻辑
 
 ```rust
+// util.rs
 pub struct Cors();
 
 impl Cors {
@@ -261,24 +334,30 @@ impl Cors {
 }
 ```
 
-**关键细节（之前理解有偏差）：**
-- `get_allowed_origin` 返回精确匹配的 Origin 字符串，不是通配符 `*`
-- Origin 必须**完全相等**，不是前缀匹配或包含匹配
-- SSO Authority 只有在 `sso_enabled()` 为 true 时才加入白名单
-- **不匹配时返回 None**，意味着 `Access-Control-Allow-Origin` Header **不会被设置**
-- CORS 是 **Response Fairing**，不是 Request Guard → **不会拒绝请求**，只影响浏览器行为
+**白名单的四个来源：**
 
-### 4.2 响应处理逻辑
+| 来源 | 值 | 条件 |
+|------|----|------|
+| `CONFIG.domain_origin()` | 配置的域名（如 `https://vault.example.com`） | 始终 |
+| Safari 扩展 | `"file://"` | 始终 |
+| 桌面客户端 | `"bw-desktop-file://bundle"` | 始终 |
+| SSO Authority | 配置的 SSO 域名 | `CONFIG.sso_enabled()` 为 true |
+
+**关键：`==` 是精确相等**，不是前缀匹配或包含匹配。Origin 必须**完全匹配**白名单中的某一项。
+
+### 4.3 on_response 的精确行为
 
 ```rust
 // util.rs
 async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Response<'r>) {
     let req_headers = request.headers();
 
-    // 第一步：仅在 Origin 匹配白名单时设置 Allow-Origin
+    // 第一步：Origin 匹配时设置 Allow-Origin
     if let Some(origin) = Cors::get_allowed_origin(req_headers) {
         response.set_header(Header::new("Access-Control-Allow-Origin", origin));
     }
+    // Origin 不匹配时：不设置 Allow-Origin Header
+    // → 浏览器收到没有 Allow-Origin 的响应，拒绝将响应暴露给 JS
 
     // 第二步：处理 OPTIONS 预检请求
     if request.method() == Method::Options {
@@ -295,86 +374,75 @@ async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Respons
 }
 ```
 
-**OPTIONS 预检处理的重要细节：**
-- `Access-Control-Allow-Methods` 直接**回显** `Access-Control-Request-Method`
-- `Access-Control-Allow-Headers` 直接**回显** `Access-Control-Request-Headers`
-- 这意味着**任何方法和 Header 都被允许**（只要 Origin 匹配）
-- 设置了 `Access-Control-Allow-Credentials: true` → 必须配合具体 Origin，不能用 `*`
-- 返回 200 OK + 空响应体，Rocket 不会继续执行实际路由处理
+### 4.4 CORS 与数据库查询的关系
 
-### 4.3 CORS 安全边界分析
+**Response Fairing 的执行时序：**
 
 ```
-浏览器发起跨域请求
+请求到达
   │
-  ├─ 预检 OPTIONS 请求
-  │    └─→ Cors Fairing 响应
-  │         ├─ Origin 匹配 → Allow-Origin + Allow-* + 200 OK
-  │         └─ Origin 不匹配 → 无 Allow-Origin Header
-  │              ↓
-  │           浏览器根据是否有 Allow-Origin 决定是否允许实际请求
+  ├─ 1. Rocket 路由匹配
+  ├─ 2. FromRequest 守卫执行（ClientIp、Headers 等）
+  ├─ 3. 路由处理函数执行 ← 数据库查询在这里发生
+  │     （无论 Origin 是否匹配，业务逻辑都已执行）
   │
-  └─ 实际请求（GET/POST 等）
-       └─→ Cors Fairing 响应
-            ├─ Origin 匹配 → Allow-Origin Header
-            └─ Origin 不匹配 → 无 Allow-Origin Header
-                 ↓
-              浏览器根据是否有 Allow-Origin 决定是否将响应暴露给 JS
+  ├─ 4. Response Fairing 执行 ← Cors 在这里
+  │     ├─ Origin 匹配 → 设置 Allow-Origin
+  │     └─ Origin 不匹配 → 不设置 Allow-Origin
+  │
+  └─ 5. 响应返回给客户端
+       ├─ 浏览器检查 Allow-Origin
+       │   ├─ 有 → 允许 JS 读取响应
+       │   └─ 无 → 拒绝 JS 读取响应（但服务器已执行完毕）
+       └─ 非浏览器客户端 → 完全忽略 CORS
 ```
 
-**关键安全点：**
-- CORS 不阻止服务器执行请求，只阻止浏览器读取响应
-- Origin 不匹配时服务器仍会执行业务逻辑，但浏览器看不到结果
-- 对于非浏览器客户端（如 curl、Postman），CORS 完全无效
-- OPTIONS 预检的 Allow-Headers/Allow-Methods 回显设计是为了兼容所有客户端需求，但也意味着限制较弱
+**安全含义：**
+
+- CORS 保护的是**浏览器端的数据读取**，不是服务器端的操作执行
+- 恶意网站向 Vaultwarden 发起跨域请求时：
+  - 如果 Origin 不匹配白名单 → 浏览器阻止 JS 读取响应 → 恶意网站拿不到数据
+  - 但服务器**已经执行了**数据库查询等操作 → 这是 CSRF 的防护领域，不是 CORS 的职责
+- CORS 与 CSRF Token 是互补的：CORS 防跨域数据泄露，CSRF Token 防跨域操作执行
+
+### 4.5 OPTIONS 预检的特殊行为
+
+**OPTIONS 请求的处理细节：**
+
+- `Access-Control-Allow-Methods`：直接**回显** `Access-Control-Request-Method`
+- `Access-Control-Allow-Headers`：直接**回显** `Access-Control-Request-Headers`
+- 设置了 `Access-Control-Allow-Credentials: true` → 必须配合具体 Origin（不能是 `*`）
+- 返回 200 OK + 空响应体
+
+**回显设计的安全含义：** 任何请求方法和自定义 Header 都被允许（只要 Origin 匹配），这是一种"宽松许可"策略。安全性完全依赖 Origin 白名单的精确性——如果白名单中的一个 Origin 被攻陷，攻击者可以发起任意方法和 Header 的跨域请求。
+
+**OPTIONS 请求是否经过路由处理？** 是的。Rocket 的路由处理在 Fairing 之前执行。但 Rocket 默认没有匹配 OPTIONS 方法的路由，所以 OPTIONS 请求通常在路由匹配阶段就得到 404 响应，然后 Cors Fairing 将其改写为 200 OK + CORS Header + 空响应体。
 
 ---
 
-## 五、WebSocket Token 保护——精确实现（修正版）
+## 五、WebSocket 鉴权——精确代码路径（修正版）
 
 ### 5.1 两个 WebSocket 端点
 
 | 端点 | 认证方式 | 用途 |
 |------|---------|------|
-| `/notifications/hub` | JWT access_token 验证 | 已登录用户的实时同步（密码更新、文件夹变更等） |
-| `/notifications/anonymous-hub` | URL token（无 JWT 验证） | 登录请求推送（移动端扫码登录） |
+| `/notifications/hub` | `decode_login` 验证 access_token（JWT） | 已登录用户的实时同步 |
+| `/notifications/anonymous-hub` | URL token 直接用作订阅标识 | 登录请求推送（移动端扫码登录） |
 
-### 5.2 已认证 WebSocket（hub）
+### 5.2 已认证 WebSocket（hub）——完整鉴权链
 
 ```rust
 // api/notifications.rs
 #[get("/hub?<data..>")]
 fn websockets_hub<'r>(
     ws: WebSocket,
-    data: WsAccessToken,           // ← URL 参数：access_token=...
-    ip: ClientIp,
-    header_token: WsAccessTokenHeader,  // ← Header：Authorization: Bearer ...
-) -> Result<rocket_ws::Stream!['r], Error> {
-    info!("Accepting Rocket WS connection from {}", ip.ip);
-
-    // Token 优先级：URL 参数 → Header → 401
-    let token = if let Some(token) = data.access_token {
-        token
-    } else if let Some(token) = header_token.access_token {
-        token
-    } else {
-        err_code!("Invalid claim", 401)  // ← 无 token 直接拒绝
-    };
-
-    // JWT 验证：必须通过 decode_login
-    let Ok(claims) = crate::auth::decode_login(&token) else {
-        err_code!("Invalid token", 401)  // ← token 无效拒绝
-    };
-
-    // 注册到用户 WS 映射
-    let entry_uuid = uuid::Uuid::new_v4();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
-    users.map.entry(claims.sub.to_string()).or_default().push((entry_uuid, tx));
-    // ...
-}
+    data: WsAccessToken,           // ← URL 查询参数解析
+    ip: ClientIp,                  // ← FromRequest 守卫，提取 IP
+    header_token: WsAccessTokenHeader,  // ← FromRequest 守卫，解析 Header
+) -> Result<rocket_ws::Stream!['r>, Error> {
 ```
 
-**WsAccessTokenHeader 实现：**
+**步骤 1：WsAccessTokenHeader 守卫（永远成功）**
 
 ```rust
 // auth.rs
@@ -383,20 +451,81 @@ pub struct WsAccessTokenHeader {
 }
 
 impl<'r> FromRequest<'r> for WsAccessTokenHeader {
+    type Error = ();
+
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let access_token = match request.headers().get_one("Authorization") {
-            Some(a) => a.rsplit("Bearer ").next().map(String::from),  // ← 从右边分割
+            Some(a) => a.rsplit("Bearer ").next().map(String::from),
             None => None,
         };
-        Outcome::Success(Self { access_token })
+        Outcome::Success(Self { access_token })  // ← 永远 Success，None 也算成功
     }
 }
 ```
 
-**Token 解析细节：**
-- 使用 `rsplit("Bearer ").next()` 从右边分割，兼容 `Bearer <token>` 格式
-- 即使 Header 中有多个 "Bearer" 字符串，也能正确取到最后一个（最右边的 token）
-- 解析失败不会返回错误，只是返回 `None`，由上层逻辑处理
+**关键：`WsAccessTokenHeader` 不是认证守卫！** 它永远返回 `Outcome::Success`，即使 `access_token` 为 `None`。与 `Headers` 守卫（JWT 验证失败时返回 `Outcome::Error`）完全不同。这是有意的设计：WebSocket 的 token 可能在 URL 参数中，Header 中没有 token 不应阻止请求进入路由处理。
+
+**步骤 2：Token 提取优先级（路由处理函数内）**
+
+```rust
+let token = if let Some(token) = data.access_token {
+    token            // 优先：URL 查询参数 ?access_token=...
+} else if let Some(token) = header_token.access_token {
+    token            // 次选：Authorization: Bearer ... Header
+} else {
+    err_code!("Invalid claim", 401)  // 两者都没有 → 401
+};
+```
+
+**为什么 URL 参数优先？** 浏览器的 WebSocket API（`new WebSocket(url)`）不支持设置自定义 Header。浏览器客户端只能通过 URL 传递 token。
+
+**步骤 3：JWT 验证（路由处理函数内）**
+
+```rust
+let Ok(claims) = crate::auth::decode_login(&token) else {
+    err_code!("Invalid token", 401)
+};
+```
+
+`decode_login` 调用 `decode_jwt`，执行完整的 JWT 验证链：
+- RSA 签名验证（使用服务器公钥）
+- 过期时间验证（`exp`，30 秒容差）
+- 生效时间验证（`nbf`）
+- 签发者验证（`iss` = `vaultwarden`）
+
+**步骤 4：使用 claims.sub 注册连接**
+
+```rust
+let entry_uuid = uuid::Uuid::new_v4();
+let (tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
+users.map.entry(claims.sub.to_string()).or_default().push((entry_uuid, tx));
+```
+
+`claims.sub` 的类型是 `UserId`（不是普通字符串），在 `LoginJwtClaims` 中定义：
+
+```rust
+// auth.rs
+pub struct LoginJwtClaims {
+    pub nbf: i64,
+    pub exp: i64,
+    pub iss: String,
+    pub sub: UserId,      // ← 类型是 UserId，不是 String
+    pub premium: bool,
+    pub name: String,
+    pub email: String,
+    pub email_verified: bool,
+    pub sstamp: String,   // security_stamp
+    pub device: DeviceId,
+    pub devicetype: String,
+    pub client_id: String,
+    pub scope: Vec<String>,
+    pub amr: Vec<String>,
+}
+```
+
+`claims.sub.to_string()` 将 `UserId` 转为字符串作为 `DashMap` 的 key。每个用户的 WebSocket 连接按 `UserId` 分组，同一用户可以有多个并发连接（多个设备）。
+
+**注意：WebSocket 鉴权使用 access_token（`decode_login`），不是 refresh_token（`decode_refresh`）。** access_token 有效期短（默认 2 小时），且包含 `sstamp`（security_stamp）。但 WebSocket 连接建立后不再重新验证 token——如果用户修改密码导致 security_stamp 变更，已建立的 WebSocket 连接不会断开，只是后续的 HTTP API 调用会因 stamp 不匹配而失败。
 
 ### 5.3 匿名 WebSocket（anonymous-hub）
 
@@ -404,9 +533,6 @@ impl<'r> FromRequest<'r> for WsAccessTokenHeader {
 // api/notifications.rs
 #[get("/anonymous-hub?<token..>")]
 fn anonymous_websockets_hub<'r>(ws: WebSocket, token: String, ip: ClientIp) -> Result<rocket_ws::Stream!['r], Error> {
-    info!("Accepting Anonymous Rocket WS connection from {}", ip.ip);
-
-    // ⚠️ 无 JWT 验证！token 直接作为订阅标识
     let (tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
     subscriptions.map.insert(token.clone(), tx);
     // ...
@@ -414,47 +540,40 @@ fn anonymous_websockets_hub<'r>(ws: WebSocket, token: String, ip: ClientIp) -> R
 ```
 
 **匿名 WebSocket 的安全设计：**
-- **无 JWT 验证**：token 直接来自 URL 参数，不做任何签名校验
-- **token 就是订阅 ID**：用于 AuthRequest（登录请求）的推送
-- **token 的生成和验证在别处**：登录流程创建 `AuthRequest` 时生成随机 UUID 作为 token，存入数据库
-- **推送时验证**：push_auth_response 时会检查 token 对应的 AuthRequest 是否存在且有效
-
-**匿名 WebSocket 的安全边界：**
-- 攻击者知道 token 才能建立连接并接收推送
-- token 是随机 UUID，不可猜测
-- token 在用户完成登录或超时后失效（从数据库删除）
-- 匿名 WebSocket 只能接收推送，不能发送任何命令（服务器端忽略所有客户端消息，除 Ping/Pong）
+- **无 JWT 验证**：`token` 直接来自 URL 参数，是 `String` 类型（非 Option），即必须提供
+- **token 就是订阅 ID**：作为 `DashMap` 的 key，用于 AuthRequest 推送
+- **token 生成**：登录流程创建 `AuthRequest` 时生成随机 UUID，存入数据库的 `auth_request` 表
+- **推送时验证**：`push_auth_response` 通过数据库查询 token 对应的 `AuthRequest` 是否存在且有效
+- **只能接收推送**：服务器端忽略除 Ping/Pong 和 INITIAL_MESSAGE 之外的所有客户端消息
 
 ### 5.4 WebSocket 与安全 Header 的协作
 
 ```
 WebSocket 连接建立流程：
-  1. HTTP GET /notifications/hub（携带 Upgrade 头）
-     ↓
-  2. Rocket 路由匹配 → websockets_hub 处理
-     ↓
-  3. FromRequest 守卫执行：
-     - ClientIp → 提取 IP
-     - WsAccessToken → 解析 URL token
-     - WsAccessTokenHeader → 解析 Authorization Header
-     ↓
-  4. 路由处理函数：
-     - Token 优先级检查（URL → Header）
-     - decode_login 验证 JWT（仅 hub）
-     - 注册到 WS_USERS / WS_ANONYMOUS_SUBSCRIPTIONS
-     ↓
-  5. Response Fairing 执行：
-     - AppHeaders → 检测到 WebSocket 握手，跳过安全头
-     - Cors → 根据 Origin 决定是否设置 Allow-Origin
-     ↓
-  6. 协议升级 → WebSocket 连接建立
+
+  HTTP GET /notifications/hub?access_token=xxx
+       │
+       ├─ 1. Rocket FromRequest 守卫执行
+       │   ├─ ClientIp → 提取 IP（可失败，回退到 0.0.0.0）
+       │   └─ WsAccessTokenHeader → 解析 Authorization Header（永远成功）
+       │
+       ├─ 2. 路由处理函数执行
+       │   ├─ Token 优先级：URL 参数 → Header → 401
+       │   ├─ decode_login → JWT 验证（可失败 → 401）
+       │   └─ claims.sub(UserId) → 注册到 WS_USERS
+       │
+       ├─ 3. Response Fairing 执行（此时 JWT 验证结果已确定）
+       │   ├─ AppHeaders → 检测 WebSocket 握手，跳过安全头
+       │   └─ Cors → 根据 Origin 决定 Allow-Origin
+       │
+       └─ 4. 协议升级 → WebSocket 连接建立
 ```
 
 **关键点：**
-- WebSocket 的 JWT 验证在**路由处理函数**中，不是 FromRequest 守卫
-- 安全 Header 的跳过在**响应阶段**，此时 JWT 验证已完成（或失败返回 401）
-- 即使是 401 响应，如果是 WebSocket 握手请求，也会跳过安全 Header
-- CORS 对 WebSocket 的影响：浏览器的 Origin 检查，但 WebSocket 协议本身没有同源限制
+- `WsAccessTokenHeader` 是**非阻塞守卫**（永远 Success），与 `Headers` 守卫的阻塞行为不同
+- JWT 验证在**路由处理函数**中，验证失败返回 401，不会触发安全 Header 例外
+- 只有 JWT 验证成功后协议升级时，AppHeaders 才会跳过安全 Header
+- WebSocket 连接建立后不再重新验证 token → security_stamp 变更不会断开已有连接
 
 ---
 
@@ -732,10 +851,10 @@ ICON_SERVICE_CSP=
 Vaultwarden 的安全防护体系体现了"深度防御"理念，四层防护各有侧重：
 
 1. **限流层**在入口处阻止暴力破解，覆盖密码/SSO/API Key/2FA 邮件发送四类入口，`refresh_login` 因 JWT 自身安全性而豁免限流
-2. **认证守卫层**通过 JWT + security_stamp 确保已认证请求的凭据时效性，`refresh_tokens` 包含旧格式 Base64 token 的兼容逻辑
-3. **WebSocket 层**区分已认证（hub）和匿名（anonymous-hub）两种场景，前者验证 JWT，后者依赖 token 的随机性和数据库验证
+2. **认证守卫层**通过 JWT + security_stamp 确保已认证请求的凭据时效性，`refresh_tokens` 包含旧格式 Base64 token 的兼容逻辑——旧格式跳过 JWT 验证但必须通过数据库 Device 查询，且 `sub=Password` 硬编码会在 `sso_only` 模式下拒绝旧 token
+3. **WebSocket 层**区分已认证（hub）和匿名（anonymous-hub）两种场景：前者使用 `decode_login` 验证 access_token（不是 refresh_token），后者依赖 token 的随机性和数据库验证；`WsAccessTokenHeader` 是非阻塞守卫（永远 Success），JWT 验证延迟到路由处理函数中执行
 4. **安全 Headers 层**通过 CSP/CORS/CORP 等在浏览器端提供防护，WebSocket 握手、connector.html、图片等例外规则均有明确的功能需求和替代安全措施
-5. **CORS 层**采用 Response Fairing 设计，Origin 精确匹配白名单，不匹配时不设置 Allow-Origin 由浏览器拦截
+5. **CORS 层**采用 Response Fairing 设计，在路由处理和数据库查询**之后**才执行，Origin 精确匹配白名单——不匹配时不设置 Allow-Origin 由浏览器拦截响应读取，但服务器端操作已执行完毕；CORS 防跨域数据泄露，与防跨域操作执行的 CSRF Token 互补
 6. **代理支持层**通过 `IP_HEADER` 配置和 `DOMAIN` 硬编码确保在复杂部署环境下安全机制依然有效
 
 各模块通过 Rocket 的 Fairing 和 FromRequest trait 实现解耦，但又在安全逻辑上形成完整的防护链。
