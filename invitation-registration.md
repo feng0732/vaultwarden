@@ -382,58 +382,120 @@ member.save()
 
 **入口**：[restore_member_impl](src/api/core/organizations.rs#L2381-L2420)
 
-**两层边界检查**：
+#### 4.3.1 逐行代码分析
 
 ```rust
-// 第一层：进入分支的条件
-match Membership::find_by_uuid_and_org(member_id, org_id, conn).await {
-    Some(mut member) if member.status < MembershipStatus::Accepted as i32 => {
-        // status < 1 才能进入这个分支
-        // 包括: -128, -127, -126, 0 (Invited!)
-        ...
-        member.restore();  // 第二层检查在 restore() 内部
-        ...
+async fn restore_member_impl(...) -> EmptyResult {
+    // 步骤 1: 组织 ID 校验
+    if org_id != &headers.org_id { err!() }
+
+    // 步骤 2: 匹配分支（第一层检查）
+    match Membership::find_by_uuid_and_org(member_id, org_id, conn).await {
+        Some(mut member) if member.status < MembershipStatus::Accepted as i32 => {
+            // 分支条件: status < 1
+            // 满足条件的 status 值:
+            //   -128 (Revoked Invited)
+            //   -127 (Revoked Accepted)
+            //   -126 (Revoked Confirmed)
+            //   0 (Active Invited) ← 边界情况！
+
+            // 步骤 3: 权限检查
+            if member.user_uuid == headers.user.uuid { err!("You cannot restore yourself") }
+            if member.atype == Owner && headers.membership_type != Owner { err!() }
+
+            // 步骤 4: 调用 restore() 方法（第二层检查在方法内部）
+            member.restore();
+
+            // 步骤 5: 策略检查
+            OrgPolicy::check_user_allowed(&member, "restore", conn).await?;
+
+            // 步骤 6: 保存到数据库
+            member.save(conn).await?;
+
+            // 步骤 7: 记录日志
+            log_event(EventType::OrganizationUserRestored, ...).await;
+        }
+        Some(_) => err!("User is already active"),  // status >= 1 走这里
+        None => err!("User not found in organization"),
     }
-    Some(_) => err!("User is already active"),
-    None => err!("User not found in organization"),
+    Ok(())
 }
 ```
 
-**restore() 内部的第二层检查** [organization.rs#L273-L279](src/db/models/organization.rs#L273-L279)：
+**restore() 方法内部** [organization.rs#L273-L279](src/db/models/organization.rs#L273-L279)：
 ```rust
 pub fn restore(&mut self) -> bool {
-    if self.status < MembershipStatus::Invited as i32 {
-        // status < 0 才真正执行恢复
-        self.status += ACTIVATE_REVOKE_DIFF;
+    // 真正执行恢复的条件: status < 0
+    if self.status < MembershipStatus::Invited as i32 {  // status < 0
+        self.status += ACTIVATE_REVOKE_DIFF;  // +128
         return true;
     }
-    false
+    false  // status >= 0 时返回 false，不修改状态
 }
 ```
 
-**边界分析表**：
+#### 4.3.2 各状态执行明细
 
-| 状态值 | 状态含义 | 第一层检查 (status < 1) | 第二层检查 (status < 0) | 结果 |
-|---|---|---|---|---|
-| -128 | Revoked Invited | ✅ 进入 | ✅ 执行 restore | 恢复到 Invited(0) |
-| -127 | Revoked Accepted | ✅ 进入 | ✅ 执行 restore | 恢复到 Accepted(1) |
-| -126 | Revoked Confirmed | ✅ 进入 | ✅ 执行 restore | 恢复到 Confirmed(2) |
-| 0 | Active Invited | ✅ 进入 | ❌ 不执行 restore | restore 返回 false，无报错 |
-| 1 | Active Accepted | ❌ 不进入 | N/A | 直接报错 "User is already active" |
-| 2 | Active Confirmed | ❌ 不进入 | N/A | 直接报错 "User is already active" |
+| status | 状态 | 进入分支 | restore()修改状态 | 策略检查 | save() | log_event() | 实际效果 |
+|---|---|---|---|---|---|---|---|
+| -128 | Revoked Invited | ✅ | ✅ (0→-128) | ✅ 执行 | ✅ | ✅ | 恢复到 Invited |
+| -127 | Revoked Accepted | ✅ | ✅ (1→-127) | ✅ 执行 | ✅ | ✅ | 恢复到 Accepted |
+| -126 | Revoked Confirmed | ✅ | ✅ (2→-126) | ✅ 执行 | ✅ | ✅ | 恢复到 Confirmed |
+| **0** | **Active Invited** | ✅ | ❌ | ✅ 调用但空检查 | ✅ | ✅ | **无状态变化但记录日志** |
+| 1 | Active Accepted | ❌ | N/A | N/A | N/A | N/A | 报错 "User is already active" |
+| 2 | Active Confirmed | ❌ | N/A | N/A | N/A | N/A | 报错 "User is already active" |
 
-**⚠️ 边界行为**：Active Invited 状态（status=0）的成员调用 restore API：
-- 第一层检查通过，进入分支
-- 但 restore() 内部不执行任何操作（返回 false）
-- 不会报错，也不会记录日志
-- 最终效果：静默的空操作
+#### 4.3.3 Active Invited (status=0) 详细拆解
 
-**恢复前置检查**（进入分支后）：
-1. 不能恢复自己
-2. 恢复 Owner 需要自己是 Owner
-3. `member.restore()` 执行（status += 128）
-4. 【策略检查】`OrgPolicy::check_user_allowed` → 恢复后验证当前状态是否符合策略
-5. 保存并记录日志
+**⚠️ 关键发现：Active Invited 调用 restore 不是静默空操作！**
+
+| 环节 | 执行情况 | 说明 |
+|---|---|---|
+| 进入分支 | ✅ 执行 | `status=0 < 1` 满足条件 |
+| `member.restore()` | ✅ 方法被调用 | 但内部 `status < 0` 不满足，返回 false，**不修改 status** |
+| 策略检查 | ✅ 执行 | `status=0 > 0` 为假，直接通过（**不做实际检查**） |
+| `member.save()` | ✅ 执行 | 空保存，数据库无变化 |
+| `log_event()` | ✅ 执行 | **记录 OrganizationUserRestored 事件** |
+
+**最终行为**：
+- API 返回 200 OK（成功）
+- Membership 状态保持 Invited(0) 不变
+- 但事件日志中会多一条"用户已恢复"的记录
+- 策略检查实际没有检查任何内容（因为 status=0 被豁免）
+
+#### 4.3.4 策略检查的豁免条件
+
+[OrgPolicy::check_user_allowed](src/db/models/org_policy.rs#L284)：
+```rust
+if m.atype < MembershipType::Admin && m.status > (MembershipStatus::Invited as i32) {
+    // 只有非 Admin 且 status > 0 才检查
+    // status = 0 (Invited) 被豁免
+}
+```
+
+这意味着：
+- **Admin/Owner 角色**：永远豁免策略检查
+- **Invited 状态**：永远豁免策略检查（包括被恢复的 Active Invited）
+
+#### 4.3.5 恢复流程总结
+
+**正常恢复流程（Revoked 状态）**：
+1. `member.restore()` → status += 128，回到撤销前的状态
+2. `check_user_allowed` → 用恢复后的真实状态检查策略
+3. `member.save()` → 保存状态变化
+4. `log_event()` → 记录恢复事件
+
+**边界场景（Active Invited）**：
+1. `member.restore()` → 不修改状态（返回 false）
+2. `check_user_allowed` → status=0 被豁免，直接通过
+3. `member.save()` → 空保存
+4. `log_event()` → 记录恢复事件（但实际什么也没恢复）
+
+**设计意图注释** [organizations.rs#L2400-L2401](src/api/core/organizations.rs#L2400-L2401)：
+```rust
+// This check need to be done after restoring to work with the correct status
+```
+策略检查必须在 restore() 之后执行，这样才能用恢复后的真实状态进行验证。
 
 **关键点**：恢复时做策略检查！因为用户在被撤销期间可能：
 - 关闭了 2FA → 恢复时如果组织要求 2FA 就会失败
@@ -515,11 +577,25 @@ pub fn restore(&mut self) -> bool {
 
 ### 6.4 Active Invited 调用 restore 会怎样？
 
-静默的空操作！不报错，也不改变状态。这是一个边界行为：
-- 第一层条件 `status < 1` 通过
-- 第二层条件 `status < 0` 不通过
-- restore() 返回 false，不执行操作
-- 不调用策略检查，不记录日志
+**不是静默的空操作！** 这是代码设计的一个边界场景：
+
+| 环节 | 执行情况 |
+|---|---|
+| 进入分支 | ✅ 是（status=0 < 1） |
+| restore() 方法被调用 | ✅ 是 |
+| restore() 修改状态 | ❌ 否（status=0 不满足 < 0） |
+| 策略检查被调用 | ✅ 是 |
+| 策略检查实际做检查 | ❌ 否（status=0 被豁免） |
+| member.save() | ✅ 是（空保存） |
+| log_event() | ✅ 是（记录恢复事件） |
+
+**最终效果**：
+- API 返回 200 成功
+- 状态保持 Invited(0) 不变
+- **但事件日志多了一条"用户已恢复"的记录**
+- 没有实际恢复任何东西
+
+这本质上是一个设计上的"漏洞"：外层分支条件（status < 1）和内层 restore() 条件（status < 0）之间有 gap，导致 status=0 这个中间态被误判为"需要恢复"。
 
 ---
 
