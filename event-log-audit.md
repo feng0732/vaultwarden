@@ -661,9 +661,139 @@ pub async fn clean_events(conn: &DbConn) -> EmptyResult {
 
 ---
 
-## 9. 总结
+## 9. 特殊案例分析：1513/1514 号事件的设计矛盾
 
-### 9.1 设计核心原则
+### 9.1 事件类型范围与写入入口的对照
+
+首先明确两大写入入口的适用范围：
+
+| 写入入口 | 设计适用的事件类型范围 | 填充字段规则 |
+|----------|------------------------|-------------|
+| `log_user_event()` | **1000-1099** 用户事件 | `user_uuid` = `act_user_uuid` = 传入的用户ID<br>每个组织各写一条副本<br>`org_user_uuid` = 该用户在对应组织的成员关系ID |
+| `log_event()` | **1100-1799** 组织类事件 | `user_uuid` = None<br>按类型填充 `cipher_uuid`/`org_user_uuid` 等<br>只写单条组织内记录 |
+
+代码中的范围校验注释：
+```rust
+// [src/api/core/events.rs:292]
+// 1000..=1099 Are user events, they need to be logged via log_user_event()
+// 1100..=1199 Cipher Events
+// ...
+// 1500..=1599 Org User Events → log_event() 处理
+```
+
+### 9.2 1513/1514 号事件的异常处理
+
+**事件定义**（组织用户事件范围）：
+```rust
+// [src/db/models/event.rs:107-108]
+OrganizationUserApprovedAuthRequest = 1513,  // 组织用户事件范围
+OrganizationUserRejectedAuthRequest = 1514,  // 组织用户事件范围
+```
+
+**实际调用**（使用了用户事件入口）：
+```rust
+// [src/api/core/accounts.rs:1594-1600]
+log_user_event(
+    EventType::OrganizationUserApprovedAuthRequest as i32,  // 1513，属于1500-1599
+    &headers.user.uuid,     // 审批者用户ID
+    headers.device.atype,
+    &headers.ip.ip,
+    &conn,
+)
+.await;
+```
+
+### 9.3 为什么用 log_user_event 而不是 log_event？
+
+#### 对比两种写入方式的字段填充结果
+
+假设场景：**管理员B** 批准了 **用户A** 的设备登录请求。
+
+**如果用 `log_event`**（符合类型范围的设计）：
+```rust
+log_event(
+    1513,
+    &用户A的成员关系ID,    // source_uuid = 被审批的成员
+    &org_id,
+    &headers.user.uuid,   // act_user = 审批者B
+    ...
+)
+```
+填充结果：
+- `org_user_uuid` = 用户A的成员关系ID ✅（语义正确，目标成员是A）
+- `act_user_uuid` = 管理员B ✅（操作者是B）
+- `user_uuid` = None ❌（查询用户A的事件时查不到）
+- 只写入该组织内一条记录
+
+**实际用 `log_user_event`**（当前代码的实现）：
+```rust
+log_user_event(
+    1513,
+    &headers.user.uuid,   // user_id = 审批者B
+    ...
+)
+```
+填充结果（来自 [src/api/core/events.rs:240-258](src/api/core/events.rs#L240-L258)）：
+- `user_uuid` = 管理员B ✅（审批者B的身份）
+- `act_user_uuid` = 管理员B ✅（审批者B的操作）
+- `org_user_uuid` = 管理员B自己的成员关系ID ❌（语义错误！应该是用户A的）
+- 在审批者B的全局 + 每个所属组织各写一条副本
+
+### 9.4 字段归属详解
+
+| 字段 | 填充值 | 语义是否正确 | 说明 |
+|------|--------|-------------|------|
+| `event_type` | 1513/1514 | ✅ | 正确的事件类型 |
+| `user_uuid` | 审批者B的ID | ⚠️ 混合语义 | 本应表示"事件主体"，但这里表示"审批者" |
+| `act_user_uuid` | 审批者B的ID | ✅ | 正确，实际执行操作的人 |
+| `org_user_uuid` | 审批者B的成员关系ID | ❌ 错误 | 应该是"被审批用户A"的成员关系ID |
+| `org_uuid` | 审批者B所属的组织 | ✅ | 正确的组织归属 |
+
+### 9.5 设计意图与权衡
+
+**为什么这样设计？**
+
+1. **以审批者为中心**：设备审批本质上是"审批者执行了一个审批操作"，需要记录在审批者的活动轨迹中
+2. **自审批场景**：绝大多数情况下，用户审批的是自己的新设备登录（`auth_request.user_uuid` == `headers.user.uuid`）
+3. **多组织同步**：如果审批者属于多个组织，需要在每个组织都记录这条事件（`log_user_event` 的双轨特性）
+4. **简化调用**：`log_user_event` 不需要额外传入 `source_uuid` 和 `org_id` 参数，调用更简单
+
+**存在的问题**：
+
+1. **语义不一致**：1500-1599 范围的事件应该用 `org_user_uuid` 标识目标成员，但这里填充的是审批者自己的
+2. **跨用户审批场景**：如果管理员B审批用户A的请求，查询用户A的事件列表时**看不到**这条审批记录
+3. **类型范围不匹配**：代码注释明确说 1000-1099 才用 `log_user_event`，但 1513/1514 打破了这个约定
+
+**代码证据 - AuthRequest 结构**：
+```rust
+// [src/db/models/auth_request.rs:22-24]
+pub struct AuthRequest {
+    pub user_uuid: UserId,                  // 请求登录的用户（被审批者）
+    pub organization_uuid: Option<OrganizationId>,
+    // ...
+}
+
+// 审批时的当前用户是 headers.user.uuid（审批者）
+// 两者可能相同（自审批）也可能不同（管理员代批）
+```
+
+### 9.6 审计查询影响
+
+| 查询场景 | 能否查到 1513/1514 事件？ | 原因 |
+|----------|-------------------------|------|
+| 查询审批者B的事件 | ✅ 能 | `user_uuid` 或 `act_user_uuid` 匹配B |
+| 查询被审批者A的事件（自审批时A==B） | ✅ 能 | 两者相同，匹配 |
+| 查询被审批者A的事件（管理员B代批时） | ❌ 不能 | A既不是 `user_uuid` 也不是 `act_user_uuid` |
+| 按 `org_user_uuid` 查询A的被操作记录 | ❌ 不能 | `org_user_uuid` 存的是B的关系ID |
+
+**关键结论**：
+> 1513/1514 号事件是一个**设计特例**——它们在数值上属于组织用户事件范围（1500-1599），但语义和实现上都是"审批者的用户事件"。`org_user_uuid` 字段在这里被错误地填充为审批者自己的成员关系ID，而不是被审批者的。这导致跨用户审批场景下，被审批用户的审计轨迹不完整。
+
+---
+
+## 10. 总结
+
+### 10.1 设计核心原则
 
 1. **双轨记录**：用户事件采用"全局+组织副本"双轨模式，确保审计完整性
 2. **角色分离**：`user_uuid`（主体）与 `act_user_uuid`（操作者）分离，支持管理员操作审计
@@ -672,8 +802,9 @@ pub async fn clean_events(conn: &DbConn) -> EmptyResult {
 5. **全链路开关**：`org_events_enabled` 在所有入口点检查，关闭时完全无性能损耗
 6. **客户端时间保留**：上报事件使用客户端日期，确保审计时间线准确
 7. **⚠️ 成员查询边界**：成员接口只覆盖 `user_uuid` 和 `act_user_uuid` 身份轨迹，**不覆盖** `organizationUserId` 目标成员维度
+8. **⚠️ 特例设计**：1513/1514 号审批事件打破类型范围约定，用 `log_user_event` 记录审批者活动
 
-### 9.2 审计查询建议
+### 10.2 审计查询建议
 
 | 审计目标 | 查询方式 | 关键字段 | 覆盖范围说明 |
 |----------|----------|----------|-------------|
@@ -682,9 +813,9 @@ pub async fn clean_events(conn: &DbConn) -> EmptyResult {
 | ⚠️ 针对某成员的操作历史 | **不能**通过成员查询接口，需直接查 `org_user_uuid` | `organizationUserId` | ❌ 成员查询接口不覆盖此字段，需自行SQL查询 |
 | 组织安全审计 | 按 `org_uuid` 分页查询 | `organizationId`, `event_type` | ✅ 组织内所有事件 |
 | 敏感操作追踪 | 按 `event_type` 过滤特定事件 | `type`, `ipAddress` | ✅ 所有类型的特定事件 |
-| ⚠️ 指定成员轨迹查询 | 调用成员事件查询接口 | 内部匹配 `user_uuid` OR `act_user_uuid` | ✅ 该用户做了什么 + 该用户作为主体的用户事件<br>❌ **不包含** 针对该成员的组织用户操作（如被邀请、被移除） |
+| ⚠️ 指定成员轨迹查询 | 调用成员事件查询接口 | 内部匹配 `user_uuid` OR `act_user_uuid` | ✅ 该用户做了什么 + 该用户作为主体的用户事件<br>❌ **不包含** 针对该成员的组织用户操作（如被邀请、被移除）<br>❌ **不包含** 该用户被他人审批的记录（跨用户审批场景） |
 
-### 9.3 成员接口覆盖边界详解
+### 10.3 成员接口覆盖边界详解
 
 **代码证据**：[src/db/models/event.rs:292-316](src/db/models/event.rs#L292-L316)
 
@@ -709,12 +840,27 @@ pub async fn clean_events(conn: &DbConn) -> EmptyResult {
 | 管理员B移除用户A | `org_user_uuid=A的成员关系ID`, `act_user_uuid=B` | ❌ 查A：不能<br>✅ 查B：能 | 同上 |
 | 用户A主动离开组织 | `org_user_uuid=A的成员关系ID`, `act_user_uuid=A` | ✅ 能 | 匹配条件2（act_user_uuid=A） |
 | 用户A创建集合 | `act_user_uuid=A` | ✅ 能 | 匹配条件2 |
+| 管理员B批准用户A的设备登录 | `org_user_uuid=B的成员关系ID`, `act_user_uuid=B`, `user_uuid=B` | ❌ 查A：不能<br>✅ 查B：能 | 1513/1514事件填充的是B的信息 |
 
 **关键结论**：
 > 成员查询接口是以"**用户身份**"为中心的活动追踪，不是以"**成员关系**"为中心的操作追踪。
-> 如果需要审计"针对某成员的所有操作"（如谁邀请了他、谁移除了他），必须直接查询 `org_user_uuid` 字段，当前API不提供此能力。
+> 如果需要审计"针对某成员的所有操作"（如谁邀请了他、谁移除了他、谁批准了他的设备登录），必须直接查询 `org_user_uuid` 字段，当前API不提供此能力。
 
-### 9.4 代码溯源路径
+### 10.4 1513/1514 事件总结表
+
+| 项目 | 说明 |
+|------|------|
+| 事件编号 | 1513 (OrganizationUserApprovedAuthRequest)<br>1514 (OrganizationUserRejectedAuthRequest) |
+| 类型范围 | 1500-1599（组织用户事件） |
+| 实际使用入口 | `log_user_event()`（本该用于1000-1099用户事件） |
+| `org_user_uuid` | 填充审批者自己的成员关系ID（语义错误） |
+| `user_uuid` | 填充审批者ID |
+| `act_user_uuid` | 填充审批者ID |
+| 自审批场景 | 正常，能查到 |
+| 跨用户审批场景 | 被审批者查不到，只有审批者能查到 |
+| 设计意图 | 以审批者为中心，记录审批者的操作活动 |
+
+### 10.5 代码溯源路径
 
 ```
 配置定义:
@@ -723,17 +869,20 @@ pub async fn clean_events(conn: &DbConn) -> EmptyResult {
 数据模型:
   src/db/models/event.rs (Event 结构体, EventType 枚举, 查询方法)
     - 注意 find_by_org_and_member 只过滤 user_uuid 和 act_user_uuid
+  src/db/models/auth_request.rs (AuthRequest 结构，包含 user_uuid=被审批者)
 
 记录入口:
   src/api/core/events.rs (log_user_event, log_event, 客户端收集)
-    - log_user_event: 填充 user_uuid 和 act_user_uuid
+    - log_user_event: 填充 user_uuid 和 act_user_uuid，多组织副本
     - log_event: 组织用户事件填充 org_user_uuid 和 act_user_uuid，不填充 user_uuid
+    - ⚠️ 1513/1514 事件例外：用 log_user_event 记录
 
 事件触发点:
   用户类:     src/api/identity.rs, src/api/core/accounts.rs
   组织类:     src/api/core/organizations.rs (邀请/移除成员等事件填充 org_user_uuid)
   密码库类:   src/api/core/ciphers.rs
   2FA类:      src/api/core/two_factor/*.rs
+  ⚠️ 特例:     src/api/core/accounts.rs:1594/1605 (1513/1514用log_user_event)
 
 查询API:
   src/api/core/events.rs
@@ -745,13 +894,14 @@ pub async fn clean_events(conn: &DbConn) -> EmptyResult {
   src/util.rs (parse_date)
 ```
 
-### 9.5 审计工作流程图
+### 10.6 审计工作流程图
 
 ```
 记录阶段:
   事件触发 → log_user_event/log_event → 填充各字段 → 写入DB
-    用户类事件: user_uuid=用户, act_user_uuid=用户
-    组织用户事件: org_user_uuid=成员关系, act_user_uuid=操作者 (user_uuid=None)
+    用户类事件 (1000-1099): user_uuid=用户, act_user_uuid=用户
+    组织用户事件 (1500-1599): org_user_uuid=成员关系, act_user_uuid=操作者 (user_uuid=None)
+    ⚠️ 特例 1513/1514: 虽然是1500-1599，但用log_user_event，user_uuid=审批者
 
 查询阶段 (成员接口):
   输入 member_id → JOIN users_organizations → 得到 user_id
