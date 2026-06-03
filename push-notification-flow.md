@@ -1204,3 +1204,293 @@ async fn deauth_user(user_id: UserId, _token: AdminToken, conn: DbConn, nt: Noti
 - 补充 `Headers` 认证守卫
 - 让清理 Token API 与设置 Token API 使用相同的定位逻辑
 - 最小改动，最大一致性
+
+---
+
+## 十四、Relay 注销与 Token 清理的失败边界
+
+### 14.1 `unregister_push_device` 未检查 HTTP 状态码
+
+#### 与 `register_push_device` 的对比
+
+**注册**：[push.rs#L119-L129](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/api/push.rs#L119-L129)
+
+```rust
+if let Err(e) = make_http_request(Method::POST, &(...))?
+    .header(...)
+    .json(&data)
+    .send()
+    .await?
+    .error_for_status()     // ← 检查了 HTTP 状态码！
+{
+    err!(format!("An error occurred while proceeding registration of a device: {e}"));
+}
+```
+
+注册使用 `.error_for_status()` 将 4xx/5xx 响应转为 `Err`，确保注册失败能被发现。
+
+**注销**：[push.rs#L146-L156](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/api/push.rs#L146-L156)
+
+```rust
+match make_http_request(
+    Method::POST,
+    &format!("{}/push/delete/{}", CONFIG.push_relay_uri(), push_id.as_ref().unwrap()),
+)?
+.header(AUTHORIZATION, auth_header)
+.send()
+.await
+{
+    Ok(r) => r,                                                    // ← 直接丢弃响应体！
+    Err(e) => err!(format!("An error occurred during device unregistration: {e}")),
+};
+Ok(())
+```
+
+**问题**：
+- `Ok(r)` 分支只返回 `r`（Response 对象），但没有调用 `.error_for_status()`
+- 即使 Relay 返回 `404 Not Found`、`401 Unauthorized`、`500 Internal Server Error`，代码也认为注销成功
+- `match` 只捕获**网络层错误**（DNS 失败、连接超时等），不捕获**应用层错误**
+- 最终 `Ok(())` 无条件返回成功
+
+#### 具体影响
+
+| Relay 返回 | 注册 `register_push_device` | 注销 `unregister_push_device` |
+|-----------|---------------------------|------------------------------|
+| 200 OK | ✓ 成功 | ✓ 成功（但未读响应体） |
+| 400 Bad Request | ✗ 报错，传播给调用方 | **✓ 静默成功** |
+| 401 Unauthorized | ✗ 报错 | **✓ 静默成功** |
+| 404 Not Found | ✗ 报错 | **✓ 静默成功** |
+| 500 Internal Error | ✗ 报错 | **✓ 静默成功** |
+| 网络超时/断连 | ✗ 报错 | ✗ 报错 |
+
+**后果**：Relay 端注销可能实际失败（如 push_id 不存在、token 过期），但 Vaultwarden 认为已注销，本地数据已清理，形成"假注销"。
+
+---
+
+### 14.2 `push_enabled` 关闭时本地 Token 未清理
+
+#### `put_clear_device_token` 的提前返回
+
+[accounts.rs#L1431-L1433](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/api/core/accounts.rs#L1431-L1433)
+
+```rust
+if !CONFIG.push_enabled() {
+    return Ok(());    // ← 直接返回，不清空数据库！
+}
+```
+
+**问题**：
+- 当 `push_enabled = false` 时，**整个函数体被跳过**
+- 数据库中的 `push_token` 和 `push_uuid` **原封不动**
+- 即使客户端调用了 `clear-token` API，也不会清空本地存储
+
+#### 对比 `unregister_push_device` 的处理
+
+[push.rs#L138-L141](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/api/push.rs#L138-L141)
+
+```rust
+pub async fn unregister_push_device(push_id: Option<&PushId>) -> EmptyResult {
+    if !CONFIG.push_enabled() || push_id.is_none() {
+        return Ok(());    // ← push_enabled=false 时也跳过
+    }
+    // ...
+}
+```
+
+**两个层级都有相同的守门逻辑**，导致 `push_enabled = false` 时：
+
+```
+put_clear_device_token()
+  → push_enabled=false → return Ok(())     ← 第一道门：整个函数跳过
+  → (不会执行到) Device::clear_push_token_by_uuid()
+  → (不会执行到) unregister_push_device()
+```
+
+#### 运维场景
+
+```
+初始状态：push_enabled=true
+  设备已注册到 Relay，数据库有 push_token + push_uuid
+
+管理员关闭推送：push_enabled=false
+  客户端调用 clear-token → 被跳过，数据库 token 仍在
+
+后续如果重新启用：push_enabled=true
+  数据库中的 push_token 可能已过期（FCM/APNs token 有生命周期）
+  Relay 端可能已清理过期注册
+  → 但数据库仍认为设备有 push_token
+  → check_user_has_push_device 返回 true
+  → 推送尝试发送但实际无法到达
+```
+
+---
+
+### 14.3 `push_uuid` 为空时仅清库不注销
+
+#### `unregister_push_device` 的 `push_id.is_none()` 短路
+
+[push.rs#L139-L141](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/api/push.rs#L139-L141)
+
+```rust
+if !CONFIG.push_enabled() || push_id.is_none() {
+    return Ok(());    // ← push_uuid 为 None 时直接跳过 Relay 注销
+}
+```
+
+#### 触发场景
+
+`push_uuid` 为 `None` 的可能原因：
+
+1. **数据迁移**：从旧版本升级时，旧设备记录没有 `push_uuid` 字段
+2. **注册失败残留**：`register_push_device` 在生成 `push_uuid` 之后、保存之前失败（极端情况）
+3. **手动数据库修改**：管理员直接操作数据库清空了 `push_uuid`
+
+#### `put_clear_device_token` 中的执行链
+
+```rust
+if let Some(device) = Device::find_by_uuid(&device_id, &conn).await {  // ① 找到设备
+    Device::clear_push_token_by_uuid(&device_id, &conn).await?;        // ② 清空 token
+    unregister_push_device(device.push_uuid.as_ref()).await?;           // ③ 注销
+}
+```
+
+当 `device.push_uuid = None` 时：
+
+- 步骤 ①：`find_by_uuid` 仍然能找到设备（push_uuid 为空不影响查询）
+- 步骤 ②：`clear_push_token_by_uuid` 执行成功，清空了 `push_token`
+- 步骤 ③：`unregister_push_device(None)` → `push_id.is_none()` → `return Ok(())`，**跳过 Relay 注销**
+
+**这个行为是合理的**——如果 `push_uuid` 为 None，设备本来就没有在 Relay 上注册过，无需注销。但问题在于：
+
+- 数据库中 `push_token` 可能非空（之前注册到了某个现已丢失的 push_uuid 对应的 Relay 记录）
+- 此时 `clear_push_token_by_uuid` 清空了 token，但 Relay 上可能存在悬空注册
+- **由于 push_uuid 丢失，无法定位 Relay 上的注册记录进行清理**
+
+---
+
+### 14.4 Admin deauth 复用相同注销逻辑的边界
+
+#### `deauth_user` 的实现
+
+[admin.rs#L463-L482](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/api/admin.rs#L463-L482)
+
+```rust
+async fn deauth_user(user_id: UserId, _token: AdminToken, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
+    let mut user = get_user_or_404(&user_id, &conn).await?;
+    nt.send_logout(&user, None, &conn).await;
+
+    if CONFIG.push_enabled() {
+        for device in Device::find_push_devices_by_user(&user.uuid, &conn).await {
+            match unregister_push_device(device.push_uuid.as_ref()).await {
+                Ok(r) => r,
+                Err(e) => error!("Unable to unregister devices from Bitwarden server: {e}"),
+            }
+        }
+    }
+
+    Device::delete_all_by_user(&user.uuid, &conn).await?;
+    user.reset_security_stamp(&conn).await?;
+    user.save(&conn).await
+}
+```
+
+#### 继承了 `unregister_push_device` 的所有边界问题
+
+| 问题 | 在 deauth 中的表现 | 后果 |
+|------|-------------------|------|
+| **不检查 HTTP 状态码** | Relay 返回 4xx/5xx 时仍认为注销成功 | 悬空注册残留 |
+| **push_uuid 为 None 时跳过** | `find_push_devices_by_user` 返回 `push_token IS NOT NULL` 的设备，但其中可能有 `push_uuid = NULL` 的 | 仅清库不注销 Relay |
+| **注销失败不阻塞** | `error!("...")` 仅打日志，循环继续 | 部分设备注销失败不影响后续 |
+
+#### 特有边界：`push_enabled` 时的本地清理
+
+```rust
+if CONFIG.push_enabled() {
+    for device in Device::find_push_devices_by_user(&user.uuid, &conn).await {
+        match unregister_push_device(device.push_uuid.as_ref()).await { ... }
+    }
+}
+
+Device::delete_all_by_user(&user.uuid, &conn).await?;  // ← 无论 push_enabled 都执行
+```
+
+与 `put_clear_device_token` 不同，Admin deauth **始终**会执行 `delete_all_by_user`：
+- `push_enabled = true`：先尝试 Relay 注销，再删除数据库中所有设备记录
+- `push_enabled = false`：跳过 Relay 注销，但仍然删除数据库记录
+
+**这意味着**：即使 `push_enabled = false`，Admin deauth 也能清空本地数据，而 `put_clear_device_token` 则完全跳过。两种清理路径在 `push_enabled = false` 时的行为不一致。
+
+#### 特有边界：注销与删除的时序
+
+```
+for device in find_push_devices_by_user(...) {
+    unregister_push_device(...)     // ← 可能失败
+}
+delete_all_by_user(...)             // ← 无论注销成功与否都执行
+```
+
+如果注销失败（网络错误），设备记录仍会被 `delete_all_by_user` 删除：
+- 数据库中已无该设备记录
+- Relay 上该设备的 `push_uuid` 仍注册着
+- **永远没有机会再次清理这个 Relay 注册**（因为本地记录已删除，不知道 push_uuid 是什么了）
+
+#### 完整的失败边界对比
+
+| 场景 | `put_clear_device_token` | `deauth_user` |
+|------|-------------------------|---------------|
+| Relay 返回 4xx/5xx | 静默成功（不检查状态码） | 静默成功（不检查状态码） |
+| Relay 网络不可达 | `err!` 传播，API 报错 | `error!` 日志，继续循环 |
+| `push_enabled = false` | **完全跳过**，本地数据不动 | 跳过注销，但删除本地记录 |
+| `push_uuid = None` | 清空 token，跳过注销 | 跳过注销，设备记录被删除 |
+| 注销失败后本地数据 | token 已清空（步骤 ② 先执行） | **设备记录被删除** |
+| 可恢复性 | 用户重新登录+上报 token 可恢复 | 无法恢复（push_uuid 丢失） |
+
+---
+
+### 14.5 失败边界总结图
+
+```
+                          ┌─────────────────────────┐
+                          │  clear-token API 调用    │
+                          └────────────┬────────────┘
+                                       │
+                          ┌────────────▼────────────┐
+                          │  push_enabled = false?   │
+                          └────┬──────────────┬─────┘
+                            YES│              │NO
+                               ▼              ▼
+                    ┌──────────────┐  ┌───────────────────────┐
+                    │ return Ok()  │  │ find_by_uuid(device_id)│
+                    │ 本地数据不动  │  └──────────┬────────────┘
+                    └──────────────┘             │
+                                        ┌───────▼────────┐
+                                        │  device 存在?   │
+                                        └┬──────────────┬─┘
+                                    YES  │              │NO
+                                         ▼              ▼
+                           ┌────────────────────┐  ┌──────────┐
+                           │ clear_push_token    │  │ return   │
+                           │ (批量清空 token)    │  │ Ok()     │
+                           └────────┬───────────┘  └──────────┘
+                                    │
+                           ┌───────▼────────────┐
+                           │ push_uuid = None?   │
+                           └┬─────────────────┬─┘
+                        YES │                 │NO
+                            ▼                 ▼
+                   ┌──────────────┐  ┌─────────────────────┐
+                   │ return Ok()  │  │ unregister_push_     │
+                   │ 库清了，     │  │ device(push_uuid)    │
+                   │ Relay 没清   │  └──────────┬──────────┘
+                   └──────────────┘             │
+                                    ┌───────────▼───────────┐
+                                    │ HTTP 请求发送到 Relay  │
+                                    └──┬─────────────────┬──┘
+                                 网络OK│                 │网络失败
+                                       ▼                 ▼
+                              ┌─────────────┐   ┌──────────────┐
+                              │ 不检查状态码 │   │ err! 传播    │
+                              │ 4xx也当成功  │   │ API 报错     │
+                              │ "假注销"    │   │ 但 token 已清│
+                              └─────────────┘   └──────────────┘
+```
