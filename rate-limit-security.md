@@ -82,7 +82,10 @@ pub fn check_limit_admin(ip: &IpAddr) -> Result<(), Error>
 
 3. **避免影响正常用户体验**：已认证用户的 token 刷新是高频操作（access_token 默认 2 小时过期），限流会严重影响使用流畅度。
 
-4. **失败成本高**：无效的 refresh_token 会在验证阶段就被拒绝，不会触发任何数据库查询，对服务器压力极小。
+4. **失败成本分析**：需要区分两种无效 token 的场景：
+   - **格式正确的过期 JWT**：`decode_refresh` 返回 `Err` → 进入旧格式回退分支 → 构造假 claims → **触发 `Device::find_by_refresh_token` 数据库查询** → 查询不到记录 → 返回错误。这意味着每次 JWT 解码失败（包括过期、签名无效等）都会产生一次数据库查询。
+   - **纯随机字符串**：同样 `decode_refresh` 返回 `Err` → 同样触发数据库查询。
+   - 但数据库查询是**精确匹配索引查询**（`WHERE refresh_token = ?`），开销极小。真正的保护在于攻击者无法在数据库中找到匹配记录——必须先获取真实存在的 refresh_token 值。
 
 ### 2.3 旧格式 token 兼容——refresh_tokens 的回退逻辑
 
@@ -382,6 +385,9 @@ async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Respons
 请求到达
   │
   ├─ 1. Rocket 路由匹配
+  │     ├─ 有匹配路由 → 进入步骤 2
+  │     └─ 无匹配路由（如 OPTIONS）→ catcher 生成 404 → 跳到步骤 4
+  │
   ├─ 2. FromRequest 守卫执行（ClientIp、Headers 等）
   ├─ 3. 路由处理函数执行 ← 数据库查询在这里发生
   │     （无论 Origin 是否匹配，业务逻辑都已执行）
@@ -389,6 +395,7 @@ async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Respons
   ├─ 4. Response Fairing 执行 ← Cors 在这里
   │     ├─ Origin 匹配 → 设置 Allow-Origin
   │     └─ Origin 不匹配 → 不设置 Allow-Origin
+  │     └─ OPTIONS 404 → 改写为 200 OK + CORS Header + 空响应体
   │
   └─ 5. 响应返回给客户端
        ├─ 浏览器检查 Allow-Origin
@@ -400,6 +407,8 @@ async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Respons
 **安全含义：**
 
 - CORS 保护的是**浏览器端的数据读取**，不是服务器端的操作执行
+- **实际请求**（GET/POST）：路由匹配成功 → 数据库查询执行 → Cors Fairing 只在响应上添加 Header → Origin 不匹配时浏览器拦截 JS 读取，但服务器操作已执行
+- **OPTIONS 预检**：路由不匹配 → catcher 生成 404 → Cors 改写为 200 → **不触发数据库查询**
 - 恶意网站向 Vaultwarden 发起跨域请求时：
   - 如果 Origin 不匹配白名单 → 浏览器阻止 JS 读取响应 → 恶意网站拿不到数据
   - 但服务器**已经执行了**数据库查询等操作 → 这是 CSRF 的防护领域，不是 CORS 的职责
@@ -416,7 +425,7 @@ async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Respons
 
 **回显设计的安全含义：** 任何请求方法和自定义 Header 都被允许（只要 Origin 匹配），这是一种"宽松许可"策略。安全性完全依赖 Origin 白名单的精确性——如果白名单中的一个 Origin 被攻陷，攻击者可以发起任意方法和 Header 的跨域请求。
 
-**OPTIONS 请求是否经过路由处理？** 是的。Rocket 的路由处理在 Fairing 之前执行。但 Rocket 默认没有匹配 OPTIONS 方法的路由，所以 OPTIONS 请求通常在路由匹配阶段就得到 404 响应，然后 Cors Fairing 将其改写为 200 OK + CORS Header + 空响应体。
+**OPTIONS 请求是否经过路由处理？** 通常不会。Rocket 默认没有匹配 OPTIONS 方法的路由，OPTIONS 请求在路由匹配阶段得到 404 → 由注册的 catcher（如 `api_not_found`）生成 404 响应 → Cors Fairing 将其改写为 200 OK + CORS Header + 空响应体。所以 OPTIONS 请求**不经过路由处理函数，不触发数据库查询**。
 
 ---
 
@@ -525,7 +534,14 @@ pub struct LoginJwtClaims {
 
 `claims.sub.to_string()` 将 `UserId` 转为字符串作为 `DashMap` 的 key。每个用户的 WebSocket 连接按 `UserId` 分组，同一用户可以有多个并发连接（多个设备）。
 
-**注意：WebSocket 鉴权使用 access_token（`decode_login`），不是 refresh_token（`decode_refresh`）。** access_token 有效期短（默认 2 小时），且包含 `sstamp`（security_stamp）。但 WebSocket 连接建立后不再重新验证 token——如果用户修改密码导致 security_stamp 变更，已建立的 WebSocket 连接不会断开，只是后续的 HTTP API 调用会因 stamp 不匹配而失败。
+**注意：WebSocket 鉴权使用 access_token（`decode_login`），不是 refresh_token（`decode_refresh`）。** access_token 有效期短（默认 2 小时），且包含 `sstamp`（security_stamp）。WebSocket 连接建立后不再重新验证 token，但服务器端的安全事件会通过 **WebSocket 推送通知客户端主动断开**：
+
+- 密码修改时调用 `nt.send_logout(&user, Some(&headers.device), &conn)` (accounts.rs)
+- 该方法通过 WebSocket 向该用户的所有连接推送 `UpdateType::LogOut` 消息
+- 客户端收到 LogOut 后主动清除本地状态并断开连接
+- **注意**：`send_logout` 的 `acting_device` 参数为 `Some(&headers.device)`，客户端收到后会排除发起操作的设备（避免自己登出自己），其他设备的 WebSocket 连接会收到登出通知
+
+这意味着 WebSocket 连接的"断开"不是由服务器验证 token 主动切断，而是由服务器推送通知驱动客户端**主动断开**。如果客户端不响应 LogOut 消息（如恶意客户端），WebSocket 连接会保持。
 
 ### 5.3 匿名 WebSocket（anonymous-hub）
 
@@ -850,11 +866,11 @@ ICON_SERVICE_CSP=
 
 Vaultwarden 的安全防护体系体现了"深度防御"理念，四层防护各有侧重：
 
-1. **限流层**在入口处阻止暴力破解，覆盖密码/SSO/API Key/2FA 邮件发送四类入口，`refresh_login` 因 JWT 自身安全性而豁免限流
+1. **限流层**在入口处阻止暴力破解，覆盖密码/SSO/API Key/2FA 邮件发送四类入口，`refresh_login` 因 JWT 自身安全性而豁免限流——但注意 `decode_refresh` 失败时仍会触发数据库查询（旧格式回退逻辑）
 2. **认证守卫层**通过 JWT + security_stamp 确保已认证请求的凭据时效性，`refresh_tokens` 包含旧格式 Base64 token 的兼容逻辑——旧格式跳过 JWT 验证但必须通过数据库 Device 查询，且 `sub=Password` 硬编码会在 `sso_only` 模式下拒绝旧 token
-3. **WebSocket 层**区分已认证（hub）和匿名（anonymous-hub）两种场景：前者使用 `decode_login` 验证 access_token（不是 refresh_token），后者依赖 token 的随机性和数据库验证；`WsAccessTokenHeader` 是非阻塞守卫（永远 Success），JWT 验证延迟到路由处理函数中执行
+3. **WebSocket 层**区分已认证（hub）和匿名（anonymous-hub）两种场景：前者使用 `decode_login` 验证 access_token（不是 refresh_token），后者依赖 token 的随机性和数据库验证；安全事件（密码修改等）通过 WebSocket 推送 `LogOut` 消息驱动客户端主动断开，而非服务器端验证 token 切断连接
 4. **安全 Headers 层**通过 CSP/CORS/CORP 等在浏览器端提供防护，WebSocket 握手、connector.html、图片等例外规则均有明确的功能需求和替代安全措施
-5. **CORS 层**采用 Response Fairing 设计，在路由处理和数据库查询**之后**才执行，Origin 精确匹配白名单——不匹配时不设置 Allow-Origin 由浏览器拦截响应读取，但服务器端操作已执行完毕；CORS 防跨域数据泄露，与防跨域操作执行的 CSRF Token 互补
+5. **CORS 层**采用 Response Fairing 设计：实际请求（GET/POST）的路由处理和数据库查询在 Cors 之前执行，Origin 不匹配时浏览器拦截响应读取但服务器操作已完毕；OPTIONS 预检请求不匹配路由、不触发数据库查询，由 catcher 生成 404 后 Cors 改写为 200 OK；CORS 防跨域数据泄露，与防跨域操作执行的 CSRF Token 互补
 6. **代理支持层**通过 `IP_HEADER` 配置和 `DOMAIN` 硬编码确保在复杂部署环境下安全机制依然有效
 
 各模块通过 Rocket 的 Fairing 和 FromRequest trait 实现解耦，但又在安全逻辑上形成完整的防护链。
