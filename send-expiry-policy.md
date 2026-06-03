@@ -4,18 +4,18 @@
 
 | 模块 | 文件路径 | 主要职责 |
 |------|---------|---------|
-| 数据模型 | [src/db/models/send.rs](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/db/models/send.rs) | Send 数据结构、密码验证、数据库操作 |
-| API 接口 | [src/api/core/sends.rs](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/api/core/sends.rs) | Send 创建、访问、更新、删除接口 |
-| 定时任务 | [src/main.rs](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/main.rs#L679-L684) | Send 过期清理定时任务调度 |
-| 配置项 | [src/config.rs](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/config.rs#L543-L545) | Send 清理任务 cron 配置 |
-| 存储抽象 | [src/storage.rs](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/storage.rs#L49-L76) | FS vs S3 存储后端判断与 operator 构建 |
-| JWT 认证 | [src/auth.rs](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/auth.rs#L522-L528) | Send 下载链接 JWT token 生成与验证 |
+| 数据模型 | [src/db/models/send.rs](src/db/models/send.rs) | Send 数据结构、密码验证、数据库操作 |
+| API 接口 | [src/api/core/sends.rs](src/api/core/sends.rs) | Send 创建、访问、更新、删除接口 |
+| 定时任务 | [src/main.rs](src/main.rs#L679-L684) | Send 过期清理定时任务调度 |
+| 配置项 | [src/config.rs](src/config.rs#L543-L545) | Send 清理任务 cron 配置 |
+| 存储抽象 | [src/storage.rs](src/storage.rs#L49-L76) | FS vs S3 存储后端判断与 operator 构建 |
+| JWT 认证 | [src/auth.rs](src/auth.rs#L522-L528) | Send 下载链接 JWT token 生成与验证 |
 
 ---
 
 ## 二、数据模型核心字段
 
-[src/db/models/send.rs#L23-L49](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/db/models/send.rs#L23-L49)
+[src/db/models/send.rs#L23-L49](src/db/models/send.rs#L23-L49)
 
 ```rust
 pub struct Send {
@@ -53,7 +53,7 @@ pub struct Send {
 ### 2. accessId 与 sendId 的关系
 
 **accessId** 是 send UUID 的 Base64URL 编码：
-[src/db/models/send.rs#L270-L281](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/db/models/send.rs#L270-L281)
+[src/db/models/send.rs#L270-L281](src/db/models/send.rs#L270-L281)
 
 ```rust
 pub async fn find_by_access_id(access_id: &str, conn: &DbConn) -> Option<Self> {
@@ -69,7 +69,7 @@ pub async fn find_by_access_id(access_id: &str, conn: &DbConn) -> Option<Self> {
 ```
 
 `to_json` 中也展示了这个编码关系：
-[src/db/models/send.rs#L150](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/db/models/send.rs#L150)
+[src/db/models/send.rs#L150](src/db/models/send.rs#L150)
 ```rust
 "accessId": BASE64URL_NOPAD.encode(Uuid::parse_str(&self.uuid).unwrap_or_default().as_bytes()),
 ```
@@ -142,7 +142,7 @@ pub async fn find_by_access_id(access_id: &str, conn: &DbConn) -> Option<Self> {
 
 ### 第一步：post_access — 获取文件元数据
 
-[src/api/core/sends.rs#L450-L507](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/api/core/sends.rs#L450-L507)
+[src/api/core/sends.rs#L450-L507](src/api/core/sends.rs#L450-L507)
 
 此端点同时服务文本和文件两种 Send。关键行为差异：
 
@@ -155,7 +155,7 @@ if send.atype == SendType::Text as i32 {
 ```
 
 返回的 `to_json_access` 中，文件 Send 包含 `file` 字段：
-[src/db/models/send.rs#L173-L193](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/db/models/send.rs#L173-L193)
+[src/db/models/send.rs#L173-L193](src/db/models/send.rs#L173-L193)
 
 ```rust
 pub async fn to_json_access(&self, conn: &DbConn) -> Value {
@@ -180,7 +180,7 @@ pub async fn to_json_access(&self, conn: &DbConn) -> Value {
 
 ### 第二步：post_access_file — 获取下载链接
 
-[src/api/core/sends.rs#L509-L568](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/api/core/sends.rs#L509-L568)
+[src/api/core/sends.rs#L509-L568](src/api/core/sends.rs#L509-L568)
 
 **核心执行顺序（极易出错）：**
 
@@ -219,7 +219,7 @@ async fn post_access_file(send_id, file_id, data, host, conn, nt) -> JsonResult 
 
 ### 第三步：实际下载（仅 FS 模式经过后端）
 
-[src/api/core/sends.rs#L583-L591](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/api/core/sends.rs#L583-L591)
+[src/api/core/sends.rs#L583-L591](src/api/core/sends.rs#L583-L591)
 
 ```rust
 #[get("/sends/<send_id>/<file_id>?<t>")]
@@ -261,8 +261,8 @@ async fn download_send(send_id: SendId, file_id: SendFileId, t: &str) -> Option<
 
 ### 存储后端判断
 
-[src/storage.rs#L49-L51](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/storage.rs#L49-L51)
-[src/storage.rs#L53-L76](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/storage.rs#L53-L76)
+[src/storage.rs#L49-L51](src/storage.rs#L49-L51)
+[src/storage.rs#L53-L76](src/storage.rs#L53-L76)
 
 ```rust
 pub(crate) fn is_fs_operator(operator: &opendal::Operator) -> bool {
@@ -284,7 +284,7 @@ pub(crate) fn operator_for_path(path: &str) -> Result<opendal::Operator, crate::
 
 **判断依据**：`sends_folder()` 的返回值是否以 `s3://` 开头。
 
-[src/config.rs#L513](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/config.rs#L513)
+[src/config.rs#L513](src/config.rs#L513)
 ```rust
 sends_folder: String, false, auto, |c| storage::join_path(&c.data_folder, "sends");
 ```
@@ -303,7 +303,7 @@ sends_folder: String, false, auto, |c| storage::join_path(&c.data_folder, "sends
 | 有效期内重复下载 | ✅ 可以（JWT 有效期内） |
 
 JWT claims：
-[src/auth.rs#L522-L528](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/auth.rs#L522-L528)
+[src/auth.rs#L522-L528](src/auth.rs#L522-L528)
 ```rust
 BasicJwtClaims {
     nbf: time_now.timestamp(),
@@ -314,7 +314,7 @@ BasicJwtClaims {
 ```
 
 下载验证：
-[src/api/core/sends.rs#L584-L591](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/api/core/sends.rs#L584-L591)
+[src/api/core/sends.rs#L584-L591](src/api/core/sends.rs#L584-L591)
 - `decode_send(t)` 验证签名 + 过期时间
 - `claims.sub == format!("{send_id}/{file_id}")` 防止 token 被挪用
 - 不检查 Send 业务状态
@@ -356,14 +356,14 @@ operator.presign_read(
 ## 七、密码保护机制
 
 ### 密码设置
-[src/db/models/send.rs#L99-L113](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/db/models/send.rs#L99-L113)
+[src/db/models/send.rs#L99-L113](src/db/models/send.rs#L99-L113)
 
 - PBKDF2，100,000 次迭代
 - 64 字节随机盐
 - 传 `None` 时清除密码
 
 ### 密码验证
-[src/db/models/send.rs#L115-L122](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/db/models/send.rs#L115-L122)
+[src/db/models/send.rs#L115-L122](src/db/models/send.rs#L115-L122)
 
 - 三元组 (`hash`, `salt`, `iter`) 缺一即返回 `false`
 - `post_access` 中密码错误记录 IP
@@ -377,8 +377,8 @@ operator.presign_read(
 
 | Send 类型 | 计数端点 | 计数时机 | 代码位置 |
 |----------|---------|---------|---------|
-| 文本 (Text) | `post_access` | 访问验证通过后 | [sends.rs#L491-L493](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/api/core/sends.rs#L491-L493) |
-| 文件 (File) | `post_access_file` | 获取下载链接时 | [sends.rs#L550](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/api/core/sends.rs#L550) |
+| 文本 (Text) | `post_access` | 访问验证通过后 | [sends.rs#L491-L493](src/api/core/sends.rs#L491-L493) |
+| 文件 (File) | `post_access_file` | 获取下载链接时 | [sends.rs#L550](src/api/core/sends.rs#L550) |
 
 **文本类型**：`post_access` 中直接计数并返回内容，一步完成。
 
@@ -415,7 +415,7 @@ operator.presign_read(
 | `deletion_date` | **必填** | 到达后从数据库彻底删除 | **≤ 31 天** |
 
 ### 删除日期强制限制
-[src/api/core/sends.rs#L145-L149](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/api/core/sends.rs#L145-L149)
+[src/api/core/sends.rs#L145-L149](src/api/core/sends.rs#L145-L149)
 
 ```rust
 if data.deletion_date > Utc::now() + TimeDelta::try_days(31).unwrap() {
@@ -437,7 +437,7 @@ cron "0 5 * * * *" (每小时第5分钟)
             └─ diesel::delete(sends::table.filter(uuid.eq(&self.uuid)))    // 删除数据库记录
 ```
 
-[src/db/models/send.rs#L246-L250](file:///d:/fz/0601/solo-dogfeeding/code/7-vaultwarden/src/db/models/send.rs#L246-L250)
+[src/db/models/send.rs#L246-L250](src/db/models/send.rs#L246-L250)
 
 清理**只看 `deletion_date`**，不看 `expiration_date`。过期的 Send 如果 `deletion_date` 还未到，只是访问返回 404，数据仍然存在。
 
