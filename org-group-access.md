@@ -626,9 +626,122 @@ pub async fn delete(&self, org_uuid: &OrganizationId, conn: &DbConn) -> EmptyRes
 
 ---
 
-## 六、重要实现细节
+## 六、配置开关：org_groups_enabled 的影响范围
 
-### 6.1 数据库 JOIN 链
+### 6.1 显式检查开关的路径
+
+以下路径在代码中**显式检查**了 `CONFIG.org_groups_enabled()`，开关关闭时完全跳过组表查询：
+
+| 函数/路径 | 代码位置 | 行为（开关关闭时） |
+|---------|---------|-------------------|
+| `can_access_collection` | `src/db/models/collection.rs` (L153) | 跳过组权限判定，只检查直接授权和成员全局权限 |
+| `find_by_user_uuid` | `src/db/models/collection.rs` (L226) | 不 JOIN 组表，查询结果不含组继承的集合 |
+| `find_by_uuid_and_user` | `src/db/models/collection.rs` (L345) | 不 JOIN 组表，无法通过组访问集合 |
+| `is_writable_by_user` | `src/db/models/collection.rs` (L428) | 不 JOIN 组表，组授权的可写权限失效 |
+| `get_group_collections_access_flags` | `src/db/models/cipher.rs` (L691) | 返回空 Vec，普通查询路径无法通过组获得权限 |
+| `is_in_full_access_group` | `src/db/models/cipher.rs` (L584) | 返回 false，组全局权限失效 |
+| CipherSyncData 构建 | `src/api/core/ciphers.rs` | 不查询组权限，同步数据不含组授权 |
+| 用户详情 groups 字段 | `src/db/models/organization.rs` (L548) | 返回空 Vec，不显示用户所属组 |
+
+**示例代码（显式检查）**：
+```rust
+// src/db/models/collection.rs (L225-L227)
+pub async fn find_by_user_uuid(user_uuid: UserId, conn: &DbConn) -> Vec<Self> {
+    if CONFIG.org_groups_enabled() {
+        // JOIN 组表查询...
+    } else {
+        // 只查询直接授权...
+    }
+}
+```
+
+---
+
+### 6.2 未显式检查开关的路径
+
+**重要发现**：以下辅助权限查询函数**没有显式检查**配置开关，即使开关关闭，仍然会 JOIN 组表进行查询：
+
+#### 6.2.1 hide_passwords_for_user
+
+**代码位置**：`src/db/models/collection.rs` (L506-L562)
+
+```rust
+pub async fn hide_passwords_for_user(&self, user_uuid: &UserId, conn: &DbConn) -> bool {
+    conn.run(move |conn| {
+        collections::table
+            .left_join(users_collections::table.on(...))
+            .left_join(users_organizations::table.on(...))
+            .left_join(groups_users::table.on(...))              // ← 无条件 JOIN
+            .left_join(groups::table.on(...))                    // ← 无条件 JOIN
+            .left_join(collections_groups::table.on(...))        // ← 无条件 JOIN
+            .filter(
+                users_collections::hide_passwords.eq(true)
+                .or(users_organizations::access_all.eq(true))
+                .or(groups::access_all.eq(true))                 // ← 组全局权限
+                .or(collections_groups::hide_passwords.eq(true)) // ← 组集合权限
+            )
+            // ...
+    })
+}
+```
+
+**行为**：
+- 无条件 LEFT JOIN `groups_users`、`groups`、`collections_groups` 三张表
+- 开关关闭时，如果数据库中存在组数据，仍然会根据组授权判定 `hide_passwords`
+
+---
+
+#### 6.2.2 is_coll_manageable_by_user
+
+**代码位置**：`src/db/models/collection.rs` (L564-L613)
+
+```rust
+pub async fn is_coll_manageable_by_user(uuid: &CollectionId, user_uuid: &UserId, conn: &DbConn) -> bool {
+    conn.run(move |conn| {
+        collections::table
+            .left_join(users_collections::table.on(...))
+            .left_join(users_organizations::table.on(...))
+            .left_join(groups_users::table.on(...))              // ← 无条件 JOIN
+            .left_join(groups::table.on(...))                    // ← 无条件 JOIN
+            .left_join(collections_groups::table.on(...))        // ← 无条件 JOIN
+            .filter(
+                users_collections::manage.eq(true)
+                .or(users_organizations::access_all.eq(true))
+                .or(groups::access_all.eq(true))                 // ← 组全局权限
+                .or(collections_groups::manage.eq(true))         // ← 组集合权限
+            )
+            // ...
+    })
+}
+```
+
+**行为**：
+- 无条件 LEFT JOIN 组相关表
+- 开关关闭时，如果数据库中存在组数据，manage 权限仍然可能通过组获得
+
+---
+
+### 6.3 开关关闭后的实际行为总结
+
+| 场景 | 开关关闭后的实际行为 |
+|-----|-------------------|
+| Collection 列表查询 | ✅ 不含组继承的集合（正确） |
+| Collection 可见性判定 | ✅ 不考虑组授权（正确） |
+| Cipher 同步数据路径 | ✅ 不含组授权（正确） |
+| Cipher 普通查询路径 | ✅ 不含组授权（正确） |
+| hide_passwords 判定 | ⚠️ 仍会读取组表，存在组数据时会生效 |
+| manage 权限判定 | ⚠️ 仍会读取组表，存在组数据时会生效 |
+| 用户详情 groups 字段 | ✅ 返回空（正确） |
+
+**关键结论**：
+- **查询可见性**的路径都正确检查了开关
+- **查询具体权限字段**的辅助函数（`hide_passwords_for_user`、`is_coll_manageable_by_user`）没有检查开关
+- 如果数据库中已经存在组数据，关闭开关后，这些权限字段的判定**仍会受到组数据影响**
+- 这是一个实现上的不一致性，潜在风险：关闭开关后权限判定可能不符合预期
+
+---
+
+### 6.4 数据库 JOIN 链
 
 查询用户通过组获得的集合权限时，JOIN 链非常长：
 
@@ -641,10 +754,6 @@ users_organizations (成员表)
         ← ciphers_collections (集合-密码关联)
           ← ciphers (密码表)
 ```
-
-### 6.2 配置开关
-
-所有组相关功能都受 `CONFIG.org_groups_enabled()` 开关控制，如果关闭则完全跳过组权限判定。
 
 ---
 
@@ -692,11 +801,18 @@ users_organizations (成员表)
 
 ## 八、代码快速索引
 
+### 8.1 核心模型
+
 | 功能 | 文件路径 | 行号范围 |
 |------|---------|---------|
 | 组模型定义 | `src/db/models/group.rs` | L18-L30 |
 | 组成员关联模型 | `src/db/models/group.rs` | L43-L49 |
 | 组-集合关联模型 | `src/db/models/group.rs` | L32-L41 |
+
+### 8.2 三层权限体系
+
+| 功能 | 文件路径 | 行号范围 |
+|------|---------|---------|
 | Collection 可见性判定 | `src/db/models/collection.rs` | L149-L156 |
 | 用户详情展示（集合过滤） | `src/db/models/organization.rs` | L556-L605 |
 | Cipher 权限限制核心函数 | `src/db/models/cipher.rs` | L601-L669 |
@@ -707,6 +823,22 @@ users_organizations (成员表)
 | 组授权查询函数 | `src/db/models/cipher.rs` | L690-L717 |
 | 多集合权限聚合规则 | `src/db/models/cipher.rs` | L645-L666 |
 | CipherSyncData 组权限预聚合 | `src/api/core/ciphers.rs` | L2175-L2190 |
+
+### 8.3 配置开关 org_groups_enabled
+
+| 功能 | 文件路径 | 行号范围 |
+|------|---------|---------|
+| find_by_user_uuid 开关检查 | `src/db/models/collection.rs` | L226 |
+| is_writable_by_user 开关检查 | `src/db/models/collection.rs` | L428 |
+| hide_passwords_for_user（无开关检查） | `src/db/models/collection.rs` | L506-L562 |
+| is_coll_manageable_by_user（无开关检查） | `src/db/models/collection.rs` | L564-L613 |
+| get_group_collections_access_flags 开关检查 | `src/db/models/cipher.rs` | L691 |
+| is_in_full_access_group 开关检查 | `src/db/models/cipher.rs` | L584 |
+
+### 8.4 组变更同步机制
+
+| 功能 | 文件路径 | 行号范围 |
+|------|---------|---------|
 | 组全局权限判定 | `src/db/models/group.rs` | L593-L610 |
 | 组集合权限判定 | `src/db/models/group.rs` | L569-L591 |
 | 用户 revision 更新函数 | `src/db/models/group.rs` | L612-L617 |
