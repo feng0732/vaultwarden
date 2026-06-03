@@ -591,37 +591,111 @@ pub fn catchers() -> Vec<Catcher> {
 
 3. **会话认证**：JWT 的验证不依赖 `ADMIN_TOKEN` 值，只验证签名和过期时间（见 6.4 节）。
 
-### 6.3 disable_admin_token 改动的生效时机
+### 6.3 disable_admin_token 改动的生效时机：三种修改路径
 
-`disable_admin_token` 的影响也在两个层面，行为不同：
+理解 `disable_admin_token` 的关键在于区分**三种不同的修改路径**及其不同行为。首先需要明确：[disable_admin_token 在配置声明中是 `editable=false`](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/config.rs#L758)：
+
+```rust
+/// Bypass admin page security (Know the risks!) |> Disables the Admin Token for the admin page so you may use your own auth in-front
+disable_admin_token:    bool,   false,  def,    false;
+```
+
+#### 路径一：通过管理面板提交配置
+
+管理面板的 [post_config](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/api/admin.rs#L797-L804) 调用 `update_config` 时传入 `ignore_non_editable=true`：
+
+```rust
+async fn post_config(data: Json<ConfigBuilder>, _token: AdminToken) -> EmptyResult {
+    let data: ConfigBuilder = data.into_inner();
+    if let Err(e) = CONFIG.update_config(data, true).await {  // ignore_non_editable = true
+        err!(format!("Unable to save config: {e:?}"))
+    }
+    Ok(())
+}
+```
+
+在 [update_config](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/config.rs#L1445-L1481) 中：
+
+```rust
+pub async fn update_config(&self, other: ConfigBuilder, ignore_non_editable: bool) -> Result<(), Error> {
+    let mut builder = other;
+    
+    // Remove values that are not editable
+    if ignore_non_editable {
+        builder.clear_non_editable();  // ← 清除所有 editable=false 的字段！
+    }
+    // ...
+}
+```
+
+[ConfigBuilder::clear_non_editable](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/config.rs#L269-L275) 由宏展开生成：
+
+```rust
+fn clear_non_editable(&mut self) {
+    // 宏展开：对每个配置项，如果 !$editable 则 self.$name = None
+    if !false {  // disable_admin_token 的 editable=false
+        self.disable_admin_token = None;
+    }
+    // ... 其他配置项
+}
+```
+
+**结论：通过管理面板无法修改 `disable_admin_token`**。即使前端恶意构造请求包含该字段，后端也会在处理时将其清除。
+
+#### 路径二：修改环境变量或配置文件 + 重启服务器
+
+这两种方式都可以修改 `disable_admin_token`，但**必须重启才能生效**：
+
+| 修改方式 | 是否经过 editable 检查 | 是否需要重启 |
+|---|---|---|
+| 环境变量（`DISABLE_ADMIN_TOKEN=true`） | ❌ 不检查（[from_env](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/config.rs#L218-L260) 直接读取） | ✅ 需要重启 |
+| 直接修改 `config.json` 文件 | ❌ 不检查（[from_file](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/config.rs#L262-L267) 直接反序列化） | ✅ 需要重启 |
+
+**注意**：直接修改 `config.json` 后，服务器不会自动检测文件变化，必须重启才会重新加载。
+
+#### 路径三：内存配置值变化（理论路径）
+
+如果内存中的 `disable_admin_token` 值发生了变化（通过内部 API 或其他机制），[AdminToken::from_request()](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/api/admin.rs#L830-L866) 会**在每次请求时动态读取**：
+
+```rust
+impl<'r> FromRequest<'r> for AdminToken {
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        // ...
+        if !CONFIG.disable_admin_token() {  // ← 每次请求都读取内存中的当前值！
+            // 执行 JWT 验证
+            let access_token = cookies.get(COOKIE_NAME).map(|c| c.value());
+            if decode_admin(access_token).is_err() {
+                cookies.remove(...);
+                return Outcome::Error((Status::Unauthorized, "Session expired"));
+            }
+        }
+        // disable_admin_token = true 时直接跳过认证
+        Outcome::Success(Self { ip })
+    }
+}
+```
+
+`CONFIG.disable_admin_token()` 是宏生成的 getter，每次读取都会 clone 内存中的最新值：
+
+```rust
+pub fn disable_admin_token(&self) -> bool {
+    self.inner.read().unwrap().config.disable_admin_token.clone()
+}
+```
+
+**结论：如果内存配置值变化，请求守卫的行为会立即改变，无需重启。**
+
+但需要强调：**在正常使用中，这种内存变化几乎不会发生**，因为：
+- 管理面板无法修改该字段
+- 内部 `update_config_partial` 虽然 `ignore_non_editable=false`，但只被 `get_duo_akey()` 调用用于特定字段
+- 没有公开的 API 可以直接修改该字段
+
+#### 两层检查点的生效时机
 
 | 检查点 | 位置 | 读取时机 | 运行时改动是否生效 |
 |---|---|---|---|
 | **路由列表** | `routes()` / `catchers()` | 启动时 | ❌ 不生效，需重启 |
-| **请求守卫** | `AdminToken::from_request()` | 每次请求时 | ✅ 立即生效 |
-
-详细分析：
-
-1. **路由列表**：启动时如果 `disable_admin_token = true`，`routes()` 返回全部路由；否则根据 `ADMIN_TOKEN` 是否设置决定。运行时修改不会改变已挂载的路由。
-
-2. **请求守卫**：[AdminToken::from_request()](file:///d:/fz/0601/solo-dogfeeding/code/9-vaultwarden/src/api/admin.rs#L830-L866) 在**每次请求**时动态检查 `CONFIG.disable_admin_token()`：
-
-   ```rust
-   if !CONFIG.disable_admin_token() {  // 每次请求都检查
-       // 执行 JWT 验证
-       let access_token = cookies.get(COOKIE_NAME).map(|c| c.value());
-       if decode_admin(access_token).is_err() {
-           cookies.remove(...);
-           return Outcome::Error((Status::Unauthorized, "Session expired"));
-       }
-   }
-   // disable_admin_token = true 时直接跳过认证
-   Outcome::Success(Self { ip })
-   ```
-
-   所以：
-   - 运行时将 `disable_admin_token` 从 `false` 改为 `true` → **立即对所有请求跳过认证**，已登录和未登录的请求都直接通过
-   - 运行时将 `disable_admin_token` 从 `true` 改为 `false` → **立即要求所有请求提供有效 JWT**，无 Cookie 的请求会返回 401
+| **请求守卫** | `AdminToken::from_request()` | 每次请求时 | ✅ 立即生效（如果内存值改变） |
 
 ### 6.4 现有登录会话的有效性：JWT 完全独立于 ADMIN_TOKEN
 
@@ -676,15 +750,15 @@ RSA 密钥的加载和生命周期：
 
 以下是几种常见配置改动场景的行为总结：
 
-| 场景 | 路由是否可用 | 新登录行为 | 现有会话 | 备注 |
-|---|---|---|---|---|
-| **启动时无 ADMIN_TOKEN → 运行时设置 ADMIN_TOKEN** | ❌ 不可用 | N/A | N/A | 路由只在启动时挂载，必须重启 |
-| **启动时有 ADMIN_TOKEN → 运行时删除 ADMIN_TOKEN** | ✅ 可用 | ❌ 无法登录 | ✅ 保持有效 | 路由已挂载，只是 validate_token 返回 false |
-| **运行时修改 ADMIN_TOKEN 值** | ✅ 可用 | ❌ 旧 token 失败<br>✅ 新 token 成功 | ✅ 保持有效 | 已登录会话不受影响 |
-| **运行时 disable_admin_token false → true** | ✅ 可用 | ✅ 无需 token | ✅ 保持有效<br>✅ 无 Cookie 也可访问 | 所有请求跳过认证 |
-| **运行时 disable_admin_token true → false** | ✅ 可用 | ✅ 需要 token | ✅ 有 Cookie 继续有效<br>❌ 无 Cookie 返回 401 | 立即要求认证 |
-| **运行时修改 admin_session_lifetime** | ✅ 可用 | ✅ 新会话使用新值 | ✅ 旧会话仍用原值 | JWT 的 exp 在签发时确定 |
-| **运行时修改 admin_ratelimit 参数** | ✅ 可用 | ✅ 仍受原限流 | ✅ 不受影响 | 限流器是 LazyLock 初始化的 |
+| 场景 | 修改路径 | 路由是否可用 | 新登录行为 | 现有会话 | 备注 |
+|---|---|---|---|---|---|
+| **启动时无 ADMIN_TOKEN → 运行时设置 ADMIN_TOKEN** | 环境变量/配置文件 + 重启 | ✅ 重启后可用 | ✅ 新 token 生效 | N/A | 必须重启，路由只在启动时挂载 |
+| **启动时有 ADMIN_TOKEN → 运行时删除 ADMIN_TOKEN** | 管理面板 | ✅ 可用 | ❌ 无法登录 | ✅ 保持有效 | 路由已挂载，只是 validate_token 返回 false |
+| **运行时修改 ADMIN_TOKEN 值** | 管理面板 | ✅ 可用 | ❌ 旧 token 失败<br>✅ 新 token 成功 | ✅ 保持有效 | 已登录会话不受影响 |
+| **修改 disable_admin_token 值** | 管理面板 | ❌ 无法修改 | - | - | 面板提交时会被 clear_non_editable 清除 |
+| **修改 disable_admin_token 值** | 环境变量 + 重启 | ✅ 可用 | 取决于新值 | ❌ 重启后全部失效 | 重启后 JWT 仍有效，但守卫行为改变 |
+| **运行时修改 admin_session_lifetime** | 管理面板 | ✅ 可用 | ✅ 新会话使用新值 | ✅ 旧会话仍用原值 | JWT 的 exp 在签发时确定 |
+| **运行时修改 admin_ratelimit 参数** | 环境变量 + 重启 | ✅ 可用 | ✅ 仍受原限流（运行时）<br>✅ 新限流（重启后） | ✅ 不受影响 | 限流器是 LazyLock 初始化的 |
 
 ### 6.6 安全启示
 
@@ -698,7 +772,12 @@ RSA 密钥的加载和生命周期：
    - 如果怀疑 token 泄露，仅修改 token 不足以立即阻止访问
    - 最安全的做法是：修改 token + 重启服务 + 删除 RSA 密钥
 
-3. **disable_admin_token 的危险**：
-   - 设为 `true` 后**任何人都可以直接访问管理面板**，无需任何认证
-   - 这个配置是 `editable=false` 的，**无法通过管理面板修改**，只能通过环境变量
-   - 设计意图是配合前置反向代理做认证（如 Authelia、OAuth2 Proxy 等），切勿单独使用
+3. **disable_admin_token 的三层防护**：
+   - **第一层（配置定义）**：`editable=false` → 管理面板无法修改
+   - **第二层（提交处理）**：`clear_non_editable()` → 即使前端篡改，后端也会清除该字段
+   - **第三层（使用意图）**：设为 `true` 后**任何人都可以直接访问管理面板**，无需任何认证，设计意图是配合前置反向代理做认证（如 Authelia、OAuth2 Proxy 等），切勿单独使用
+
+4. **配置热更新的边界**：
+   - ✅ **立即生效**：`ADMIN_TOKEN`（登录验证）、`admin_session_lifetime`（新会话）、所有业务逻辑配置（如 `signups_allowed`）
+   - ❌ **需要重启**：路由列表、RSA 密钥、限流参数、数据库连接池、静态文件路径
+   - ⚠️ **理论上可热更新**：`disable_admin_token`（内存值改变立即生效，但正常路径无法触发）
