@@ -881,3 +881,326 @@ register_push_device 使用 DEVICE_B 的 push_uuid 和 push_token
 - 补充 `Headers` 认证守卫
 - 统一按用户 + 设备定位
 - 或者明确设计为"按 device.app 全局清理所有关联用户"的语义
+
+---
+
+## 十三、清理 Push Token 时多账号受影响的深度分析
+
+### 13.1 DeviceId 的格式与复合主键
+
+#### 数据库主键定义
+
+[schema.rs#L47-L59](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/db/schema.rs#L47-L59)：
+
+```sql
+devices (uuid, user_uuid) {
+    uuid         -> Text,        -- 客户端生成的设备标识
+    user_uuid    -> Text,        -- 所属用户
+    push_uuid    -> Nullable<Text>,
+    push_token   -> Nullable<Text>,
+    ...
+}
+```
+
+**复合主键为 `(uuid, user_uuid)`**，这意味着：
+
+- 同一个 `uuid`（设备标识）可以出现在**多行**中，只要 `user_uuid` 不同
+- 每行代表"某个用户在某台设备上的会话"
+
+#### DeviceId 的语义
+
+[device.rs#L369-L372](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/db/models/device.rs#L369-L372)：
+
+```rust
+pub struct DeviceId(String);
+```
+
+`DeviceId` 是一个包裹 `String` 的新类型，**不包含 `user_uuid`**。它仅代表设备端生成的标识符（由客户端在登录时通过 `device_identifier` 字段提供）。
+
+#### 多账号场景的数据布局
+
+当同一台手机（device_id=`abc123`）上登录了两个用户时：
+
+| uuid (DeviceId) | user_uuid | push_uuid | push_token |
+|-----------------|-----------|-----------|------------|
+| `abc123` | `user_A` | `push-uuid-A` | `FCM_token_A` |
+| `abc123` | `user_B` | `push-uuid-B` | `FCM_token_B` |
+
+两条记录共享相同的 `uuid`，但各自有独立的 `push_uuid` 和 `push_token`。
+
+---
+
+### 13.2 `find_by_uuid` 与 `clear_push_token_by_uuid` 的查询差异
+
+这是多账号受影响的**核心根源**：两个函数对复合主键的使用方式完全不同。
+
+#### `find_by_uuid`：仅按 uuid 过滤，返回单条记录
+
+[device.rs#L208-L210](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/db/models/device.rs#L208-L210)
+
+```rust
+pub async fn find_by_uuid(uuid: &DeviceId, conn: &DbConn) -> Option<Self> {
+    conn.run(move |conn| {
+        devices::table
+            .filter(devices::uuid.eq(uuid))    // ← 仅过滤 uuid
+            .first::<Self>(conn)                // ← 只取第一条
+            .ok()
+    })
+    .await
+}
+```
+
+**关键问题**：
+- `filter(devices::uuid.eq(uuid))` 只用 `uuid` 过滤，**不加** `user_uuid` 条件
+- 当存在多条记录（多用户共享设备）时，`.first()` 返回哪一条**取决于数据库的默认排序**
+- SQLite/MySQL/PostgreSQL 的默认排序可能不一致
+- **调用者拿到的是"随机"某个用户的设备记录**
+
+#### `clear_push_token_by_uuid`：仅按 uuid 过滤，批量更新
+
+[device.rs#L212-L221](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/db/models/device.rs#L212-L221)
+
+```rust
+pub async fn clear_push_token_by_uuid(uuid: &DeviceId, conn: &DbConn) -> EmptyResult {
+    conn.run(move |conn| {
+        diesel::update(devices::table)
+            .filter(devices::uuid.eq(uuid))     // ← 仅过滤 uuid
+            .set(devices::push_token.eq::<Option<String>>(None))
+            .execute(conn)                      // ← 影响所有匹配行
+            .map_res("Error removing push token")
+    })
+    .await
+}
+```
+
+**关键差异**：
+- `UPDATE ... WHERE uuid = ?` **不加** `user_uuid` 条件
+- `.execute()` 是批量操作，**会清空所有匹配行的 push_token**
+- 这意味着**所有在该设备上登录的用户的 push_token 都会被清空**
+
+#### 两个函数的行为对比
+
+| 函数 | WHERE 条件 | 结果范围 | 多账号影响 |
+|------|----------|---------|-----------|
+| `find_by_uuid` | `uuid = ?` | 返回 1 条（随机） | 只拿到"某个"用户的设备 |
+| `clear_push_token_by_uuid` | `uuid = ?` | 更新所有匹配行 | **所有用户**的 token 被清空 |
+| `find_by_uuid_and_user` | `uuid = ? AND user_uuid = ?` | 精确到用户 | 仅影响指定用户 |
+
+---
+
+### 13.3 `put_clear_device_token` 的完整执行链与后果
+
+[accounts.rs#L1422-L1441](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/api/core/accounts.rs#L1422-L1441)
+
+```rust
+async fn put_clear_device_token(device_id: DeviceId, conn: DbConn) -> EmptyResult {
+    if !CONFIG.push_enabled() { return Ok(()); }
+
+    if let Some(device) = Device::find_by_uuid(&device_id, &conn).await {  // ① 随机取一条
+        Device::clear_push_token_by_uuid(&device_id, &conn).await?;        // ② 清空所有行
+        unregister_push_device(device.push_uuid.as_ref()).await?;           // ③ 注销一个 push_uuid
+    }
+
+    Ok(())
+}
+```
+
+#### 逐步分析
+
+**步骤 ①**：`find_by_uuid(&device_id)` → 随机取一条设备记录
+
+假设数据：
+| uuid | user_uuid | push_uuid | push_token |
+|------|-----------|-----------|------------|
+| `abc123` | `user_A` | `push-A` | `FCM_A` |
+| `abc123` | `user_B` | `push-B` | `FCM_B` |
+
+返回结果不确定——可能是 `user_A` 的记录，也可能是 `user_B` 的记录。
+
+**步骤 ②**：`clear_push_token_by_uuid(&device_id)` → 批量清空
+
+```sql
+UPDATE devices SET push_token = NULL WHERE uuid = 'abc123'
+```
+
+**两条记录的 push_token 都被清空**，但只有 `find_by_uuid` 返回的那条记录的 `push_uuid` 被保留在了步骤 ① 的变量中。
+
+**步骤 ③**：`unregister_push_device(device.push_uuid.as_ref())` → 仅注销一个
+
+[push.rs#L138-L158](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/api/push.rs#L138-L158)：
+
+```rust
+pub async fn unregister_push_device(push_id: Option<&PushId>) -> EmptyResult {
+    if !CONFIG.push_enabled() || push_id.is_none() { return Ok(()); }
+    let auth_api_token = get_auth_api_token().await?;
+    let auth_header = format!("Bearer {auth_api_token}");
+
+    match make_http_request(
+        Method::POST,
+        &format!("{}/push/delete/{}", CONFIG.push_relay_uri(), push_id.as_ref().unwrap()),
+    )?
+    .header(AUTHORIZATION, auth_header)
+    .send()
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => err!(format!("An error occurred during device unregistration: {e}")),
+    };
+    Ok(())
+}
+```
+
+**只注销了一个 `push_uuid`**（步骤 ① 随机取到的那条），另一个 `push_uuid` 仍在 Relay 上注册。
+
+---
+
+### 13.4 多账号场景下的具体后果
+
+#### 场景：手机上登录了两个账号，调用 clear-token
+
+```
+初始状态:
+  Row 1: (abc123, user_A, push-A, FCM_A)  ← Relay 已注册 push-A
+  Row 2: (abc123, user_B, push-B, FCM_B)  ← Relay 已注册 push-B
+
+调用: PUT /devices/identifier/abc123/clear-token
+
+步骤 ① find_by_uuid("abc123")
+  → 返回 Row 1 (user_A 的记录，假设排序如此)
+
+步骤 ② clear_push_token_by_uuid("abc123")
+  → UPDATE devices SET push_token = NULL WHERE uuid = 'abc123'
+  → Row 1: push_token = NULL  ← user_A 的 token 清空
+  → Row 2: push_token = NULL  ← user_B 的 token 也被清空！
+
+步骤 ③ unregister_push_device(push-A)
+  → POST https://push.bitwarden.com/push/delete/push-A
+  → push-A 从 Relay 注销 ✓
+  → push-B 仍在 Relay 注册 ✗ ← 悬空！
+```
+
+#### 后果矩阵
+
+| 用户 | push_token | push_uuid | Relay 状态 | 推送能否到达 |
+|------|-----------|-----------|-----------|------------|
+| user_A | **已清空** | push-A（已注销） | 已注销 | ✗ 无法推送 |
+| user_B | **已清空** | push-B（未注销） | **悬空注册** | ✗ 无法推送（token 已清空，check 不通过） |
+
+#### 悬空注册的具体危害
+
+1. **Relay 侧残留**：`push-B` 仍在 Bitwarden Push Relay 上注册，但 Vaultwarden 侧已无对应 push_token
+2. **无法接收推送**：因为 `check_user_has_push_device` 查询 `push_token IS NOT NULL`，token 清空后检查不通过，不会发送推送
+3. **无法自动恢复**：user_B 需要重新登录并上报 token 才能恢复推送功能
+4. **无主动清理**：Relay 侧的悬空注册不会过期，只能等用户重新登录时 `register_push_device` 覆盖
+
+---
+
+### 13.5 POST / PUT 双入口分析
+
+[accounts.rs#L1390-L1393](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/api/core/accounts.rs#L1390-L1393) 与 [accounts.rs#L1443-L1447](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/api/core/accounts.rs#L1443-L1447)
+
+```rust
+// Token 上报：POST 和 PUT 都指向同一实现
+#[post("/devices/identifier/<device_id>/token", data = "<data>")]
+async fn post_device_token(device_id: DeviceId, data: Json<PushToken>, headers: Headers, conn: DbConn) -> EmptyResult {
+    put_device_token(device_id, data, headers, conn).await
+}
+
+#[put("/devices/identifier/<device_id>/token", data = "<data>")]
+async fn put_device_token(device_id: DeviceId, data: Json<PushToken>, headers: Headers, conn: DbConn) -> EmptyResult {
+    // ... 实际逻辑
+}
+
+// Token 清理：POST 和 PUT 也都指向同一实现
+#[put("/devices/identifier/<device_id>/clear-token")]
+async fn put_clear_device_token(device_id: DeviceId, conn: DbConn) -> EmptyResult {
+    // ... 实际逻辑
+}
+
+#[post("/devices/identifier/<device_id>/clear-token")]
+async fn post_clear_device_token(device_id: DeviceId, conn: DbConn) -> EmptyResult {
+    put_clear_device_token(device_id, conn).await
+}
+```
+
+#### 双入口的设计意图
+
+代码注释说明：
+
+```rust
+// On upstream server, both PUT and POST are declared.
+// Implementing the POST method in case it would be useful somewhere
+```
+
+- 上游 Bitwarden Server 同时声明了 PUT 和 POST
+- Vaultwarden 为兼容性也提供了两种 HTTP 方法
+- **两者行为完全一致**，POST 只是 PUT 的委托转发
+
+#### 安全影响
+
+两个入口共享同一实现，意味着：
+- `POST /devices/identifier/<id>/clear-token` 同样无认证
+- `PUT /devices/identifier/<id>/clear-token` 同样无认证
+- 攻击面是双倍的，但实际风险不变（都走同一函数）
+
+---
+
+### 13.6 与 Admin deauth 的对比：正确的做法
+
+[admin.rs#L463-L480](file:///d:/fz/0601/solo-dogfeeding/code/11-vaultwarden/src/api/admin.rs#L463-L480) 提供了一个**正确的多设备注销实现**：
+
+```rust
+async fn deauth_user(user_id: UserId, _token: AdminToken, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
+    let mut user = get_user_or_404(&user_id, &conn).await?;
+    nt.send_logout(&user, None, &conn).await;
+
+    if CONFIG.push_enabled() {
+        for device in Device::find_push_devices_by_user(&user.uuid, &conn).await {
+            match unregister_push_device(device.push_uuid.as_ref()).await {
+                Ok(r) => r,
+                Err(e) => error!("Unable to unregister devices from Bitwarden server: {e}"),
+            }
+        }
+    }
+
+    Device::delete_all_by_user(&user.uuid, &conn).await?;
+    // ...
+}
+```
+
+**关键差异**：
+
+| 维度 | `put_clear_device_token` | `deauth_user`（Admin） |
+|------|-------------------------|----------------------|
+| 查询范围 | `find_by_uuid` → 跨用户 | `find_push_devices_by_user` → 按用户 |
+| 遍历所有设备 | 否，只取一条 | 是，逐一处理 |
+| Relay 注销 | 只注销一个 push_uuid | **遍历注销所有** push_uuid |
+| 认证 | 无 | AdminToken |
+| 影响范围 | 可能波及其他用户 | 仅影响目标用户 |
+
+---
+
+### 13.7 问题总结与修复方向
+
+#### 三个叠加的问题
+
+1. **`find_by_uuid` 跨用户取单条** → 随机取到某个用户的设备
+2. **`clear_push_token_by_uuid` 跨用户批量清空** → 所有用户在该设备上的 token 都被清空
+3. **只注销一个 push_uuid** → 其他用户的 push_uuid 在 Relay 上悬空
+
+#### 修复方向
+
+**方案 A：精确清理（推荐）**
+- 改用 `find_by_uuid_and_user` 定位设备
+- 改用带 `user_uuid` 条件的 `clear_push_token`
+- 仅清理当前用户的 push_token 和 push_uuid
+
+**方案 B：全局清理（当前行为的修正版）**
+- `find_by_uuid` 改为查询所有匹配行（返回 `Vec<Self>`）
+- 遍历所有匹配设备，逐一注销 push_uuid
+- 确保所有 Relay 注册都被清理
+
+**方案 C：简化方案**
+- 补充 `Headers` 认证守卫
+- 让清理 Token API 与设置 Token API 使用相同的定位逻辑
+- 最小改动，最大一致性
