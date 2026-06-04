@@ -83,6 +83,154 @@ loop {
 | 事件日志清理 | `CONFIG.org_events_enabled() && CONFIG.events_days_retain().is_some()` | [main.rs:732-734](src/main.rs#L732-L734) |
 | 其余所有 | 仅检查 schedule 非空 | 各 `if !CONFIG.xxx_schedule().is_empty()` |
 
+### 2.4 同一 tick 内的执行顺序
+
+`job_scheduler_ng` 的 [JobScheduler::tick()](https://github.com/BlackDex/job_scheduler/blob/master/src/lib.rs#L327-L330) 实现非常简单：
+
+```rust
+pub fn tick(&mut self) {
+    for job in &mut self.jobs {
+        job.tick();
+    }
+}
+```
+
+这意味着：
+
+1. **遍历顺序严格等于 `sched.add()` 注册顺序**：
+   - [main.rs:679-746](src/main.rs#L679-L746) 的注册顺序：send_purge → trash_purge → incomplete_2fa → **emergency_request_timeout** → **emergency_notification_reminder** → auth_request_purge → duo_context_purge → event_cleanup → sso_auth_purge
+   - 紧急访问 timeout job 先于 reminder job 被遍历
+
+2. **闭包同步执行，但任务异步提交**：
+   - 每个 `job.tick()` 同步执行闭包（在调度线程内）
+   - 闭包内 `runtime.spawn(...)` 将异步任务提交到 tokio 后立即返回
+   - 因此：**闭包提交顺序** = 注册顺序，但**异步任务实际执行顺序**由 tokio 调度器决定（不确定）
+
+3. **关键边界**：如果两个 Job 的 cron 表达式在**同一秒**命中（例如都设为 `0 5 * * * *`）：
+   - 它们的闭包会按注册顺序依次提交到 tokio
+   - 但实际并发执行顺序不可预测
+   - 对于有依赖关系的 Job（如紧急访问的两个任务），同一时间点命中可能产生竞态
+
+### 2.5 Cron 配置校验
+
+配置校验分为两个阶段：
+
+**阶段一：启动时校验**（[config.rs:1212-1243](src/config.rs#L1212-L1243)）
+
+服务器启动时，在 `ConfigBuilder::validate()` 中对所有非空的 cron schedule 做 parse 校验：
+
+```rust
+if !cfg.send_purge_schedule.is_empty() && cfg.send_purge_schedule.parse::<Schedule>().is_err() {
+    err!("`SEND_PURGE_SCHEDULE` is not a valid cron expression")
+}
+```
+
+校验失败会直接调用 `err!()` 宏，导致进程 panic 退出。
+
+**校验覆盖范围（已校验）**：
+- `SEND_PURGE_SCHEDULE`
+- `TRASH_PURGE_SCHEDULE`
+- `INCOMPLETE_2FA_SCHEDULE`
+- `EMERGENCY_NOTIFICATION_REMINDER_SCHEDULE`
+- `EMERGENCY_REQUEST_TIMEOUT_SCHEDULE`
+- `EVENT_CLEANUP_SCHEDULE`
+- `AUTH_REQUEST_PURGE_SCHEDULE`
+
+**校验缺失（未校验，有风险）**：
+- `DUO_CONTEXT_PURGE_SCHEDULE`
+- `PURGE_INCOMPLETE_SSO_AUTH`
+
+这两个配置项没有启动校验，若配置错误会在 `schedule_jobs()` 注册时通过 `.parse().unwrap()` panic，表现为**启动后才崩溃**而非启动时失败。
+
+**阶段二：注册时 parse**（[main.rs:681](src/main.rs#L681) 等各处）
+
+```rust
+sched.add(Job::new(CONFIG.send_purge_schedule().parse().unwrap(), || { ... }));
+```
+
+理论上启动校验已保证合法性，但仍使用 `unwrap()`。如果动态修改 CONFIG（虽然实际上是只读的），这里可能 panic。
+
+### 2.6 紧急访问任务的时间依赖与自定义配置风险
+
+#### 默认配置的时间差设计
+
+默认 cron 配置：
+| Job | Cron | 触发时间 |
+|-----|------|---------|
+| emergency_request_timeout | `0 7 * * * *` | 每小时第 7 分钟 0 秒 |
+| emergency_notification_reminder | `0 3 * * * *` | 每小时第 3 分钟 0 秒 |
+
+**注意：reminder 实际先于 timeout 执行（03 < 07），与注释意图相反。**
+
+[main.rs:702-703](src/main.rs#L702-L703) 的注释明确期望 timeout 先执行：
+
+> This job should run before the emergency access reminders job to avoid
+> sending reminders for requests that are about to be granted anyway.
+
+但默认 cron 时间安排是 reminder（03）→ timeout（07），即**先提醒，4 分钟后才批准**。
+
+#### 设计意图与实际行为的矛盾
+
+```
+理想时序（注释期望）：   timeout ──> reminder（批准的就不提醒）
+实际默认时序：         reminder（可能提醒了即将批准的） ──> timeout（批准）
+```
+
+这意味着在默认配置下，有些即将被批准的紧急访问请求会被先发送提醒邮件，造成**不必要的邮件打扰**。
+
+#### 自定义时间调整的风险场景
+
+如果用户自定义这两个 cron 表达式，可能出现以下情况：
+
+##### 场景 1：设为同一时间点（风险 ⚠️）
+
+```bash
+EMERGENCY_REQUEST_TIMEOUT_SCHEDULE="0 5 * * * *"
+EMERGENCY_NOTIFICATION_REMINDER_SCHEDULE="0 5 * * * *"
+```
+
+- 同一 tick 内按注册顺序：timeout 闭包先提交，reminder 后提交
+- 但 tokio 调度顺序不确定，两个异步任务可能并发执行
+- **风险**：reminder 发送邮件时，timeout 刚好把状态改为 `RecoveryApproved`，导致 `find_all_recoveries_initiated` 查询不到，错过提醒
+- **反向风险**：reminder 先查询到记录并发送邮件，timeout 随后批准，造成不必要的提醒
+
+##### 场景 2：timeout 先于 reminder 执行（正确的时序）
+
+```bash
+EMERGENCY_REQUEST_TIMEOUT_SCHEDULE="0 2 * * * *"    # 第 2 分钟
+EMERGENCY_NOTIFICATION_REMINDER_SCHEDULE="0 5 * * * *"  # 第 5 分钟
+```
+
+- 符合注释意图：先批准，再为剩余未批准的发送提醒
+- 是推荐的正确配置方式
+
+##### 场景 3：reminder 先于 timeout 执行（默认行为，有浪费）
+
+```bash
+EMERGENCY_REQUEST_TIMEOUT_SCHEDULE="0 5 * * * *"    # 第 5 分钟
+EMERGENCY_NOTIFICATION_REMINDER_SCHEDULE="0 2 * * * *"  # 第 2 分钟
+```
+
+- 先提醒，3 分钟后批准
+- 可能发送不必要的提醒（批准前 3 分钟被提醒了）
+- 但功能上是正确的，只是用户体验和资源利用上有浪费
+
+##### 场景 4：执行间隔小于单任务执行时间（重叠风险 ⚠️）
+
+如果两个任务的 cron 间隔很近（例如相差 1 分钟），而 reminder 任务执行时间超过 1 分钟：
+- timeout 的新实例被 spawn 时，reminder 的旧实例可能仍在运行
+- 两者并发操作同一条 EmergencyAccess 记录
+- 依赖数据库乐观并发（UPDATE 只改一个字段）+ retry(10) 兜底
+
+#### 字段级隔离的并发保护
+
+为减少写冲突，两个任务采用**只更新各自关心的字段**的设计：
+
+- [update_access_status_and_save](src/db/models/emergency_access.rs#L178-L201)：只 SET `status` + `updated_at`
+- [update_last_notification_date_and_save](src/db/models/emergency_access.rs#L203-L219)：只 SET `last_notification_at` + `updated_at`
+
+这是一种乐观的字段级隔离，降低了并发写相互覆盖的概率。但 `updated_at` 字段仍会相互覆盖（后写胜出）。
+
 ---
 
 ## 3. 过期清理逻辑详解
