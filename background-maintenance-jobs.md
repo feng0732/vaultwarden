@@ -117,7 +117,7 @@ pub fn tick(&mut self) {
 
 **阶段一：启动时校验**（[config.rs:1212-1243](src/config.rs#L1212-L1243)）
 
-服务器启动时，在 `ConfigBuilder::validate()` 中对所有非空的 cron schedule 做 parse 校验：
+服务器启动时，在 `validate_config()` 中对所有非空的 cron schedule 做 parse 校验：
 
 ```rust
 if !cfg.send_purge_schedule.is_empty() && cfg.send_purge_schedule.parse::<Schedule>().is_err() {
@@ -125,7 +125,25 @@ if !cfg.send_purge_schedule.is_empty() && cfg.send_purge_schedule.parse::<Schedu
 }
 ```
 
-校验失败会直接调用 `err!()` 宏，导致进程 panic 退出。
+此处 `err!()` 宏的定义见 [error.rs:327-337](src/error.rs#L327-L337)，其行为是 **`return Err(Error::new_msg(msg))`**，即返回 `Result::Err`，而非 panic。
+
+但 `validate_config()` 的返回值 `Result<(), Error>` 最终被消费于 [config.rs:44-47](src/config.rs#L44-L47)：
+
+```rust
+rt.block_on(Config::load()).unwrap_or_else(|e| {
+    println!("Error loading config:\n  {e:?}\n");
+    exit(12)  // 退出码 12
+})
+```
+
+因此，cron 校验失败的实际效果链是：
+
+```
+err!() → return Err(Error) → validate_config() 返回 Err
+→ Config::load() 返回 Err → unwrap_or_else → exit(12)
+```
+
+**结论**：不是 panic，而是**以退出码 12 正常退出进程**。对运维而言，进程消失但不会产生 panic 回溯栈。
 
 **校验覆盖范围（已校验）**：
 - `SEND_PURGE_SCHEDULE`
@@ -140,7 +158,7 @@ if !cfg.send_purge_schedule.is_empty() && cfg.send_purge_schedule.parse::<Schedu
 - `DUO_CONTEXT_PURGE_SCHEDULE`
 - `PURGE_INCOMPLETE_SSO_AUTH`
 
-这两个配置项没有启动校验，若配置错误会在 `schedule_jobs()` 注册时通过 `.parse().unwrap()` panic，表现为**启动后才崩溃**而非启动时失败。
+这两个配置项没有启动校验。若配置错误，会在 `schedule_jobs()` 注册时通过 `.parse().unwrap()` 触发**真正的 panic**（因为 `unwrap()` 在 `Err` 上 panic），且 panic 发生在独立 OS 线程 `job-scheduler` 中而非主线程——进程不会因此自动退出，而是调度线程静默崩溃，所有定时任务停止运行。
 
 **阶段二：注册时 parse**（[main.rs:681](src/main.rs#L681) 等各处）
 
@@ -148,7 +166,7 @@ if !cfg.send_purge_schedule.is_empty() && cfg.send_purge_schedule.parse::<Schedu
 sched.add(Job::new(CONFIG.send_purge_schedule().parse().unwrap(), || { ... }));
 ```
 
-理论上启动校验已保证合法性，但仍使用 `unwrap()`。如果动态修改 CONFIG（虽然实际上是只读的），这里可能 panic。
+理论上启动校验已保证合法性，但仍使用 `unwrap()`。由于 CONFIG 在运行时是只读的，不存在动态修改导致 parse 失败的路径。
 
 ### 2.6 紧急访问任务的时间依赖与自定义配置风险
 
@@ -182,17 +200,56 @@ sched.add(Job::new(CONFIG.send_purge_schedule().parse().unwrap(), || { ... }));
 
 如果用户自定义这两个 cron 表达式，可能出现以下情况：
 
-##### 场景 1：设为同一时间点（风险 ⚠️）
+##### 场景 1：设为同一时间点——reminder 是否仍会提醒？
 
 ```bash
 EMERGENCY_REQUEST_TIMEOUT_SCHEDULE="0 5 * * * *"
 EMERGENCY_NOTIFICATION_REMINDER_SCHEDULE="0 5 * * * *"
 ```
 
-- 同一 tick 内按注册顺序：timeout 闭包先提交，reminder 后提交
-- 但 tokio 调度顺序不确定，两个异步任务可能并发执行
-- **风险**：reminder 发送邮件时，timeout 刚好把状态改为 `RecoveryApproved`，导致 `find_all_recoveries_initiated` 查询不到，错过提醒
-- **反向风险**：reminder 先查询到记录并发送邮件，timeout 随后批准，造成不必要的提醒
+同一 tick 内，两个闭包按注册顺序依次被 `runtime.spawn()` 提交到 tokio。提交是同步的、非阻塞的，之后两个异步任务在 tokio 调度器中并发运行。关键在于：**两个任务各自独立从连接池获取数据库连接**（`pool.get().await`），各自持有独立的 `DbConn`。
+
+追踪 [emergency_request_timeout_job](src/api/core/emergency_access.rs#L722-L775) 的执行流：
+
+```
+1. pool.get().await           → 获取连接 conn_t
+2. find_all_recoveries_initiated(&conn_t)  → SELECT ... WHERE status = RecoveryInitiated
+3. for each emer:
+   a. 判断 recovery_allowed_at <= now
+   b. update_access_status_and_save(RecoveryApproved, &now, &conn_t)
+      → UPDATE ... SET status=Approved, updated_at=now WHERE uuid=X
+   c. 发送邮件
+```
+
+追踪 [emergency_notification_reminder_job](src/api/core/emergency_access.rs#L777-L834) 的执行流：
+
+```
+1. pool.get().await           → 获取连接 conn_r
+2. find_all_recoveries_initiated(&conn_r)  → SELECT ... WHERE status = RecoveryInitiated
+3. for each emer:
+   a. 判断 final_recovery_reminder_at <= now && next_recovery_reminder_at <= now
+   b. update_last_notification_date_and_save(&now, &conn_r)
+      → UPDATE ... SET last_notification_at=now, updated_at=now WHERE uuid=X
+   c. 发送邮件
+```
+
+**两种可能的执行交错**：
+
+**交错 A：timeout 先完成 SELECT，再 UPDATE 了 status**
+- reminder 随后做 SELECT，此时该记录 `status = RecoveryApproved`，不再满足 `find_all_recoveries_initiated` 的过滤条件
+- **结果：该记录不会出现在 reminder 列表中，不发送提醒邮件** ✓
+
+**交错 B：reminder 先完成 SELECT（此时 status 仍为 RecoveryInitiated）**
+- reminder 拿到了包含该记录的列表
+- 即使 timeout 随后 UPDATE 了 status，reminder 的列表已经是内存中的快照，不会重新查询
+- **结果：reminder 仍会对该记录发送提醒邮件，然后 UPDATE last_notification_at**
+- 这封提醒邮件是**不必要的**——因为 timeout 随后就会批准该请求
+
+**结论**：同秒命中时，reminder **可能仍会提醒**（取决于 SELECT 和 UPDATE 的交错时机）。具体来说：
+- 如果 timeout 的 UPDATE 在 reminder 的 SELECT 之前完成 → 不提醒
+- 如果 reminder 的 SELECT 在 timeout 的 UPDATE 之前完成 → **会提醒**（多余邮件）
+
+两种交错的概率取决于 tokio 调度和数据库响应速度。由于两个任务各自持有独立的 `DbConn`，不存在连接级串行化，交错 B 是完全可能的。
 
 ##### 场景 2：timeout 先于 reminder 执行（正确的时序）
 
