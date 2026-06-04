@@ -83,9 +83,131 @@ loop {
 | 事件日志清理 | `CONFIG.org_events_enabled() && CONFIG.events_days_retain().is_some()` | [main.rs:732-734](src/main.rs#L732-L734) |
 | 其余所有 | 仅检查 schedule 非空 | 各 `if !CONFIG.xxx_schedule().is_empty()` |
 
-### 2.4 同一 tick 内的执行顺序
+### 2.4 Tick 延迟与 Missed Run 补跑机制
 
-`job_scheduler_ng` 的 [JobScheduler::tick()](https://github.com/BlackDex/job_scheduler/blob/master/src/lib.rs#L327-L330) 实现非常简单：
+#### Job::tick() 的完整逻辑
+
+Vaultwarden 使用 `job_scheduler_ng` v2.4.0 的默认 feature `cron`（[Cargo.toml:140](Cargo.toml#L140)，[job_scheduler_ng/Cargo.toml](https://github.com/BlackDex/job_scheduler/blob/master/Cargo.toml) 默认 `features = ["cron"]`）。
+
+`Job::tick()` 的完整源码如下（[job_scheduler_ng/src/lib.rs](https://github.com/BlackDex/job_scheduler/blob/master/src/lib.rs)）：
+
+```rust
+#[cfg(feature = "cron")]
+fn tick(&mut self) {
+    let now = Utc::now().with_timezone(&self.tz);
+    if let Some(last_tick) = self.last_tick {
+        if self.limit_missed_runs > 0 {
+            for event in self.cron.after(&last_tick).take(self.limit_missed_runs) {
+                if event > now {
+                    break;
+                }
+                (self.run)();
+            }
+        } else {
+            for event in self.cron.after(&last_tick) {
+                if event > now {
+                    break;
+                }
+                (self.run)();
+            }
+        }
+    }
+    self.last_tick = Some(now);
+}
+```
+
+按代码顺序逐步分析：
+
+1. **获取当前时刻** `now`
+2. **检查 `last_tick`**：若为 `None`（首次 tick），跳过整个循环，直接到步骤 6
+3. **`self.cron.after(&last_tick)`**：生成 `last_tick` **之后**的所有计划时刻迭代器
+4. **`.take(self.limit_missed_runs)`**：限制最多检查 N 个计划时刻
+5. **遍历每个 event**：
+   - 若 `event > now`（尚未到期）→ `break` 停止检查
+   - 若 `event <= now`（已到期或正在到期）→ 执行闭包 `(self.run)()`
+6. **无论是否执行了闭包**，始终执行 `self.last_tick = Some(now)`
+
+#### 首次 Tick 的特殊行为
+
+`Job::new()` 初始化时 `last_tick = None`。因此：
+
+- **服务器启动后的第一次 `sched.tick()` 不会触发任何 Job**
+- 它仅设置 `last_tick = Some(now)` 作为后续 tick 的时间基准
+- 这意味着启动时刻恰好命中的 cron 时间点会被**跳过**，直到下一个计划时刻到来
+
+#### 默认补跑上限：limit_missed_runs = 1
+
+`Job::new()` 的默认值：
+
+```rust
+limit_missed_runs: 1,
+```
+
+Vaultwarden 的 [schedule_jobs()](src/main.rs#L663-L762) 中**没有任何 `job.limit_missed_runs()` 调用**，因此所有 Job 都使用默认值 1。
+
+`limit_missed_runs = 1` 意味着 `.take(1)` ——每次 tick 最多只检查 **1 个**计划时刻。这直接决定了补跑能力：
+
+- **补跑 1 次**：如果只有 1 个计划时刻在 `last_tick` 到 `now` 之间被跳过，它可以被补上
+- **无法补跑多次**：如果连续多个计划时刻被跳过（tick 延迟超过一个周期），只有最早的那个被补上，其余**永久丢失**
+
+#### 时序示例：正常执行
+
+以 `0 5 * * * *`（每小时第 5 分钟第 0 秒）为例，`JOB_POLL_INTERVAL_MS = 30000`：
+
+```
+tick 时刻       last_tick      cron.after(&last_tick)  take(1)   event <= now?   动作
+───────────────────────────────────────────────────────────────────────────────────────
+10:00:30        None           (跳过)                   -         -              设 last_tick=10:00:30
+10:01:00        10:00:30       10:01:05,...             10:01:05  10:01:05 > now  break，不执行
+10:01:30        10:01:00       10:01:05,...             10:01:05  10:01:05 ≤ now  ✓ 执行
+10:02:00        10:01:30       10:02:05,...             10:02:05  10:02:05 > now  break，不执行
+10:02:30        10:02:00       10:02:05,...             10:02:05  10:02:05 ≤ now  ✓ 执行
+```
+
+每个计划时刻都能在其后的第一个 tick 中被捕获并执行。
+
+#### 时序示例：Tick 延迟导致 Missed Run
+
+同一 Job，假设 tick 3 发生时系统卡顿（如数据库慢查询导致 `pool.get()` 超时），延迟到 10:05:30 才执行：
+
+```
+tick 时刻       last_tick      cron.after(&last_tick)         take(1)   event ≤ now?   动作
+─────────────────────────────────────────────────────────────────────────────────────────────
+10:00:30        None           (跳过)                          -         -              last_tick=10:00:30
+10:01:30        10:00:30       10:01:05,...                    10:01:05  ≤ now          ✓ 执行 10:01:05
+10:05:30        10:01:30       10:02:05,10:03:05,10:04:05,...  10:02:05  ≤ now          ✓ 执行 10:02:05
+                                                                            ← take(1) 耗尽，循环结束
+10:06:00        10:05:30       10:06:05,...                    10:06:05  > now          break
+10:06:30        10:06:00       10:06:05,...                    10:06:05  ≤ now          ✓ 恢复正常
+```
+
+**10:03:05、10:04:05、10:05:05 三个计划时刻被永久丢失。**
+
+原因：
+- tick 3 在 10:05:30 时，`cron.after(&10:01:30)` 从 10:02:05 开始枚举
+- `.take(1)` 只取 10:02:05 一个，执行后循环结束
+- `last_tick` 被设为 10:05:30
+- 下一个 tick 从 10:06:05 开始枚举，10:03~10:05 的计划时刻已经落在 `last_tick` 之前，不会再被访问
+
+#### 对 Vaultwarden 各 Job 的实际影响
+
+| Job | 周期 | 丢失一次的影响 | 丢失多次的影响 |
+|-----|------|--------------|--------------|
+| Send 清理 | 每小时 | 下次补上，无影响 | 同左 |
+| Cipher 回收站 | 每天 | 下次补上，无影响 | 同左 |
+| Auth Request 清理 | 每分钟 | 下次补上，无影响 | 同左 |
+| Duo Context 清理 | 每分钟 | 下次补上，无影响 | 同左 |
+| Event 清理 | 每天 | 下次补上，无影响 | 同左 |
+| SSO Auth 清理 | 每天 | 下次补上，无影响 | 同左 |
+| **2FA 通知** | 每分钟 | **若丢失，用户收不到该次告警邮件** | **多次丢失=多次漏通知** |
+| **紧急访问超时** | 每小时 | **若丢失，授权延迟 1 小时** | **更长时间延迟** |
+| **紧急访问提醒** | 每小时 | **若丢失，提醒延迟 1 小时** | **更长时间延迟** |
+
+清理类 Job 天然幂等，丢失只是推迟；通知/状态流转类 Job 丢失则造成**功能性延迟**。
+
+### 2.5 同一 tick 内的执行顺序
+
+`JobScheduler::tick()` 的实现：
 
 ```rust
 pub fn tick(&mut self) {
@@ -94,8 +216,6 @@ pub fn tick(&mut self) {
     }
 }
 ```
-
-这意味着：
 
 1. **遍历顺序严格等于 `sched.add()` 注册顺序**：
    - [main.rs:679-746](src/main.rs#L679-L746) 的注册顺序：send_purge → trash_purge → incomplete_2fa → **emergency_request_timeout** → **emergency_notification_reminder** → auth_request_purge → duo_context_purge → event_cleanup → sso_auth_purge
@@ -111,7 +231,7 @@ pub fn tick(&mut self) {
    - 但实际并发执行顺序不可预测
    - 对于有依赖关系的 Job（如紧急访问的两个任务），同一时间点命中可能产生竞态
 
-### 2.5 Cron 配置校验
+### 2.6 Cron 配置校验
 
 配置校验分为两个阶段：
 
@@ -168,7 +288,7 @@ sched.add(Job::new(CONFIG.send_purge_schedule().parse().unwrap(), || { ... }));
 
 理论上启动校验已保证合法性，但仍使用 `unwrap()`。由于 CONFIG 在运行时是只读的，不存在动态修改导致 parse 失败的路径。
 
-### 2.6 紧急访问任务的时间依赖与自定义配置风险
+### 2.7 紧急访问任务的时间依赖与自定义配置风险
 
 #### 默认配置的时间差设计
 
@@ -365,15 +485,14 @@ EMERGENCY_NOTIFICATION_REMINDER_SCHEDULE="0 2 * * * *"  # 第 2 分钟
 
 ## 4. 重复执行保护
 
-### 4.1 调度器层面：cron 粒度天然防重
+### 4.1 调度器层面：cron 匹配与补跑限制
 
-`job_scheduler_ng` 的 cron 匹配是**时间点匹配**而非"至少间隔"语义。
-以 `0 5 * * * *`（每小时第 5 分钟）为例，只有在 `:05:00` 这一个 tick 才会触发。
-由于 `JOB_POLL_INTERVAL_MS` 默认 30 秒，tick 频率远高于 cron 最小粒度（秒级），
-因此每个 cron 时间点只会被命中一次。
+`job_scheduler_ng` 的 cron 匹配采用 `cron.after(&last_tick)` 迭代器模式（详见 2.4 节分析）。
+每次 tick 最多检查 `limit_missed_runs`（默认 1）个计划时刻，对已到期的事件执行补跑。
 
-**但存在风险场景**：如果某次 tick 执行时间超过一个 poll interval（如数据库慢查询），
-`sched.tick()` 不会为"跳过"的时间点补触发——这是 `job_scheduler_ng` 的设计，它只匹配"当前 tick 时刻"。
+- **单次延迟**：如果 tick 延迟导致恰好错过 1 个计划时刻，下一次 tick 会补跑该时刻
+- **多次延迟**：如果 tick 延迟导致错过 N > 1 个计划时刻，下一次 tick 只补跑最早的 1 个，其余 N-1 个永久丢失
+- **同秒不重复**：由于 `cron.after(&last_tick)` 返回 `last_tick` **之后**的时刻，已执行的计划时刻不会被重复命中
 
 ### 4.2 运行时层面：`runtime.spawn` 即忘即弃
 
