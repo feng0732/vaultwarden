@@ -109,7 +109,57 @@ if !headers.user.check_valid_password(&data.old_master_key_authentication_hash) 
 - 按 organization_id 匹配并更新 `reset_password_key`
 
 **Step 6：更新 Sends** — [accounts.rs:872-879](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L872-L879)
-- 通过 [update_send_from_data](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs) 更新 send 的 `akey` 和加密数据
+- 通过 [update_send_from_data](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs#L609-L665) 更新 send 的 `akey` 和加密数据
+
+#### 3.2.1 File Send vs Text Send 在密钥轮换中的不对称更新
+
+Send 分为 Text Send（类型 0）和 File Send（类型 1）。两者都会在轮换时更新 `send.akey`、`name`、`notes`、删除时间等通用字段，但 `sends.data` 的更新路径不同。
+
+**SendData 请求结构** — [sends.rs:72-91](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs#L72-L91)：
+```rust
+pub struct SendData {
+    r#type: i32,            // 0 = Text, 1 = File
+    key: String,            // 用新 User Key 重新加密后的 Send Key
+    name: String,
+    notes: Option<String>,
+    text: Option<Value>,    // Text Send 专用
+    file: Option<Value>,    // File Send 专用；更新时通常为 null
+    pub id: Option<SendId>, // key rotation 用来定位已有 Send
+}
+```
+
+**update_send_from_data 的关键分支** — [sends.rs:631-641](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs#L631-L641)：
+```rust
+// When updating a file Send, we receive nulls in the File field, as it's immutable,
+// so we only need to update the data field in the Text case
+if data.r#type == SendType::Text as i32 {
+    let data_str = if let Some(mut d) = data.text {
+        d.as_object_mut().and_then(|d| d.remove("response"));
+        serde_json::to_string(&d)?
+    } else {
+        err!("Send data not provided");
+    };
+    send.data = data_str;
+}
+
+send.name = data.name;
+send.akey = data.key;
+send.notes = data.notes;
+```
+
+结论：
+
+1. **Text Send 会重写 `sends.data`**。Text 类型的数据体来自请求里的 `text` 字段，服务端去掉 `response` 后重新序列化并覆盖 `send.data`。
+2. **File Send 不重写 `sends.data`**。注释明确说明更新 File Send 时收到的 `file` 字段为 null，因为文件信息不可变，所以服务端只在 Text 分支更新 data。
+3. **两种类型都会更新 `send.akey`**。轮换改变的是“用新 User Key 包裹 Send Key 的密文”，不是让服务端解密或重新加密文件内容。
+4. **服务端不判断 file/text 内容是否加密**。`sends.data` 只是客户端提交的 JSON 字符串；对 File Send 来说，服务端保留原有 data，并继续通过 [Send::to_json](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/send.rs#L155-L156) 按 atype 输出到 `file` 字段。
+
+**to_json 序列化时的对应关系**：
+```rust
+"text": if self.atype == SendType::Text as i32 { Some(&data) } else { None },
+"file": if self.atype == SendType::File as i32 { Some(&data) } else { None },
+```
+同一个 `sends.data` 字段会根据 atype 被映射成响应里的 `text` 或 `file`，但轮换更新阶段只有 Text Send 会把请求体重新写入 `sends.data`。
 
 **Step 7：更新 Ciphers（核心步骤）** — [accounts.rs:881-894](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L881-L894)
 - 仅处理个人 ciphers（`organization_id.is_none()`）
@@ -433,6 +483,62 @@ DB: cipher.key = NULL
 
 4. **仅处理个人密码**：组织密码（`organization_id.is_some()`）在轮换流程中被跳过，由组织密钥轮换机制处理。
 
+#### 6.3.1 id 缺失与额外条目的边界条件
+
+轮换接口对全量数据覆盖的检查分成“校验阶段”和“更新阶段”。这里的细节是：Ciphers、Sends、Folders 的 id 都是 `Option`，但后续处理方式不一样。
+
+**id 字段定义**：
+
+| 数据类型 | id 字段 | 代码位置 |
+|----------|--------|----------|
+| Cipher | `id: Option<CipherId>` | [ciphers.rs:256](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/ciphers.rs#L256) |
+| Send | `pub id: Option<SendId>` | [sends.rs:90](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs#L90) |
+| Folder | `id: Option<FolderId>` | [accounts.rs:657](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L657) |
+| Emergency Access | `id: EmergencyAccessId`，不可缺失 | [accounts.rs:664](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L664) |
+| Reset Password Key | `organization_id: OrganizationId`，不可缺失 | [accounts.rs:671](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L671) |
+
+**校验阶段：只检查已有 id 是否被覆盖**
+
+以 Sends 为例，[validate_keydata](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L787-L792) 使用 `filter_map` 收集请求里的 id：
+```rust
+let existing_send_ids = existing_sends.iter().map(|s| &s.uuid).collect::<HashSet<&SendId>>();
+let provided_send_ids = data.account_data.sends.iter().filter_map(|s| s.id.as_ref()).collect::<HashSet<&SendId>>();
+if !provided_send_ids.is_superset(&existing_send_ids) {
+    err!("All existing sends must be included in the rotation")
+}
+```
+
+这个阶段有两个后果：
+
+- `id = None` 的条目会被过滤掉；只要其他条目已经覆盖数据库里的所有既有 id，校验仍可通过。
+- 额外 id 不会被挡住；`is_superset` 只要求“包含全部已有 id”，不要求请求集合与数据库集合完全相等。
+
+Ciphers 的校验逻辑相同，也使用请求 id 集合对既有 id 集合做超集检查。
+
+**更新阶段：Ciphers/Sends 使用 unwrap，Folders 用 if let**
+
+Sends 更新循环 [accounts.rs:873-L879](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L873-L879)：
+```rust
+for send_data in data.account_data.sends {
+    let Some(send) = existing_sends.iter_mut().find(|s| &s.uuid == send_data.id.as_ref().unwrap()) else {
+        err!("Send doesn't exist")
+    };
+    update_send_from_data(send, send_data, ...)
+}
+```
+
+Ciphers 更新循环也直接对 `cipher_data.id.as_ref().unwrap()` 做匹配。相比之下，Folders 先用 `if let Some(folder_id) = folder_data.id` 判断，缺 id 的条目会被安全跳过。
+
+| 数据类型 | 缺失 id（校验阶段） | 缺失 id（更新阶段） | 额外不存在 id（更新阶段） |
+|----------|-------------------|-------------------|----------------------|
+| Ciphers | 可能通过：`filter_map` 会过滤 None | `unwrap()` 触发 panic | 返回 `Cipher doesn't exist` |
+| Sends | 可能通过：`filter_map` 会过滤 None | `unwrap()` 触发 panic | 返回 `Send doesn't exist` |
+| Folders | 可能通过：`filter_map` 会过滤 None | `if let` 安全跳过 | 返回 `Folder doesn't exist` |
+| Emergency Access | id 非 Option，反序列化阶段就必须存在 | 不适用 | 返回业务错误 |
+| Reset Password Key | organization_id 非 Option，反序列化阶段就必须存在 | 不适用 | 返回业务错误 |
+
+因此，`id = None` 的 Cipher/Send 条目是一个校验-更新不一致的边界：校验阶段可能因为 `filter_map` 被忽略，更新阶段却会在 `unwrap()` 处触发 panic。额外但不存在的 id 则不会 panic，会走到明确的业务错误。
+
 ### 6.4 事务与部分失败问题
 
 代码中有明确的 TODO 注释：[accounts.rs:799](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L799-L799) 和 [accounts.rs:814](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L814-L814)
@@ -486,3 +592,12 @@ DB: cipher.key = NULL
 | validate_keydata 的 cipher ID 超集校验 | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L740-L751 |
 | 轮换中 Send UpdateType::None 调用 | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L872-L879 |
 | 轮换中 Cipher UpdateType::None 调用 | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L881-L894 |
+| SendData 请求结构（含 text/file/id 字段） | [sends.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs) | L70-L91 |
+| update_send_from_data 中 Text/File 分支 | [sends.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs) | L631-L641 |
+| Send.to_json 中 text/file 序列化分支 | [send.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/send.rs) | L155-L156 |
+| validate_keydata 的 send ID 校验（含 filter_map） | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L787-L792 |
+| Sends 更新循环（含 unwrap 风险） | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L873-L879 |
+| Ciphers 更新循环（含 unwrap 风险） | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L883-L892 |
+| Folders 更新循环（if let 安全模式） | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L835-L845 |
+| UpdateFolderData 结构（含 Option<FolderId>） | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L650-L659 |
+| UpdateEmergencyAccessData 结构 | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L661-L666 |
