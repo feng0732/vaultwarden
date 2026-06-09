@@ -6,11 +6,11 @@ Vaultwarden 的同步机制基于**时间戳游标**而非显式的 Sync Token �
 
 | 层次 | 机制 | 主要文件 |
 |------|------|----------|
-| 用户级游标 | `User.updated_at` 作为全局同步版本号 | [user.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/db/models/user.rs) |
-| 实体级时间戳 | 每个实体（Cipher/Folder/Send/...）各自维护 `updated_at` / `revision_date` | [cipher.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/db/models/cipher.rs), [folder.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/db/models/folder.rs), [send.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/db/models/send.rs) |
-| 实时推送 | WebSocket + Push Notification 通知变更 | [notifications.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/notifications.rs), [push.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/push.rs) |
+| 用户级游标 | `User.updated_at` 作为全局同步版本号 | `src/db/models/user.rs` |
+| 实体级时间戳 | 每个实体（Cipher/Folder/Send/...）各自维护 `updated_at` / `revision_date` | `src/db/models/cipher.rs`, `src/db/models/folder.rs`, `src/db/models/send.rs` |
+| 实时推送 | WebSocket + Push Notification 通知变更 | `src/api/notifications.rs`, `src/api/push.rs` |
 
-同步入口位于 [ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/core/ciphers.rs#L121-L204) 的 `sync` 函数。
+同步入口位于 `src/api/core/ciphers.rs` 的 `sync` 函数（约 L121-L204）。
 
 ---
 
@@ -20,7 +20,7 @@ Vaultwarden 的同步机制基于**时间戳游标**而非显式的 Sync Token �
 
 Vaultwarden 没有独立的 "sync token" 字段，而是使用 `users.updated_at` 列作为用户的全局同步版本号。
 
-**字段定义** ([user.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/db/models/user.rs#L29-L72))：
+**字段定义**（`src/db/models/user.rs` User 结构体）：
 
 ```rust
 pub struct User {
@@ -31,7 +31,7 @@ pub struct User {
 }
 ```
 
-**游标获取 API** ([accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/core/accounts.rs#L1169-L1174))：
+**游标获取 API**（`src/api/core/accounts.rs` revision_date 函数）：
 
 ```rust
 #[get("/accounts/revision-date")]
@@ -45,12 +45,11 @@ fn revision_date(headers: Headers) -> JsonResult {
 
 ### 2.2 游标的更新传播
 
-当任何关联数据发生变化时，`User.updated_at` 会被级联更新。核心入口是 [update_users_revision](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/db/models/cipher.rs#L414-L440)：
+当任何关联数据发生变化时，`User.updated_at` 会被级联更新。核心入口是 `Cipher::update_users_revision`（`src/db/models/cipher.rs`，约 L414-L440）：
 
 **Cipher 变更时的传播**：
 
 ```rust
-// cipher.rs L414-L440
 pub async fn update_users_revision(&self, conn: &DbConn) -> Vec<UserId> {
     let mut user_uuids = Vec::new();
     match self.user_uuid {
@@ -78,7 +77,7 @@ pub async fn update_users_revision(&self, conn: &DbConn) -> Vec<UserId> {
 }
 ```
 
-**底层更新实现** ([user.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/db/models/user.rs#L351-L386))：
+**底层更新实现**（`src/db/models/user.rs` update_uuid_revision 函数）：
 
 ```rust
 pub async fn update_uuid_revision(uuid: &UserId, conn: &DbConn) {
@@ -91,9 +90,9 @@ pub async fn update_uuid_revision(uuid: &UserId, conn: &DbConn) {
 
 | 实体 | 触发位置 |
 |------|----------|
-| Cipher | [cipher.rs L442-L445](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/db/models/cipher.rs#L442-L445) `save()` → `update_users_revision()` |
-| Folder | [folder.rs L75-L77](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/db/models/folder.rs#L75-L77) `save()` → `User::update_uuid_revision()` |
-| Collection | [collection.rs L161-L162](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/db/models/collection.rs#L161-L162) `save()` → `update_users_revision()` |
+| Cipher | `src/db/models/cipher.rs` `save()` → `update_users_revision()` |
+| Folder | `src/db/models/folder.rs` `save()` → `User::update_uuid_revision()` |
+| Collection | `src/db/models/collection.rs` `save()` → `update_users_revision()` |
 | Send | 类似，`save()` 时更新 |
 | Organization | 类似 |
 
@@ -105,7 +104,7 @@ pub async fn update_uuid_revision(uuid: &UserId, conn: &DbConn) {
 
 **重要发现**：Vaultwarden 当前的 `/sync` 端点**不支持服务端增量筛选**。每次同步都会返回用户可见的全部数据。
 
-同步入口 [ciphers.rs L121-L204](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/core/ciphers.rs#L121-L204)：
+同步入口（`src/api/core/ciphers.rs` sync 函数）：
 
 ```rust
 #[get("/sync?<data..>")]
@@ -137,11 +136,125 @@ async fn sync(data: SyncData, headers: Headers, ..., conn: DbConn) -> JsonResult
 
 客户端需要自行对比各实体的 `revisionDate` 字段来判断哪些需要更新。
 
-### 3.2 乐观并发控制：`LastKnownRevisionDate`
+### 3.2 响应级筛选：excludeDomains 与 SSH Key 隐藏
+
+虽然没有基于时间戳的增量筛选，但 `/sync` 端点在响应组装前做了**两项条件筛选**。
+
+#### 3.2.1 excludeDomains 参数对 domains 字段的影响
+
+**请求参数定义**（`src/api/core/ciphers.rs` SyncData 结构体）：
+
+```rust
+#[derive(FromForm, Default)]
+struct SyncData {
+    #[field(name = "excludeDomains")]
+    exclude_domains: bool, // Default: 'false'
+}
+```
+
+**筛选逻辑**（sync 函数内部，组装 domains_json 处）：
+
+```rust
+let domains_json = if data.exclude_domains {
+    Value::Null                              // excludeDomains=true → 返回 null
+} else {
+    api::core::get_eq_domains(&headers, true).into_inner()  // 否则返回等价域名数据
+};
+```
+
+当 `excludeDomains=true` 时，响应中的 `domains` 字段直接为 `null`，跳过等价域名查询。
+
+**域名数据来源**（`src/api/core/mod.rs` get_eq_domains 函数）：
+
+```rust
+fn get_eq_domains(headers: &Headers, no_excluded: bool) -> Json<Value> {
+    let user = &headers.user;
+    let equivalent_domains: Vec<Vec<String>> = from_str(&user.equivalent_domains).unwrap();
+    let excluded_globals: Vec<i32> = from_str(&user.excluded_globals).unwrap();
+
+    let mut globals: Vec<GlobalDomain> = from_str(GLOBAL_DOMAINS).unwrap();
+    for global in &mut globals {
+        global.excluded = excluded_globals.contains(&global.r#type);
+    }
+
+    // sync 调用时 no_excluded=true → 过滤掉用户已排除的全局域名组
+    if no_excluded {
+        globals.retain(|g| !g.excluded);
+    }
+
+    Json(json!({
+        "equivalentDomains": equivalent_domains,
+        "globalEquivalentDomains": globals,
+        "object": "domains",
+    }))
+}
+```
+
+注意：同步接口调用 `get_eq_domains` 时第二个参数 `no_excluded=true`，意味着返回的 `globalEquivalentDomains` 还会额外过滤掉用户在设置中排除的全局域名组（与 `/settings/domains` 端点行为不同，后者保留全部并标记 excluded 字段）。
+
+#### 3.2.2 低版本客户端隐藏 SSH Key
+
+**客户端版本解析**（`src/auth.rs` ClientVersion 请求守卫）：
+
+```rust
+pub struct ClientVersion(pub semver::Version);
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for ClientVersion {
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        let headers = request.headers();
+
+        // 从 HTTP Header "Bitwarden-Client-Version" 读取 semver 版本号
+        let Some(version) = headers.get_one("Bitwarden-Client-Version") else {
+            err_handler!("No Bitwarden-Client-Version header provided")
+        };
+
+        let Ok(version) = semver::Version::parse(version) else {
+            err_handler!("Invalid Bitwarden-Client-Version header provided")
+        };
+
+        Outcome::Success(ClientVersion(version))
+    }
+}
+```
+
+sync 函数签名中 `client_version: Option<ClientVersion>`，意味着版本头是可选的。
+
+**SSH Key 筛选逻辑**（sync 函数内部，约 L128-L137）：
+
+```rust
+// Filter out SSH keys if the client version is less than 2024.12.0
+let show_ssh_keys = if let Some(client_version) = client_version {
+    let ver_match = semver::VersionReq::parse(">=2024.12.0").unwrap();
+    ver_match.matches(&client_version.0)
+} else {
+    false   // 未提供版本头 → 默认隐藏
+};
+if !show_ssh_keys {
+    ciphers.retain(|c| c.atype != 5);  // atype=5 即 SshKey
+}
+```
+
+完整判定表：
+
+| 条件 | show_ssh_keys | 结果 |
+|------|--------------|------|
+| 未提供 `Bitwarden-Client-Version` Header | `false` | 过滤掉所有 `atype=5` 的密文 |
+| 版本 `< 2024.12.0` | `false` | 过滤掉所有 `atype=5` 的密文 |
+| 版本 `>= 2024.12.0` | `true` | 保留 SSH Key 类型密文 |
+
+Cipher 类型定义（`src/db/models/cipher.rs`）：
+- `1` = Login
+- `2` = SecureNote
+- `3` = Card
+- `4` = Identity
+- `5` = **SshKey**（SSH Key 是 v2024.12.0 引入的新类型）
+
+### 3.3 乐观并发控制：`LastKnownRevisionDate`
 
 虽然不支持服务端增量拉取，但在**写入**时有基于时间戳的冲突检测机制。
 
-**请求字段定义** ([ciphers.rs L293-L299](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/core/ciphers.rs#L293-L299))：
+**请求字段定义**（`src/api/core/ciphers.rs` CipherData 结构体）：
 
 ```rust
 pub struct CipherData {
@@ -153,7 +266,7 @@ pub struct CipherData {
 }
 ```
 
-**冲突检测逻辑** ([ciphers.rs L420-L433](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/core/ciphers.rs#L420-L433))：
+**冲突检测逻辑**（`src/api/core/ciphers.rs` update_cipher_from_data 内部）：
 
 ```rust
 // Check that the client isn't updating an existing cipher with stale data.
@@ -173,11 +286,9 @@ if ut != UpdateType::None
 
 判断逻辑：如果 `server_updated_at - client_last_known > 1 秒`，则返回错误要求客户端重新同步。
 
-### 3.3 创建 vs 更新的判断
+### 3.4 创建 vs 更新的判断
 
-在处理密文共享/更新时，通过 `last_known_revision_date` 是否存在来区分创建与更新操作，进而推送不同类型的通知：
-
-[ciphers.rs L1064-L1072](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/core/ciphers.rs#L1064-L1072)：
+在处理密文共享/更新时，通过 `last_known_revision_date` 是否存在来区分创建与更新操作，进而推送不同类型的通知（`src/api/core/ciphers.rs` share_cipher 内部）：
 
 ```rust
 // When LastKnownRevisionDate is None, it is a new cipher, so send CipherCreate.
@@ -190,20 +301,16 @@ let ut = if let Some(ut) = override_ut {
 };
 ```
 
-### 3.4 软删除标记：`deleted_at`
+### 3.5 软删除标记：`deleted_at`
 
-已删除的密文不会立即从数据库移除，而是通过 `deleted_at` 标记：
-
-[cipher.rs L340-L342](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/db/models/cipher.rs#L340-L342)：
+已删除的密文不会立即从数据库移除，而是通过 `deleted_at` 标记（`src/db/models/cipher.rs` to_json 方法）：
 
 ```rust
 "revisionDate": format_date(&self.updated_at),
 "deletedDate": self.deleted_at.map_or(Value::Null, |d| Value::String(format_date(&d))),
 ```
 
-定期清理任务通过 `find_deleted_before` 查找并彻底清除超过保留期的记录：
-
-[cipher.rs L967-L973](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/db/models/cipher.rs#L967-L973)：
+定期清理任务通过 `find_deleted_before` 查找并彻底清除超过保留期的记录（`src/db/models/cipher.rs`）：
 
 ```rust
 pub async fn find_deleted_before(dt: &NaiveDateTime, conn: &DbConn) -> Vec<Self> {
@@ -219,7 +326,7 @@ pub async fn find_deleted_before(dt: &NaiveDateTime, conn: &DbConn) -> Vec<Self>
 
 ### 4.1 UpdateType 枚举
 
-[notifications.rs L620-L654](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/notifications.rs#L620-L654)：
+（`src/api/notifications.rs` UpdateType 枚举）：
 
 ```rust
 pub enum UpdateType {
@@ -245,7 +352,7 @@ pub enum UpdateType {
 
 ### 4.2 Cipher 更新推送
 
-[notifications.rs L407-L454](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/notifications.rs#L407-L454)：
+（`src/api/notifications.rs` WebSocketUsers::send_cipher_update 方法）：
 
 ```rust
 pub async fn send_cipher_update(
@@ -284,7 +391,7 @@ pub async fn send_cipher_update(
 
 ### 4.3 消息格式（MessagePack）
 
-[notifications.rs L562-L593](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/notifications.rs#L562-L593)：
+（`src/api/notifications.rs` create_update 函数）：
 
 ```
 [
@@ -317,7 +424,7 @@ pub async fn send_cipher_update(
 
 为避免 N+1 查询问题，全量同步前先通过 `CipherSyncData` 一次性预加载所有关联数据。
 
-**结构体定义** ([ciphers.rs L2096-L2110](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/core/ciphers.rs#L2096-L2110))：
+**结构体定义**（`src/api/core/ciphers.rs` CipherSyncData 结构体）：
 
 ```rust
 pub struct CipherSyncData {
@@ -333,7 +440,7 @@ pub struct CipherSyncData {
 }
 ```
 
-**批量加载实现** ([ciphers.rs L2118-L2214](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/core/ciphers.rs#L2118-L2214))，以几个典型查询为例：
+**批量加载实现**（`src/api/core/ciphers.rs` CipherSyncData::new），以几个典型查询为例：
 
 ```rust
 pub async fn new(user_id: &UserId, sync_type: CipherSyncType, conn: &DbConn) -> Self {
@@ -364,7 +471,7 @@ pub async fn new(user_id: &UserId, sync_type: CipherSyncType, conn: &DbConn) -> 
 
 ### 5.2 单条 Cipher JSON 组装
 
-[cipher.rs L145-L412](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/db/models/cipher.rs#L145-L412) 的 `to_json` 方法利用预加载数据快速构建响应：
+`src/db/models/cipher.rs` 的 `to_json` 方法利用预加载数据快速构建响应：
 
 ```rust
 pub async fn to_json(
@@ -414,7 +521,7 @@ pub async fn to_json(
 
 ### 5.3 完整同步响应结构
 
-[ciphers.rs L191-L203](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/core/ciphers.rs#L191-L203)：
+（`src/api/core/ciphers.rs` sync 函数最终返回值）：
 
 ```json
 {
@@ -452,7 +559,7 @@ pub async fn to_json(
     ],
     "sends": [/* Send.to_json */],
     "policies": [/* OrgPolicy.to_json */],
-    "domains": { /* equivalent domains */ },
+    "domains": { /* equivalent domains 或 null */ },
     "userDecryption": { /* KDF params, encrypted user key */ },
     "object": "sync"
 }
@@ -463,62 +570,71 @@ pub async fn to_json(
 ## 6. 完整同步时序
 
 ```
-客户端                                  服务端 (Vaultwarden)
-  │                                        │
-  │──── GET /accounts/revision-date ──────▶│
-  │                                        │ 查询 users.updated_at
-  │◀─── 返回毫秒级时间戳 ──────────────────│
-  │                                        │
-  │  [本地比对：如时间戳无变化则跳过]       │
-  │                                        │
-  │──── GET /sync ────────────────────────▶│
-  │                                        │
-  │                                        │ 1. Cipher::find_by_user_visible()
-  │                                        │    → 全量拉取用户可见密文
-  │                                        │
-  │                                        │ 2. CipherSyncData::new()
-  │                                        │    → 批量预加载附件/文件夹/收藏/
-  │                                        │      集合/权限等关联数据
-  │                                        │
-  │                                        │ 3. Folder::find_by_user()
-  │                                        │    Collection::find_by_user_uuid()
-  │                                        │    Send::find_by_user()
-  │                                        │    OrgPolicy::find_confirmed_by_user()
-  │                                        │
-  │                                        │ 4. 逐项调用 to_json 组装
-  │                                        │
-  │◀─── 返回完整同步数据 ──────────────────│
-  │                                        │
-  │  [客户端按 revisionDate 逐条比对更新]   │
-  │                                        │
-  │────────────────────────────────────────│
-  │         WebSocket 长连接                │
-  │────────────────────────────────────────│
-  │                                        │  [其他设备修改数据]
-  │                                        │  → Cipher.save()
-  │                                        │    → update_users_revision()
-  │                                        │      → users.updated_at = NOW
-  │                                        │  → send_cipher_update()
-  │                                        │
-  │◀── ReceiveMessage(UpdateType, Payload)─│
-  │     {RevisionDate, Id, ...}            │
-  │                                        │
-  │  [根据推送决定是否重新 /sync]           │
+客户端                                          服务端 (Vaultwarden)
+  │                                                │
+  │──── GET /accounts/revision-date ─────────────▶│
+  │                                                │ 查询 users.updated_at
+  │◀─── 返回毫秒级时间戳 ──────────────────────────│
+  │                                                │
+  │  [本地比对：如时间戳无变化则跳过]               │
+  │                                                │
+  │──── GET /sync?excludeDomains=false ───────────▶│
+  │     Header: Bitwarden-Client-Version: 2025.1.0 │
+  │                                                │
+  │                                                │ 1. 解析 excludeDomains 参数（默认 false）
+  │                                                │ 2. 解析客户端版本（≥2024.12.0 → 保留 SSH Key）
+  │                                                │ 3. Cipher::find_by_user_visible()
+  │                                                │    → 全量拉取用户可见密文
+  │                                                │    → retain(|c| c.atype != 5) 可能过滤 SSH Key
+  │                                                │
+  │                                                │ 4. CipherSyncData::new()
+  │                                                │    → 批量预加载附件/文件夹/收藏/
+  │                                                │      集合/权限等关联数据
+  │                                                │
+  │                                                │ 5. Folder::find_by_user()
+  │                                                │    Collection::find_by_user_uuid()
+  │                                                │    Send::find_by_user()
+  │                                                │    OrgPolicy::find_confirmed_by_user()
+  │                                                │    get_eq_domains(no_excluded=true) 或 null
+  │                                                │
+  │                                                │ 6. 逐项调用 to_json 组装
+  │                                                │
+  │◀─── 返回完整同步数据 ──────────────────────────│
+  │                                                │
+  │  [客户端按 revisionDate 逐条比对更新]           │
+  │                                                │
+  │────────────────────────────────────────────────│
+  │         WebSocket 长连接                        │
+  │────────────────────────────────────────────────│
+  │                                                │  [其他设备修改数据]
+  │                                                │  → Cipher.save()
+  │                                                │    → update_users_revision()
+  │                                                │      → users.updated_at = NOW
+  │                                                │  → send_cipher_update()
+  │                                                │
+  │◀── ReceiveMessage(UpdateType, Payload) ────────│
+  │     {RevisionDate, Id, ContextId, ...}         │
+  │                                                │
+  │  [ContextId == 自身? 跳过 : 决定是否重新 /sync] │
 ```
 
 ---
 
 ## 7. 关键代码索引
 
-| 功能 | 文件 | 行号 |
-|------|------|------|
-| 全量同步入口 | [ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/core/ciphers.rs) | L121-L204 |
-| 游标获取 API | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/core/accounts.rs) | L1169-L1174 |
-| User 游标更新 | [user.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/db/models/user.rs) | L351-L386 |
-| Cipher 游标传播 | [cipher.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/db/models/cipher.rs) | L414-L445 |
-| 写冲突检测（LastKnownRevisionDate） | [ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/core/ciphers.rs) | L420-L433 |
-| CipherSyncData 批量预加载 | [ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/core/ciphers.rs) | L2096-L2214 |
-| Cipher JSON 组装 | [cipher.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/db/models/cipher.rs) | L145-L412 |
-| WebSocket 推送（Cipher） | [notifications.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/notifications.rs) | L407-L454 |
-| UpdateType 枚举 | [notifications.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/notifications.rs) | L620-L654 |
-| Push 通知转发 | [push.rs](file:///d:/fz/0601/solo-dogfeeding/code/131-vaultwarden/src/api/push.rs) | L160-L189 |
+| 功能 | 文件位置 | 区域 |
+|------|----------|------|
+| 全量同步入口 | `src/api/core/ciphers.rs` | sync 函数 |
+| 游标获取 API | `src/api/core/accounts.rs` | revision_date 函数 |
+| User 游标更新 | `src/db/models/user.rs` | update_uuid_revision / update_revision_impl |
+| Cipher 游标传播 | `src/db/models/cipher.rs` | update_users_revision |
+| excludeDomains 筛选 | `src/api/core/ciphers.rs` | sync 函数内 domains_json 分支 |
+| 等价域名组装 | `src/api/core/mod.rs` | get_eq_domains 函数 |
+| 客户端版本解析 | `src/auth.rs` | ClientVersion FromRequest impl |
+| SSH Key 版本筛选 | `src/api/core/ciphers.rs` | sync 函数内 show_ssh_keys 分支 |
+| 写冲突检测 LastKnownRevisionDate | `src/api/core/ciphers.rs` | update_cipher_from_data 内部 |
+| CipherSyncData 批量预加载 | `src/api/core/ciphers.rs` | CipherSyncData struct + new 方法 |
+| Cipher JSON 组装 | `src/db/models/cipher.rs` | to_json 方法 |
+| WebSocket 推送 Cipher | `src/api/notifications.rs` | WebSocketUsers::send_cipher_update |
+| UpdateType 枚举 | `src/api/notifications.rs` | UpdateType enum |
+| Push 通知转发 | `src/api/push.rs` | push_cipher_update 等函数 |
