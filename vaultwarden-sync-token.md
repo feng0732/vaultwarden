@@ -218,9 +218,33 @@ impl<'r> FromRequest<'r> for ClientVersion {
 }
 ```
 
-sync 函数签名中 `client_version: Option<ClientVersion>`，意味着版本头是可选的。
+sync 函数签名中参数类型为 `client_version: Option<ClientVersion>`，其中 `Option<T>` 在 Rocket 中的 FromRequest 语义是：**当内部守卫返回 Error 或 Forward 时，整体返回 Success(None)，而不是把错误抛给客户端**。
 
-**SSH Key 筛选逻辑**（sync 函数内部，约 L128-L137）：
+因此版本头缺失或解析失败不会导致请求 4xx，只会让 `client_version = None`，进入默认隐藏分支。
+
+**边界一：版本头缺失或解析失败的处理路径**：
+
+```
+请求进入 sync 处理器
+  │
+  ├─ Header "Bitwarden-Client-Version" 缺失
+  │   → ClientVersion::from_request 返回 Outcome::Error
+  │   → Option<ClientVersion> 包裹后变为 None
+  │   → show_ssh_keys = false
+  │
+  ├─ Header 存在但非法（如 "abc", "2024" 等非 semver）
+  │   → semver::Version::parse 返回 Err
+  │   → ClientVersion::from_request 返回 Outcome::Error
+  │   → Option<ClientVersion> 包裹后变为 None
+  │   → show_ssh_keys = false
+  │
+  └─ Header 合法（如 "2025.1.0"）
+      → semver 解析成功
+      → client_version = Some(ClientVersion(2025.1.0))
+      → 继续版本比较
+```
+
+**SSH Key 筛选逻辑**（`src/api/core/ciphers.rs` sync 函数内部）：
 
 ```rust
 // Filter out SSH keys if the client version is less than 2024.12.0
@@ -228,7 +252,7 @@ let show_ssh_keys = if let Some(client_version) = client_version {
     let ver_match = semver::VersionReq::parse(">=2024.12.0").unwrap();
     ver_match.matches(&client_version.0)
 } else {
-    false   // 未提供版本头 → 默认隐藏
+    false   // 未提供版本头或解析失败 → 默认隐藏
 };
 if !show_ssh_keys {
     ciphers.retain(|c| c.atype != 5);  // atype=5 即 SshKey
@@ -237,18 +261,116 @@ if !show_ssh_keys {
 
 完整判定表：
 
-| 条件 | show_ssh_keys | 结果 |
-|------|--------------|------|
-| 未提供 `Bitwarden-Client-Version` Header | `false` | 过滤掉所有 `atype=5` 的密文 |
-| 版本 `< 2024.12.0` | `false` | 过滤掉所有 `atype=5` 的密文 |
-| 版本 `>= 2024.12.0` | `true` | 保留 SSH Key 类型密文 |
+| 条件 | client_version | show_ssh_keys | 结果 |
+|------|---------------|--------------|------|
+| 未提供 `Bitwarden-Client-Version` Header | `None` | `false` | 过滤所有 `atype=5` 的密文 |
+| Header 非合法 semver（"abc"、"2024"） | `None` | `false` | 过滤所有 `atype=5` 的密文 |
+| 合法版本 `< 2024.12.0` | `Some(ver)` | `false` | 过滤所有 `atype=5` 的密文 |
+| 合法版本 `>= 2024.12.0` | `Some(ver)` | `true` | 保留 SSH Key 类型密文 |
 
-Cipher 类型定义（`src/db/models/cipher.rs`）：
+Cipher 类型定义（`src/db/models/cipher.rs` CipherType 枚举）：
 - `1` = Login
 - `2` = SecureNote
 - `3` = Card
 - `4` = Identity
 - `5` = **SshKey**（SSH Key 是 v2024.12.0 引入的新类型）
+
+**边界二：版本通过后 Cipher::to_json 对 SshKey 必填字段的校验**
+
+即使通过了版本检查（show_ssh_keys=true），SSH Key 类型密文在输出到 JSON 时还会被 `to_json` 二次校验——若必填字段缺失或为空，会将整个 sshKey 对象置为 `null`。
+
+`src/db/models/cipher.rs` to_json 方法中的校验逻辑：
+
+```rust
+// Fix invalid SSH Entries
+// This breaks at least the native mobile client if invalid
+// The only way to fix this is by setting type_data_json to `null`
+// Opening this ssh-key in the mobile client will probably crash the client, but you can edit, save and afterwards delete it
+if self.atype == 5
+    && (type_data_json["keyFingerprint"].as_str().is_none_or(str::is_empty)
+        || type_data_json["privateKey"].as_str().is_none_or(str::is_empty)
+        || type_data_json["publicKey"].as_str().is_none_or(str::is_empty))
+{
+    warn!("Error parsing ssh-key, mandatory fields are invalid for {}", self.uuid);
+    type_data_json = Value::Null;
+}
+```
+
+SshKey 必填字段检查项：
+
+| 字段 | 含义 | 校验条件 |
+|------|------|----------|
+| `keyFingerprint` | 密钥指纹（公钥 SHA256 哈希） | 必须是非空字符串 |
+| `privateKey` | 私钥 PEM | 必须是非空字符串 |
+| `publicKey` | 公钥 PEM | 必须是非空字符串 |
+
+**三个字段任一缺失或为空 → type_data_json = Value::Null**。
+
+**Data 字段置空路径追踪**：
+
+```
+self.data（数据库存储的 JSON 字符串）
+  │
+  ├─ serde_json 解析失败 → type_data_json = {}（空对象）
+  │
+  └─ 解析成功 → type_data_json = 原始 data
+      │
+      ├─ atype != 5 → 跳过 SSH 校验
+      │
+      └─ atype == 5（SSH Key）
+          │
+          ├─ keyFingerprint/privateKey/publicKey 任一缺失或为空
+          │     → 打印 warn 日志
+          │     → type_data_json = Value::Null  ←──── 置空点
+          │
+          └─ 全部字段完整有效 → type_data_json 保持原值
+
+后续赋值：
+  data_json = type_data_json.clone();             // 先克隆为 null
+  json_object["sshKey"] = type_data_json;         // sshKey 字段 = null
+  json_object["data"] = data_json;                // data 字段使用后续补基础键后的对象
+```
+
+注意：`data_json` 是 `type_data_json` 的克隆，但随后会强制追加 `fields`、`name`、`notes`、`passwordHistory` 四个键，所以当 type_data_json 被置为 Null 时，data_json 实际变成 `{fields:[], name:"...", notes:..., passwordHistory:[]}`——**只有 sshKey 字段真正变为 null**，data 字段仍保留基础结构。
+
+**边界三：/sync 与 /ciphers 在 SSH 过滤上的差异**
+
+SSH Key 版本过滤**只作用于 `/sync` 端点**，其他所有密文读取端点均不做任何版本检查和类型过滤：
+
+| 端点 | 函数签名 | 是否过滤 SSH Key | 说明 |
+|------|----------|-----------------|------|
+| `GET /sync` | `sync(..., client_version: Option<ClientVersion>, ...)` | ✅ 是 | 版本 `<2024.12.0` 或无版本头时过滤 `atype=5` |
+| `GET /ciphers` | `get_ciphers(headers: Headers, conn: DbConn)` | ❌ 否 | 直接全量返回，不读取 `Bitwarden-Client-Version` |
+| `GET /ciphers/<id>` | `get_cipher(cipher_id, headers, conn)` | ❌ 否 | 单条读取无条件返回，包括 SSH Key |
+| `GET /ciphers/<id>/admin` | `get_cipher_admin(...)` → 调用 get_cipher | ❌ 否 | 同上 |
+| `GET /ciphers/<id>/details` | `get_cipher_details(...)` → 调用 get_cipher | ❌ 否 | 同上 |
+
+`/ciphers` 列表端点的完整实现：
+
+```rust
+#[get("/ciphers")]
+async fn get_ciphers(headers: Headers, conn: DbConn) -> JsonResult {
+    // 注意：无 client_version 参数
+    let ciphers = Cipher::find_by_user_visible(&headers.user.uuid, &conn).await;
+    let cipher_sync_data = CipherSyncData::new(&headers.user.uuid, CipherSyncType::User, &conn).await;
+
+    let mut ciphers_json = Vec::with_capacity(ciphers.len());
+    for c in ciphers {
+        // 没有 retain 过滤，所有类型的密文都会 to_json 输出
+        ciphers_json.push(
+            c.to_json(&headers.host, &headers.user.uuid, Some(&cipher_sync_data), CipherSyncType::User, &conn).await?,
+        );
+    }
+
+    Ok(Json(json!({
+      "data": ciphers_json,
+      "object": "list",
+      "continuationToken": null
+    })))
+}
+```
+
+影响：低版本客户端若直接调用 `/ciphers` 或 `/ciphers/<id>`，仍能拿到 SSH Key 类型密文；只有走标准同步流程 `/sync` 时才会被过滤。这意味着**版本过滤并非安全边界，而是兼容性保护**（防止旧客户端解析未知类型时崩溃）。
 
 ### 3.3 乐观并发控制：`LastKnownRevisionDate`
 
@@ -631,7 +753,11 @@ pub async fn to_json(
 | excludeDomains 筛选 | `src/api/core/ciphers.rs` | sync 函数内 domains_json 分支 |
 | 等价域名组装 | `src/api/core/mod.rs` | get_eq_domains 函数 |
 | 客户端版本解析 | `src/auth.rs` | ClientVersion FromRequest impl |
-| SSH Key 版本筛选 | `src/api/core/ciphers.rs` | sync 函数内 show_ssh_keys 分支 |
+| SSH Key 版本筛选（/sync 独有） | `src/api/core/ciphers.rs` | sync 函数内 show_ssh_keys 分支 |
+| SshKey 必填字段校验（keyFingerprint/privateKey/publicKey） | `src/db/models/cipher.rs` | to_json 方法内 atype==5 分支 |
+| SshKey 置空路径追踪 | `src/db/models/cipher.rs` | to_json 方法 type_data_json 赋值链 |
+| /ciphers 列表端点（无版本过滤） | `src/api/core/ciphers.rs` | get_ciphers 函数 |
+| /ciphers/<id> 单条端点（无版本过滤） | `src/api/core/ciphers.rs` | get_cipher 函数 |
 | 写冲突检测 LastKnownRevisionDate | `src/api/core/ciphers.rs` | update_cipher_from_data 内部 |
 | CipherSyncData 批量预加载 | `src/api/core/ciphers.rs` | CipherSyncData struct + new 方法 |
 | Cipher JSON 组装 | `src/db/models/cipher.rs` | to_json 方法 |
