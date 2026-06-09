@@ -33,7 +33,7 @@ Vaultwarden 作为 Bitwarden 的兼容服务端实现，提供了完整的个人
 |-----------|----------|------|
 | `csv` / `Csv` / `CSV` | 0 个文件 | 服务端无任何 CSV 解析代码 |
 | `format.*import` / `import.*format` | 0 个文件 | 无多格式导入分派逻辑 |
-| `lastpass` / `1password` / `keepass` | 仅 2 个无关匹配 | 无非 Bitwarden 格式的导入适配器 |
+| `lastpass` / `1password` / `keepass` | 0 个文件 | 无非 Bitwarden 格式的导入适配器 |
 
 相关源码搜索范围：`src/` 目录下所有 `*.rs` 文件。
 
@@ -589,11 +589,9 @@ async fn get_org_export(org_id: OrganizationId, headers: AdminHeaders, conn: DbC
 
 位置：[src/api/core/organizations.rs#L3095-L3097](src/api/core/organizations.rs#L3095-L3097)
 
-**为什么组织导出需要额外转换？**
-- `get_org_collections_impl` 调用 `Collection::to_json()`，`get_org_details_impl` 调用 `Cipher::to_json(..., CipherSyncType::Organization)`
-- 虽然这些 `to_json()` 方法本身已经手动拼出 camelCase 字段名，但 `Cipher::to_json()` 内部从数据库读 JSON 时使用的 `LowerCase<T>` 已经保证了内部嵌套 key 是小写开头
-- 组织导出仍然再做一次整体递归转换，是双重保险：确保任何从 DB 读出的历史数据（可能在 `LowerCase<T>` 引入前写入的 PascalCase key）最终都转换为客户端可接受的格式
-- 顶层的 `"collections"` 和 `"ciphers"` 这两个 key 是 `get_org_export` 直接写的，不在转换范围内
+**转换范围**
+- `get_org_collections_impl` 调用 `Collection::to_json()`，`get_org_details_impl` 调用 `Cipher::to_json(..., CipherSyncType::Organization)`，这两个函数的返回值整体被传入 `convert_json_key_lcase_first()` 做递归转换
+- 顶层的 `"collections"` 和 `"ciphers"` 这两个 key 是 `get_org_export` 直接写出的，不在转换范围内
 
 ### CipherSyncType 对导出数据的影响
 
