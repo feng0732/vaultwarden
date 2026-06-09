@@ -220,6 +220,55 @@ update_cipher_from_data(saved_cipher, cipher_data, &headers, None, &conn, &nt, U
 2. 但此时其他设备还持有旧的 Master Key，无法解密新数据，可能导致客户端状态混乱
 3. 更好的策略是：完成所有更新后，强制其他设备重新登录 → 全量同步
 
+
+### 5.2.1 Send 密钥轮换的同步机制深度解析
+
+Send 的更新与 Cipher 采用完全相同的同步抑制策略，但具体实现位于 [update_send_from_data](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs#L609-L665)。
+
+**调用链对比**：
+
+```
+密钥轮换入口 [accounts.rs:878]
+    │
+    └── update_send_from_data(send, send_data, &headers, &conn, &nt, UpdateType::None)
+            │
+            ├── 1. 更新 send.akey = data.key         // Send Key 用新 User Key 重新加密
+            ├── 2. 更新 send.name/notes/data...      // 重新加密的数据
+            │
+            ├── 3. send.save(conn)                   // [send.rs:197-L229]
+            │       │
+            │       ├── send.update_users_revision(conn)  // [send.rs:252-L261]
+            │       │     └── User::update_uuid_revision(user_uuid, conn)
+            │       │           └── UPDATE users SET updated_at = NOW()
+            │       │
+            │       └── send.revision_date = NOW()
+            │
+            └── 4. if ut != UpdateType::None          // [sends.rs:661-L663]
+                     └── 条件为 false，跳过 nt.send_send_update(...)
+```
+
+**关键洞察：两个层次的同步静默**
+
+1. **实时推送层被抑制**：
+   - `UpdateType::None` 使 [sends.rs:661](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs#L661-L663) 的条件判断直接跳过 `nt.send_send_update()`。
+   - WebSocket 不会向其他设备推送 SyncSendUpdate 消息，Push 通知也不会发送到移动设备。
+   - 这与 Cipher 更新时的处理完全对称，Cipher 也在相同的 `if ut != UpdateType::None` 分支后才推送。
+
+2. **修订时间戳仍然更新**：
+   - `send.save()` 内部会无条件执行 `self.update_users_revision(conn)`，更新 `User.updated_at`。
+   - 同一个保存流程还会把 `self.revision_date` 更新为当前时间，保留 Send 自身的修订版本。
+   - 其他设备重新登录后做增量同步时，可以通过用户级和 Send 级时间戳发现 Send 已经变化，再拉取重新加密后的数据。
+
+如果连时间戳也不更新，其他设备重新登录后可能基于上次同步时间做增量拉取，从而漏掉 Send 的变更，最终拿不到重新加密后的 Send 数据。因此轮换流程只抑制实时推送，不抑制修订时间戳。
+
+| 同步层面 | Cipher [update_cipher_from_data](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/ciphers.rs#L545-L574) | Send [update_send_from_data](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs#L660-L663) |
+|---------|------|------|
+| 实时推送抑制 | `if ut != UpdateType::None` | `if ut != UpdateType::None` |
+| 修订时间戳更新 | `cipher.save()` 内部更新用户修订时间和 cipher 自身时间 | `send.save()` 内部更新用户修订时间和 Send 自身 `revision_date` |
+| 增量同步可见性 | 重新登录后可通过修订时间发现 | 重新登录后可通过修订时间发现 |
+
+因此“Send 更新没有触发同步”只在实时推送层成立；增量同步依赖的时间戳仍然被正确更新。
+
 ### 5.3 完整的同步失效链
 
 ```
@@ -270,6 +319,89 @@ update_cipher_from_data(saved_cipher, cipher_data, &headers, None, &conn, &nt, U
 - 模型定义为 `Option<String>`：[cipher.rs:43](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/cipher.rs#L43-L43)
 - CipherData 请求体中也是 `Option<String>`：[ciphers.rs:261](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/ciphers.rs#L261-L261)
 - 序列化到 JSON 时直接输出，为 NULL 则表示该 cipher 使用旧的"全局 User Key 直接加密"模式：[cipher.rs:345](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/cipher.rs#L345-L345)
+
+
+### 6.1.1 旧 cipher.key (NULL) 在密钥轮换中的完整兼容路径
+
+这是密钥轮换兼容性的核心：2023.10 之前创建、没有独立 Cipher Key 的旧密码条目，在轮换时仍要保持可解密。
+
+#### 两种加密模式的本质区别
+
+```
+模式 A（旧模式，cipher.key = NULL）
+  User Key → 直接加密 Cipher Data（name/notes/data/...）
+  没有中间层，每个 cipher 没有独立密钥
+
+模式 B（新模式，cipher.key = Some("..."))
+  User Key → 加密 Cipher Key（存储在 cipher.key 字段）
+  Cipher Key → 加密 Cipher Data（name/notes/data/...）
+  每个 cipher 有独立的对称密钥
+```
+
+#### 兼容的五层防线
+
+**第一层：数据模型层使用 Option<String>**
+
+服务端三个关键位置都允许 NULL 合法存在：
+
+| 位置 | 定义 | 代码位置 |
+|------|------|----------|
+| 数据库模型 | `pub key: Option<String>` | [cipher.rs:43](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/cipher.rs#L43-L43) |
+| 请求体反序列化 | `key: Option<String>` | [ciphers.rs:261](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/ciphers.rs#L261-L261) |
+| JSON 序列化输出 | `json!({"key": self.key})` 可输出 null | [cipher.rs:345](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/cipher.rs#L345-L345) |
+
+这意味着旧 cipher 从数据库读出时是 `None`，返回给客户端时是 `"key": null`；客户端轮换请求不传 key 或传 null，服务端反序列化后仍是 `None`。
+
+**第二层：校验层不检查 key 字段值**
+
+[validate_keydata](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L740-L751) 只做 cipher ID 的超集校验：
+
+```rust
+let existing_cipher_ids = existing_ciphers.iter().map(|c| &c.uuid).collect();
+let provided_cipher_ids = data.account_data.ciphers.iter()
+    .filter(|c| c.organization_id.is_none())
+    .filter_map(|c| c.id.as_ref())
+    .collect();
+if !provided_cipher_ids.is_superset(&existing_cipher_ids) {
+    err!("All existing ciphers must be included in the rotation")
+}
+```
+
+这段逻辑只要求所有个人 cipher 都出现在请求里，不校验请求是否带 key、key 是否与数据库原值匹配，也不检查 key 的加密格式。`Cipher::validate_cipher_data` 也只校验 notes 大小和 password_history 的 null 值，不检查 `cipher.key`。
+
+**第三层：更新层是对称赋值**
+
+[update_cipher_from_data](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/ciphers.rs#L526-L531) 直接把请求值写回：
+
+```rust
+cipher.key = data.key;              // 旧模式下 data.key = None → cipher.key 保持 None
+cipher.name = data.name;            // 重新加密后的数据
+cipher.notes = data.notes;
+cipher.fields = ...;
+cipher.data = type_data.to_string();
+cipher.password_history = ...;
+```
+
+原来 `cipher.key` 是 None 时，只要客户端按旧模式提交 None，服务端就继续保存 NULL；如果客户端在轮换时提交新的加密 Cipher Key，服务端也会无感地把条目升级到新模式。
+
+**第四层：不同客户端版本都能落到同一套 Option 语义**
+
+| 客户端行为 | 服务端接收结果 | 保存结果 |
+|-----------|---------------|----------|
+| 不发送 key 字段 | `data.key = None` | `cipher.key = NULL` |
+| 发送 `"key": null` | `data.key = None` | `cipher.key = NULL` |
+| 发送 `"key": "enc(...)"` | `data.key = Some(...)` | `cipher.key = Some(...)` |
+
+**第五层：加密逻辑由客户端负责**
+
+服务端不参与加密或解密，也不校验加密数据能否被旧模式或新模式解开。只要客户端能正确完成“解密旧值 → 按目标模式重新加密 → 提交给服务端”，服务端就按请求体原样存储。这个零信任边界让旧条目可以继续保持 NULL，也可以由新客户端在轮换时静默升级为独立 Cipher Key 模式。
+
+```
+DB: cipher.key = NULL
+  ├── 客户端未发送 key      → data.key = None      → 继续保存 NULL
+  ├── 客户端发送 key = null → data.key = None      → 继续保存 NULL
+  └── 客户端发送 enc(ck)    → data.key = Some(...) → 升级为新模式
+```
 
 ### 6.2 旧客户端与新服务端的兼容
 
@@ -345,3 +477,12 @@ update_cipher_from_data(saved_cipher, cipher_data, &headers, None, &conn, &nt, U
 | 紧急访问密钥模型 | [emergency_access.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/emergency_access.rs) | L23-L25 |
 | 组织成员密钥模型 | [organization.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/organization.rs) | L49-L60 |
 | Send 密钥模型 | [send.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/send.rs) | L30-L35 |
+| Send 数据更新函数 | [sends.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs) | L609-L665 |
+| Send 推送抑制判断 | [sends.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs) | L660-L663 |
+| Send.save() 更新修订时间戳 | [send.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/send.rs) | L197-L199 |
+| Send.update_users_revision() | [send.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/send.rs) | L252-L261 |
+| Cipher 推送抑制判断 | [ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/ciphers.rs) | L545-L574 |
+| Cipher.validate_cipher_data（不校验 key） | [cipher.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/cipher.rs) | L97-L140 |
+| validate_keydata 的 cipher ID 超集校验 | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L740-L751 |
+| 轮换中 Send UpdateType::None 调用 | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L872-L879 |
+| 轮换中 Cipher UpdateType::None 调用 | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L881-L894 |
