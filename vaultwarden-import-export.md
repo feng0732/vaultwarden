@@ -455,7 +455,7 @@ Vaultwarden 有两个与"导出"相关的核心接口，但它们的用途、调
 | **SyncType** | `CipherSyncType::User` | `CipherSyncType::Organization` |
 | **文件夹/收藏/归档** | 包含（folders, favorite, archivedDate） | 不包含 |
 | **返回顶层字段** | profile, folders, collections, policies, ciphers, domains, sends, userDecryption | collections, ciphers |
-| **JSON Key 处理** | 原样返回 PascalCase | 递归转换为 camelCase（首字母小写） |
+| **JSON Key 处理** | 代码手动拼 camelCase + DB 读时 `LowerCase<T>` 自动递归首字母小写 | 对整个 collections 和 ciphers 数组递归做首字母小写转换 |
 | **代码位置** | [src/api/core/ciphers.rs#L121-L204](src/api/core/ciphers.rs#L121-L204) | [src/api/core/organizations.rs#L3101-L3111](src/api/core/organizations.rs#L3101-L3111) |
 
 ### /sync 同步接口格式（用户侧）
@@ -484,7 +484,67 @@ Vaultwarden 有两个与"导出"相关的核心接口，但它们的用途、调
 }
 ```
 
-**关键点**：`CipherSyncType::User` 模式下，每个 Cipher 返回时会附加 `folderId`、`favorite`、`archivedDate`、`edit`、`viewPassword`、`permissions` 等用户专属字段。
+#### /sync 字段命名的两层机制
+
+`/sync` 返回的所有字段均为 **camelCase**（首字母小写，后续单词大写），但并非从某个 PascalCase 源"原样返回"，而是通过以下两层机制产生：
+
+**第一层：顶层字段和模型字段由 Rust 代码手动拼出**
+
+`sync()` 函数在 [src/api/core/ciphers.rs#L191-L203](src/api/core/ciphers.rs#L191-L203) 中通过 `json!({...})` 宏硬编码写出顶层字段：
+
+```rust
+json!({
+    "profile": user_json,
+    "folders": folders_json,
+    "collections": collections_json,
+    "policies": policies_json,
+    "ciphers": ciphers_json,
+    "domains": domains_json,
+    "sends": sends_json,
+    "userDecryption": {
+        "masterPasswordUnlock": master_password_unlock,
+    },
+    "object": "sync"
+})
+```
+
+每个子模型的 `to_json()` 同样手动写出 camelCase 字段：
+
+- `Cipher::to_json()` 写出 `"creationDate"`、`"revisionDate"`、`"organizationId"`、`"folderId"`、`"favorite"`、`"archivedDate"` 等 [src/db/models/cipher.rs#L336-L410](src/db/models/cipher.rs#L336-L410)
+- `Folder::to_json()` 写出 `"revisionDate"` 等 [src/db/models/folder.rs#L52-L61](src/db/models/folder.rs#L52-L61)
+- `Collection::to_json()` 写出 `"externalId"`、`"organizationId"` 等 [src/db/models/collection.rs#L68-L76](src/db/models/collection.rs#L68-L76)
+
+**第二层：数据库存储的 JSON 通过 `LowerCase<T>` 自动递归首字母小写**
+
+Cipher 的 `data`（类型特定数据，如 login/card 的字段）、`fields`（自定义字段）、`password_history`（密码历史）在数据库中以 JSON 字符串形式存储，key 大小写取决于写入时的客户端版本。读取时统一通过 `LowerCase<T>` 反序列化包装器处理：
+
+```rust
+// 数据库 data 字段读入时，LowerCase<Value> 自动将所有 key 首字母递归转小写
+let mut type_data_json = serde_json::from_str::<LowerCase<Value>>(&self.data)
+    .map_or_else(|_| Value::Object(serde_json::Map::new()), |d| d.data);
+
+// fields 和 password_history 同理
+let fields_json: Vec<_> = self.fields.as_ref().and_then(|s| {
+    serde_json::from_str::<Vec<LowerCase<Value>>>(s)
+        .ok()
+}) ... ;
+```
+位置：[src/db/models/cipher.rs#L190-L255](src/db/models/cipher.rs#L190-L255)
+
+`LowerCase<T>` 的实现位于 [src/util.rs#L560-L620](src/util.rs#L560-L620)，其核心访问器 `LowerCaseVisitor::visit_map` 对每个 key 调用 `process_json_key()`：
+
+```rust
+while let Some((key, value)) = map.next_entry()? {
+    result_map.insert(
+        process_json_key(key),          // 当前 key 首字母小写
+        convert_json_key_lcase_first(value) // 嵌套 value 递归转换
+    );
+}
+```
+
+因此，**`/sync` 输出不调用 `convert_json_key_lcase_first` 做顶层转换**，而是通过模型代码手动拼字段 + `LowerCase<T>` 自动读取转换这两层机制实现统一的 camelCase 输出。
+
+**关键点**：`CipherSyncType::User` 模式下，每个 Cipher 返回时会附加 `folderId`、`favorite`、`archivedDate`、`edit`、`viewPassword`、`permissions` 等用户专属字段，这些字段也由 `to_json()` 手动拼出为 camelCase。
 
 ### 组织导出接口格式
 
@@ -505,9 +565,35 @@ Vaultwarden 有两个与"导出"相关的核心接口，但它们的用途、调
 }
 ```
 
-**关键兼容处理**：导出时所有 JSON key 的首字母会被递归转换为小写（`convert_json_key_lcase_first`），因为 Bitwarden 客户端的组织导入代码无法处理大写首字母的 key。
+#### 组织导出的递归首字母小写转换
 
-位置：[src/api/core/organizations.rs#L3095-L3110](src/api/core/organizations.rs#L3095-L3110)
+与 `/sync` 不同，组织导出接口显式调用 `convert_json_key_lcase_first()` 对 **collections 和 ciphers 两个数组整体** 做递归首字母小写转换：
+
+```rust
+#[get("/organizations/<org_id>/export")]
+async fn get_org_export(org_id: OrganizationId, headers: AdminHeaders, conn: DbConn) -> JsonResult {
+    ...
+    Ok(Json(json!({
+        "collections": convert_json_key_lcase_first(get_org_collections_impl(&org_id, &conn).await),
+        "ciphers": convert_json_key_lcase_first(get_org_details_impl(&org_id, &headers.host, &headers.user.uuid, &conn).await?),
+    })))
+}
+```
+位置：[src/api/core/organizations.rs#L3101-L3111](src/api/core/organizations.rs#L3101-L3111)
+
+代码注释明确说明了原因：
+
+> `// NOTE: It seems clients can't handle uppercase-first keys!!`
+> `//       We need to convert all keys so they have the first character to be a lowercase.`
+> `//       Else the export will be just an empty JSON file.`
+
+位置：[src/api/core/organizations.rs#L3095-L3097](src/api/core/organizations.rs#L3095-L3097)
+
+**为什么组织导出需要额外转换？**
+- `get_org_collections_impl` 调用 `Collection::to_json()`，`get_org_details_impl` 调用 `Cipher::to_json(..., CipherSyncType::Organization)`
+- 虽然这些 `to_json()` 方法本身已经手动拼出 camelCase 字段名，但 `Cipher::to_json()` 内部从数据库读 JSON 时使用的 `LowerCase<T>` 已经保证了内部嵌套 key 是小写开头
+- 组织导出仍然再做一次整体递归转换，是双重保险：确保任何从 DB 读出的历史数据（可能在 `LowerCase<T>` 引入前写入的 PascalCase key）最终都转换为客户端可接受的格式
+- 顶层的 `"collections"` 和 `"ciphers"` 这两个 key 是 `get_org_export` 直接写的，不在转换范围内
 
 ### CipherSyncType 对导出数据的影响
 
@@ -546,20 +632,36 @@ if sync_type == CipherSyncType::User {
 ```
 位置：[src/db/models/cipher.rs#L373-L399](src/db/models/cipher.rs#L373-L399)
 
-### Key 大小写转换规则
+### 两种 key 小写转换机制的对比
 
-组织导出时，`convert_json_key_lcase_first()` 递归遍历整个 JSON 结构：
+Vaultwarden 中存在 **两种独立** 的 key 首字母小写转换机制，分别服务于不同场景：
+
+| 机制 | 触发时机 | 作用范围 | 代码位置 |
+|------|---------|---------|----------|
+| `LowerCase<T>` 反序列化包装器 | 从数据库读取 JSON 字符串时 | `Cipher.data`、`Cipher.fields`、`Cipher.password_history` 的所有嵌套 key | [src/util.rs#L560-L620](src/util.rs#L560-L620) |
+| `convert_json_key_lcase_first()` 后处理函数 | 组织导出接口返回前 | collections 和 ciphers 两个数组整体（全递归） | [src/util.rs#L621-L778](src/util.rs#L621-L778) |
+
+#### `process_json_key` 的转换规则
+
+两种机制底层均调用同一个 key 处理函数：
 
 ```rust
 fn process_json_key(key: &str) -> String {
     match key.to_lowercase().as_ref() {
         "ssn" => "ssn".into(),   // 特殊处理：SSN（社会安全号）保持全小写
-        _ => lcase_first(key),   // 其余首字母小写（PascalCase → camelCase）
+        _ => lcase_first(key),   // 其余首字母小写（如 CreationDate → creationDate）
     }
 }
 ```
 
 位置：[src/util.rs#L621-L628](src/util.rs#L621-L628)
+
+`convert_json_key_lcase_first()` 对传入的 JSON 值做递归处理：
+- 数组：对每个元素递归调用
+- 对象：对每个 key 调用 `process_json_key()`，value 递归调用
+- 其他类型：原样返回
+
+位置：[src/util.rs#L739-L778](src/util.rs#L739-L778)
 
 ### Cipher 导出格式（CipherDetails）
 
@@ -662,13 +764,20 @@ if !show_ssh_keys {
 
 ### 核心函数速查
 
-| 函数 | 位置 | 作用 |
-|------|------|------|
+| 函数/机制 | 位置 | 作用 |
+|---------|------|------|
 | `post_ciphers_import` | [src/api/core/ciphers.rs#L595-L644](src/api/core/ciphers.rs#L595-L644) | 个人导入入口 |
 | `post_org_import` | [src/api/core/organizations.rs#L1782-L1866](src/api/core/organizations.rs#L1782-L1866) | 组织导入入口 |
 | `update_cipher_from_data` | [src/api/core/ciphers.rs#L395-L576](src/api/core/ciphers.rs#L395-L576) | CipherData → Cipher 映射写入 |
 | `Cipher::validate_cipher_data` | [src/db/models/cipher.rs#L97-L140](src/db/models/cipher.rs#L97-L140) | 导入前置验证 |
-| `Cipher::to_json` | [src/db/models/cipher.rs#L145-L412](src/db/models/cipher.rs#L145-L412) | Cipher 序列化导出 |
+| `Cipher::to_json` | [src/db/models/cipher.rs#L145-L412](src/db/models/cipher.rs#L145-L412) | Cipher 序列化导出（手动拼 camelCase 字段） |
+| `Folder::to_json` | [src/db/models/folder.rs#L52-L61](src/db/models/folder.rs#L52-L61) | Folder 序列化（手动拼 camelCase） |
+| `Collection::to_json` | [src/db/models/collection.rs#L68-L76](src/db/models/collection.rs#L68-L76) | Collection 序列化（手动拼 camelCase） |
+| `sync` | [src/api/core/ciphers.rs#L121-L204](src/api/core/ciphers.rs#L121-L204) | 个人完整数据同步（手动拼 camelCase 顶层字段） |
 | `get_org_export` | [src/api/core/organizations.rs#L3101-L3111](src/api/core/organizations.rs#L3101-L3111) | 组织导出入口 |
-| `convert_json_key_lcase_first` | [src/util.rs#L739-L778](src/util.rs#L739-L778) | 导出时 JSON Key 大小写转换 |
-| `sync` | [src/api/core/ciphers.rs#L121-L204](src/api/core/ciphers.rs#L121-L204) | 个人完整数据同步 |
+| `get_org_details_impl` | [src/api/core/organizations.rs#L896-L910](src/api/core/organizations.rs#L896-L910) | 组织导出 Cipher 数据获取 |
+| `get_org_collections_impl` | [src/api/core/organizations.rs#L491-L493](src/api/core/organizations.rs#L491-L493) | 组织导出 Collection 数据获取 |
+| `LowerCase<T>` | [src/util.rs#L560-L620](src/util.rs#L560-L620) | DB JSON 读入时自动递归首字母小写的反序列化包装器 |
+| `convert_json_key_lcase_first` | [src/util.rs#L739-L778](src/util.rs#L739-L778) | 组织导出时对整个 JSON 值递归首字母小写转换 |
+| `process_json_key` | [src/util.rs#L621-L628](src/util.rs#L621-L628) | 单个 key 首字母小写处理（ssn 特殊全小写） |
+| `deser_opt_nonempty_str` | [src/util.rs#L630-L643](src/util.rs#L630-L643) | 反序列化时空字符串转 None（folder_id 等字段） |
