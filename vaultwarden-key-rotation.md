@@ -161,6 +161,135 @@ send.notes = data.notes;
 ```
 同一个 `sends.data` 字段会根据 atype 被映射成响应里的 `text` 或 `file`，但轮换更新阶段只有 Text Send 会把请求体重新写入 `sends.data`。
 
+#### 3.2.2 Send 的访问密码与限制字段在轮换中的处理
+
+Send 除了加密数据外，还有一组与加密无关的"访问控制字段"。这些字段在密钥轮换中的处理逻辑需要单独理解。
+
+**Send 的访问控制字段分类**：
+
+| 字段 | 请求结构定义 | 数据库字段 | 是否与加密相关 | 处理模式 |
+|------|-------------|-----------|---------------|---------|
+| **访问密码** | `password: Option<String>` | `password_hash`, `password_salt`, `password_iter` | ❌ 无关（仅身份验证） | **条件覆盖** |
+| **最大访问次数** | `max_access_count: Option<NumberOrString>` | `max_access_count` | ❌ 无关 | **空则清除，否则赋值** |
+| **过期时间** | `expiration_date: Option<DateTime<Utc>>` | `expiration_date` | ❌ 无关 | **空则清除，否则赋值** |
+| **删除时间** | `deletion_date: DateTime<Utc>` | `deletion_date` | ❌ 无关 | **必须提供，强制赋值** |
+| **隐藏邮箱** | `hide_email: Option<bool>` | `hide_email` | ❌ 无关 | **直接赋值** |
+| **是否禁用** | `disabled: bool` | `disabled` | ❌ 无关 | **直接赋值** |
+| **已访问次数** | （请求中不存在） | `access_count` | ❌ 无关 | **保持不变** |
+
+**update_send_from_data 后半段的完整逻辑** — [sends.rs:643-L658](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs#L643-L658)：
+```rust
+send.name = data.name;
+send.akey = data.key;
+send.deletion_date = data.deletion_date.naive_utc();   // 必须字段，强制覆盖
+send.notes = data.notes;
+send.max_access_count = match data.max_access_count {  // Option：None 则清除
+    Some(m) => Some(m.into_i32()?),
+    _ => None,
+};
+send.expiration_date = data.expiration_date.map(|d| d.naive_utc()); // Option：None 则清除
+send.hide_email = data.hide_email;    // Option<bool>：None 也会被写回（清除隐藏邮箱）
+send.disabled = data.disabled;        // 非 Option bool：必须显式 true/false
+
+// 访问密码：只有显式传入才变更
+if let Some(password) = data.password {
+    send.set_password(Some(&password));
+}
+// ⚠️ data.password = None 时：保持旧密码不变（不会被清除）
+```
+
+##### 访问密码的"条件保留"机制
+
+这是最容易误解的点：`SendData.password` 是 `Option<String>`，但语义不是"None 表示清除密码"，而是"None 表示**保持原有密码不变**"。
+
+[Send::set_password](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/send.rs#L99-L113) 的实现：
+```rust
+pub fn set_password(&mut self, password: Option<&str>) {
+    const PASSWORD_ITER: i32 = 100_000;
+    if let Some(password) = password {
+        // 设置密码：生成新的随机 salt + PBKDF2 哈希
+        self.password_iter = Some(PASSWORD_ITER);
+        let salt = crate::crypto::get_random_bytes::<64>().to_vec();
+        let hash = crate::crypto::hash_password(password.as_bytes(), &salt, PASSWORD_ITER as u32);
+        self.password_salt = Some(salt);
+        self.password_hash = Some(hash);
+    } else {
+        // 清除密码：三个字段全部置 None
+        self.password_iter = None;
+        self.password_salt = None;
+        self.password_hash = None;
+    }
+}
+```
+
+**三种场景对比**：
+
+| 客户端发送 | 服务端行为 | 结果 |
+|-----------|-----------|------|
+| `"password": "newpass123"` | 调用 `set_password(Some("newpass123"))` | ✅ 密码被重设（生成新 salt + 新哈希） |
+| `"password": null`（或不发送字段） | 不调用 `set_password`（`if let Some` 不匹配） | ✅ 原有 `password_hash/salt/iter` 完整保留 |
+| — | 调用 `PUT /sends/<id>/remove-password` 独立端点 | ✅ 调用 `set_password(None)`，三个字段全部清空 |
+
+独立的 `put_remove_password` 端点 — [sends.rs:686-L702](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs#L686-L702)：
+```rust
+#[put("/sends/<send_id>/remove-password")]
+async fn put_remove_password(...) {
+    send.set_password(None);  // 唯一能清除 Send 密码的方式
+    send.save(&conn).await?;
+}
+```
+
+**密钥轮换场景下的密码行为**：
+
+```
+轮换前：Send 设有访问密码 password_hash = Some(...)
+    │
+    ▼
+客户端构造轮换请求时：
+    ├── 方案 A：不发送 password 字段 → data.password = None
+    │       └── 服务端不调用 set_password → 原密码保留 ✅
+    │
+    ├── 方案 B：发送 "password": "原密码" → data.password = Some("原密码")
+    │       └── 服务端 set_password(Some("原密码")) → 新 salt + 新哈希，密码逻辑上不变
+    │
+    └── 方案 C：发送 "password": "新密码" → data.password = Some("新密码")
+            └── 服务端 set_password(Some("新密码")) → 密码被修改（等价于顺带改了密码）
+
+⚠️ 发送 "password": null 无法清除密码，必须走 remove-password 独立端点
+```
+
+##### NumberOrString：max_access_count 的类型兼容
+
+`max_access_count` 在请求体中是 `Option<NumberOrString>`，这是为了兼容不同客户端序列化的差异：有的客户端发数字 `{"maxAccessCount": 5}`，有的发字符串 `{"maxAccessCount": "5"}`。
+
+[NumberOrString](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/util.rs#L645-L674) 的 untagged 反序列化：
+```rust
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum NumberOrString {
+    Number(i64),
+    String(String),
+}
+```
+
+轮换时的处理 — [sends.rs:647-L650](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs#L647-L650)：
+```rust
+send.max_access_count = match data.max_access_count {
+    Some(m) => Some(m.into_i32()?),  // 数字或字符串统一转 i32
+    _ => None,                        // 请求不发该字段 → 清除限制（不设最大访问次数）
+};
+```
+
+##### 轮换中非加密字段的设计意图
+
+这些访问控制字段与密钥加密体系完全解耦，因此：
+- **访问密码（password_hash/salt/iter）**：基于 PBKDF2 本地验证，与 User Key / Send Key 毫无关系，轮换时无需变化
+- **max_access_count / access_count**：纯业务计数，与加密无关
+- **expiration_date / deletion_date**：纯时间判断，与加密无关
+- **hide_email / disabled**：纯布尔开关，与加密无关
+
+所以在密钥轮换中这些字段的"被重新提交"实际上更像是一次全量同步——客户端必须把所有字段都带上，服务端会按语义逐一覆盖（或有条件地保留）。
+
 **Step 7：更新 Ciphers（核心步骤）** — [accounts.rs:881-894](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L881-L894)
 - 仅处理个人 ciphers（`organization_id.is_none()`）
 - 调用 [update_cipher_from_data](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/ciphers.rs#L395-L576)，传入 `UpdateType::None`
@@ -601,3 +730,9 @@ Ciphers 更新循环也直接对 `cipher_data.id.as_ref().unwrap()` 做匹配。
 | Folders 更新循环（if let 安全模式） | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L835-L845 |
 | UpdateFolderData 结构（含 Option<FolderId>） | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L650-L659 |
 | UpdateEmergencyAccessData 结构 | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L661-L666 |
+| Send.set_password（密码设置/清除逻辑） | [send.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/send.rs) | L99-L113 |
+| Send 访问密码的条件保留判断（if let Some） | [sends.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs) | L655-L658 |
+| put_remove_password 独立端点（唯一清除密码方式） | [sends.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs) | L686-L702 |
+| update_send_from_data 限制字段处理 | [sends.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs) | L643-L654 |
+| NumberOrString 类型兼容定义 | [util.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/util.rs) | L645-L674 |
+| SendFileData 文件元数据结构 | [sends.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs) | L365-L371 |
