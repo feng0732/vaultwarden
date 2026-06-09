@@ -453,36 +453,100 @@ sso_pkce=false:         Vaultwarden 本地计算 SHA256(verifier) == sso_auth.cl
 - ✅ 攻击者能同时控制授权发起和 code 兑换两个阶段（例如同一恶意客户端）
 - ✅ `sso_pkce=false` 且攻击者能读数据库：直接从 `sso_auth.client_challenge` 字段反推是不可能的（SHA256 不可逆），但如果攻击者能写入数据库另当别论
 
-### 6.4 防线三：浏览器绑定 Cookie（`VW_SSO_BINDING`）
+### 6.4 防线二与防线三的联合作用：state、PKCE、浏览器绑定 Cookie 与同源限制
 
-**校验点**：仅在 `/connect/oidc-signin`（IdP 回调 Vaultwarden 时）执行一次（[identity.rs](src/api/identity.rs#L1214-L1223)）。
+本节把 state 流转、PKCE verifier、SSO_BINDING Cookie 和浏览器同源限制放在一起分析——它们在代码中是分层协作的，单独看任何一个都容易得出错误结论。
 
-Cookie 属性（[identity.rs](src/api/identity.rs#L1294-L1302)）：
-- `Path=/identity/connect/`（仅在该路径及其子路径下发送）
-- `SameSite=Lax`（跨站 POST 不发送，但跨站 GET 顶级导航会发送）
-- `HttpOnly`（JS 无法通过 `document.cookie` **读取**明文值，但 XSS 仍可在受害者浏览器上下文中通过 fetch/XHR 发起请求让浏览器自动带上该 Cookie——因此 HttpOnly 只能防止"Cookie 值被窃取后在攻击者环境中复用"，不能阻止 XSS 上下文中的即时攻击）
-- `Secure`（仅 HTTPS 下发送，取决于当前请求是否 https）
+#### state 的完整代码事实（按执行顺序）
 
-校验逻辑：
+1. **state 是 authorize 入参，不由 Vaultwarden 生成**
+   - 定义在 [identity.rs](src/api/identity.rs#L1247-L1268) 的 `AuthorizeData.state: OIDCState`，是客户端（Web/Desktop/Mobile/CLI）生成并通过 query 参数传入的，只是 `String` 的 newtype 包装。
+   - Vaultwarden 对 state **不做任何校验**：不检查长度、格式、随机性、是否唯一冲突（冲突时 DB 的 `on_conflict` 会直接覆盖）。
+
+2. **SsoAuth 以 state 为主键保存上下文**
+   - 在 [sso_auth.rs](src/db/models/sso_auth.rs#L42-L57) 的 `SsoAuth` 结构体中，`state` 是 `#[diesel(primary_key(state))]`。
+   - 保存时同时写入：`client_challenge`（PKCE code_challenge，也是客户端入参）、`nonce`（`sso::authorize_url` 内部随机生成）、`redirect_uri`（客户端入参/硬编码）、`binding_hash`（authorize 函数内随机生成的浏览器绑定哈希）。见 [identity.rs](src/api/identity.rs#L1286-L1292)。
+
+3. **oidc-signin 用 state 回查 SsoAuth**
+   - IdP 回调时把 state（经 Base64 编码）和 code 一起传回，Vaultwarden 在 [identity.rs](src/api/identity.rs#L1208-L1212) 解码 state 后调用 `SsoAuth::find(&state, conn)`：
+     - 找不到 → 直接报错 `"Cannot retrieve sso_auth"`
+     - 找到 → 进入 SSO_BINDING Cookie 校验
+
+4. **Cookie 校验通过后写入 code_response**
+   - [identity.rs](src/api/identity.rs#L1214-L1227)：SSO_BINDING 哈希匹配后，把 IdP 返回的 code 写入 `sso_auth.code_response`，然后**把 code 和 state 再次通过重定向传回给客户端**。
+
+5. **/connect/token 阶段客户端再传 code 和 code_verifier**
+   - 客户端拿到 code 后发起 `POST /identity/connect/token`（grant_type=authorization_code），传入 `code` 和 `code_verifier`（[identity.rs](src/api/identity.rs#L1091-L1147) 的 `ConnectData`）。
+   - Vaultwarden 用 `SsoAuth::find_by_code(code)` 再次定位 sso_auth（[sso_auth.rs](src/db/models/sso_auth.rs#L122-L131)），然后在 PKCE 校验 + IdP Token 交换中使用 `code_verifier`。
+
+#### 各防护机制的协作关系
+
 ```
-Cookie 中的明文 binding_token → SHA-256 → 必须等于 DB 中 sso_auth.binding_hash
+客户端                          Vaultwarden                          IdP
+  │                                │                                  │
+  │ 1. GET /connect/authorize      │                                  │
+  │    ?state=S                    │                                  │
+  │    &code_challenge=C           │                                  │
+  │ ─────────────────────────────▶ │                                  │
+  │                                │ 2. 生成 SSO_BINDING Cookie B      │
+  │                                │    生成 nonce N                   │
+  │                                │    写入 SsoAuth(state=S,          │
+  │                                │           challenge=C, nonce=N,   │
+  │                                │           binding_hash=SHA256(B)) │
+  │ 3. 302 → IdP authorize URL     │                                  │
+  │    (携带 state=S, nonce=N,     │                                  │
+  │     code_challenge=C)          │ ───────────────────────────────▶ │
+  │                                │                                  │ 4. 用户在 IdP 登录
+  │                                │                                  │ 5. IdP 校验 code_challenge
+  │                                │                                  │    生成授权 code X
+  │ 6. 302 → /connect/oidc-signin  │                                  │
+  │    ?code=X&state=Base64(S)     │ ◀─────────────────────────────── │
+  │ ─────────────────────────────▶ │                                  │
+  │                                │ 7. SsoAuth::find(state=S)         │
+  │                                │    校验 SHA256(Cookie B)          │
+  │                                │       == sso_auth.binding_hash   │
+  │                                │    写入 sso_auth.code_response=X  │
+  │ 8. 302 → redirect_uri          │                                  │
+  │    ?code=X&state=S             │                                  │
+  │ ◀───────────────────────────── │                                  │
+  │                                │                                  │
+  │ 9. POST /connect/token         │                                  │
+  │    grant_type=authorization_   │                                  │
+  │    code                         │                                  │
+  │    code=X & code_verifier=V    │                                  │
+  │ ─────────────────────────────▶ │                                  │
+  │                                │ 10. SsoAuth::find_by_code(X)      │
+  │                                │     PKCE 校验:                    │
+  │                                │     sso_pkce=false:               │
+  │                                │       SHA256(V) == challenge C   │
+  │                                │     sso_pkce=true:                │
+  │                                │       把 V 发给 IdP 校验          │
+  │                                │ 11. 向 IdP 兑换 Token             │
+  │                                │ ───────────────────────────────▶ │
+  │                                │                                  │ 12. IdP 校验 code X + verifier V
+  │                                │ ◀─────────────────────────────── │
+  │                                │     返回 id_token/access_token    │
+  │                                │ 13. 校验 id_token(nonce=N, ...)   │
+  │                                │ 14. 账号映射 → 返回 Vaultwarden   │
+  │ ◀───────────────────────────── │     access_token / refresh_token  │
 ```
 
-**能拦住**：
-- ❌ **纯 CSRF 攻击**：第三方网站诱导受害者浏览器访问 `GET /connect/oidc-signin?code=X&state=Y`（注意这是 GET）。
-  - 事实校准：`/connect/oidc-signin` 本身是 GET 端点，而 OAuth2 的 `state` 参数本身已经是标准 CSRF 防护机制——攻击者如果不知道 `state` 值就无法让 Vaultwarden 在 DB 中定位到对应的 `sso_auth` 记录。
-  - 额外的 SSO_BINDING Cookie 提供了第二道防线：即使攻击者通过某种方式泄露了 `state`，也还需要受害者浏览器携带正确的 SSO_BINDING Cookie 才能通过校验（而 Cookie 不会被第三方网站读取或伪造）。
-  - SameSite=Lax 在跨站顶级 GET 导航时**会发送 Cookie**，但仅靠 CSRF 无法构造 `state`，因此该场景仍被联合防御拦住。
-- ❌ **跨设备/跨浏览器会话劫持**：攻击者在自己的浏览器发起授权（得到自己的 SSO_BINDING Cookie 和 state），然后诱导受害者浏览器回调 `/connect/oidc-signin?code=...&state=攻击者的state`。
-  - 受害者浏览器不会携带攻击者浏览器的 SSO_BINDING Cookie → 哈希不匹配 → 被拦截。
-- ❌ **攻击者只拿到 code 但拿不到 Cookie**：例如通过 Referer 泄露、日志泄露等方式拿到 code，但无法读取受害者浏览器的 Cookie。
+#### 逐攻击场景分析：攻击者能走到哪里
 
-**拦不住**：
-- ✅ **同一浏览器内的 XSS 攻击**：HttpOnly 只是阻止 JS 读取 Cookie 明文，但如果攻击者已经能在受害者浏览器中执行 JS（XSS），可以直接通过 `fetch('/identity/connect/oidc-signin?...')` 发起请求，浏览器会自动带上 SSO_BINDING Cookie。但攻击者仍然需要知道受害者会话对应的 `state` 值才能成功完成回调——这取决于 XSS 是否能访问到当前页面上下文中的 `state`。
-- ✅ **恶意浏览器扩展 / 本地恶意软件**：不受浏览器同源策略和 HttpOnly 限制，可以直接读取任意 Cookie 并伪造请求。
-- ✅ **攻击者自己完整走完流程**：在自己的浏览器中发起授权，自己携带 Cookie 完成回调 → 校验当然通过。
-- ✅ **Path  bypass 理论可能**：Cookie 的 Path 限制为 `/identity/connect/`，虽然目前回调端点就在该路径下，但如果将来有其他 SSO 相关端点不在此路径下可能有风险（当前版本不存在）。
-- ✅ **SameSite=Lax 的固有局限性**：在顶级跨站导航（如点击 `<a href="...">`）时 Cookie 仍会发送，结合 `state` 泄露才能构成攻击。
+| 攻击场景 | 能走到第几步 | 被哪道防线拦截 | 代码依据 |
+|----------|-------------|---------------|----------|
+| **场景 A：纯跨站 CSRF**（第三方网站 evil.com 诱导受害者点击 `<a href="/identity/connect/oidc-signin?code=X&state=Y">`） | 到第 7 步（SsoAuth::find）之前 | state 不可知：evil.com 无法读取受害者浏览器上下文中的 state 值（state 由客户端生成，存在于 Bitwarden 客户端内存/URL 参数中，跨站不可读）。即使盲目猜 state，也无法通过后续 SSO_BINDING 哈希校验。 | `SsoAuth::find` 找不到或 Cookie 哈希不匹配 → [identity.rs](src/api/identity.rs#L1210-L1221) |
+| **场景 B：跨站 CSRF + state 泄露**（攻击者通过 Referer、日志、URL 分享等渠道拿到了受害者的 state 值） | 到第 7 步的 SSO_BINDING 校验 | SSO_BINDING Cookie：SameSite=Lax 在跨站顶级 GET 导航时会发送 Cookie，state 也已泄露；但攻击者构造的 URL 中的 state=Y 对应的是 **攻击者自己的** sso_auth.binding_hash（攻击者的浏览器生成的），而受害者浏览器携带的是 **受害者自己的** SSO_BINDING Cookie → 哈希不匹配。 | SHA256 比对失败 → [identity.rs](src/api/identity.rs#L1218-L1221) |
+| **场景 C：XSS（攻击者在 Vaultwarden 域名下有 JS 执行权限）** | 能走到第 8 步（oidc-signin 重定向完成），第 9-14 步取决于能否拿到 code_verifier | 浏览器绑定 Cookie：XSS 中通过 `fetch()` 发起请求，浏览器自动带上 SSO_BINDING Cookie；如果 XSS 能访问当前页面上下文中的 state 值，则可成功完成 oidc-signin 回调。但**到第 9 步还需要 `code_verifier`**——verifier 由 Bitwarden 客户端生成并保存在客户端内存中，如果 XSS 在 Web Vault 页面上下文中，可能通过 JS 读取内存中的 verifier；如果是在其他页面上下文中的 XSS，则拿不到 verifier，在第 10 步 PKCE 校验被拦截。 | PKCE 校验需要 verifier → [sso_client.rs](src/sso_client.rs#L216-L225) |
+| **场景 D：中间人/网络窃听者**（能看到所有 HTTP 流量，假设 HTTPS 已被攻破或降级） | 能看到第 1-9 步的所有明文，但仍被第 10 步 PKCE 和第 13 步 Id Token 校验拦住 | 可以截获 state（第 1 步）、code（第 6 步），但：① **code_verifier** 在第 9 步从客户端发到 Vaultwarden，中间理论上能拿到，但拿到了也没用——IdP 的 code X 只能使用一次（OIDC 规范）；② **SSO_BINDING Cookie 的 Secure 属性**在 HTTPS 下即使网络层能看到 Cookie，攻击者在自己的浏览器中也无法伪造该 Cookie（因为 Secure）；③ 即使伪造了请求，Id Token 的签名校验仍然无法绕过。 | PKCE one-time code + Id Token 签名 |
+| **场景 E：攻击者控制同一浏览器的恶意扩展/本地恶意软件** | 能走完全流程 | 浏览器扩展不受 SameSite/HttpOnly/同源限制，可以读取 state、code_verifier、Cookie，可以伪造任意请求。这种情况所有浏览器侧防护全部失效。 | 浏览器安全模型之外 |
+| **场景 F：攻击者在自己的浏览器中完整走合法流程** | 能走完全流程（预期行为） | 所有防护机制都是针对"攻击者冒充受害者"设计的，对合法用户自己的登录流程不做拦截。 | 正常登录路径 |
+
+#### 关键结论
+
+- **state 本身不保证安全**：它只是一个数据库查找键，由客户端生成且不校验，单独不足以防御 CSRF；真正起作用的是 state + SSO_BINDING Cookie 的**组合**——state 确保回调能定位到正确的会话，Cookie 确保发起授权和接收回调的是同一浏览器。
+- **PKCE 是 code 被盗后的最后一道防线**：即使 state 和 code 同时泄露（如 Referer 泄露），攻击者没有 code_verifier 也无法在 `/connect/token` 阶段兑换到 Token。
+- **同源限制保护 /connect/token 端点**：如果攻击者试图从第三方网站用 AJAX 直接调用 `POST /identity/connect/token`，会被浏览器 CORS 策略拦截；但攻击者如果已经拿到 code 和 verifier，也可以在自己的非浏览器环境中直接发 POST，不受同源限制——这就是 PKCE 存在的意义。
 
 ### 6.5 防线四：Id Token 校验
 
@@ -561,15 +625,19 @@ if validate_claim.iss.ne(&CONFIG.sso_authority()) { ... }  // iss 校验（与 s
 
 基于以上分析，对常见攻击场景逐一判定：
 
-| 攻击场景 | 是否可行 | 在哪一道防线被拦截 |
-|----------|----------|-------------------|
+| 攻击场景 | 是否可行 | 实际能走到哪一步 / 被哪道防线拦截 |
+|----------|----------|----------------------------------|
 | 攻击者完全没有 IdP 账号，想直接登录 Vaultwarden | ❌ 不可行 | 防线一（IdP 登录）：没有凭据拿不到 code |
 | 攻击者有自己的合法 IdP 账号，想登录**自己的** Vaultwarden 账号 | ✅ 可行 | 全部防线正常放行（预期行为） |
 | 攻击者有自己的合法 IdP 账号，想登录**他人的** Vaultwarden 账号（邮箱不同） | ❌ 不可行 | 防线五（账号映射）：identifier 和 email 都不匹配目标用户 |
 | 攻击者有自己的合法 IdP 账号，IdP 返回的邮箱恰好等于目标用户邮箱且 email_verified=true | ✅ 可行（风险） | 防线五可能放行（取决于 `sso_signups_match_email` 配置）；这是 IdP 身份与 Vaultwarden 账号的信任边界 |
 | 管理员设置了 `signups_allowed=false`，攻击者仍通过 SSO 自动创建新账号 | ✅ 可行（注意） | **不会被拦截**：SSO 自动注册走 `is_email_domain_allowed()`，不检查 `signups_allowed`；需配合 `signups_domains_whitelist` 才能限制 SSO 新用户 |
-| 攻击者通过某种渠道截获了受害者的 `code`，但没有其他上下文 | ❌ 不可行 | 防线三（需要 SSO_BINDING Cookie 才能写入 DB 的 code_response）+ 防线二（需要 verifier 才能兑换 token） |
-| 攻击者在受害者浏览器中发起 SSO 授权（XSS/CSRF），想获取受害者的 code | ❌ 极难 | 防线三 + OAuth2 `state` 参数本身的 CSRF 防护：攻击者需要同时知道 `state` 值，并让受害者浏览器携带正确的 SSO_BINDING Cookie；`SameSite=Lax` 对跨站 POST 提供额外保护 |
+| **场景 A：纯跨站 CSRF**（第三方网站诱导受害者点击回调链接） | ❌ 不可行 | state 不可知：`SsoAuth::find` 找不到记录（跨站无法读取受害者客户端内存中的 state 值） |
+| **场景 B：跨站 CSRF + state 泄露**（攻击者通过 Referer/日志拿到了受害者的 state） | ❌ 不可行 | SSO_BINDING Cookie 哈希不匹配：state 对应攻击者自己的 sso_auth.binding_hash，但受害者浏览器携带的是受害者自己的 Cookie |
+| **场景 C：仅截获 code，没有其他上下文**（如 Referer 泄露 code） | ❌ 不可行 | 两层拦截：① oidc-signin 阶段需要 state + SSO_BINDING Cookie 才能把 code 写入 DB；② 即使跳过写入直接调 /connect/token，也需要 PKCE verifier 才能兑换 |
+| **场景 D：XSS 在 Vaultwarden 域名下执行 JS**（能拿到 state 且 fetch 自动带 Cookie） | ⚠️ 部分可行 | 能走完 oidc-signin 回调（第 1-8 步），但第 9 步需要 PKCE code_verifier；verifier 在 Bitwarden 客户端内存中，若 XSS 不在 Web Vault SSO 流程页面上下文中则拿不到，PKCE 校验拦截 |
+| **场景 E：中间人/网络窃听者**（HTTPS 假设已攻破，能看到所有流量） | ❌ 不可行 | ① IdP 的 code 只能用一次（OIDC 规范），中间人即使拿到 code+verifier 也会和合法客户端竞争；② SSO_BINDING Cookie 的 Secure 属性使攻击者无法在自己浏览器中伪造；③ Id Token 签名无法伪造 |
+| **场景 F：恶意浏览器扩展/本地恶意软件**（不受浏览器安全模型限制） | ✅ 可行 | 能读取 Cookie、state、code_verifier，能伪造任意请求，所有浏览器侧防护全部失效 |
 | 攻击者伪造 Id Token | ❌ 不可行 | 防线四（openidconnect crate 的签名校验不通过） |
 | 攻击者用另一个 IdP 签发的合法 Token | ❌ 不可行 | 防线四（issuer 校验不通过，与 Discovery 时记录的 issuer_url 不匹配） |
 | 攻击者跳过 `/sso/prevalidate`，不传 `ssoToken` | ✅ 可行（无影响） | 该参数本来就不校验，不影响任何后续防线 |
@@ -577,38 +645,44 @@ if validate_claim.iss.ne(&CONFIG.sso_authority()) { ... }  // iss 校验（与 s
 ### 6.8 总结：各防线的职责分工
 
 ```
-                    ┌──────────────────────────────────────────────────┐
-                    │  sso_token / authorize 参数不校验的影响区域       │
-                    │  仅限于"授权发起前"，不影响以下任何防线            │
-                    └──────────────────────────────────────────────────┘
+                    ┌──────────────────────────────────────────────────────┐
+                    │    sso_token / authorize 参数不校验的影响区域         │
+                    │    仅限于"授权发起前"，不影响以下任何防线              │
+                    └──────────────────────────────────────────────────────┘
                                                │
                                                ▼
-┌─────────────┐  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│  防线一     │  │  防线二     │  │  防线三       │  │  防线四       │  │  防线五       │
-│  IdP 登录   │─▶│  PKCE       │─▶│  浏览器绑定   │─▶│  Id Token 校验│─▶│  账号映射     │
-│             │  │             │  │  Cookie      │  │              │  │              │
-│  拦：无凭据 │  │  拦：code   │  │  拦：跨设备   │  │  拦：伪造/    │  │  拦：冒用     │
-│  人/冒用   │  │  劫持       │  │  /CSRF 回调  │  │  篡改/过期   │  │  他人账号     │
-│  IdP 凭据  │  │             │  │              │  │              │  │              │
-└─────────────┘  └─────────────┘  └──────────────┘  └──────────────┘  └──────────────┘
-       │                │                  │                 │                  │
-       ▼                ▼                  ▼                 ▼                  ▼
-  需要攻破 IdP    需要同时拿到       需要读/写受害者       需要攻破 IdP       需要 IdP 返回
-  本身或拿到      code 和 verifier   浏览器 Cookie         签名私钥或        受害者邮箱且
-  受害者凭据                                             配置不当           验证通过
+┌─────────────┐  ┌──────────────────────────────────────────────┐  ┌──────────────┐  ┌──────────────┐
+│  防线一     │  │  防线二 + 防线三：state + PKCE + 浏览器绑定     │  │  防线四       │  │  防线五       │
+│  IdP 登录   │─▶│  Cookie + 同源限制（联合作用，缺一不可）       │─▶│  Id Token 校验│─▶│  账号映射     │
+│             │  │                                              │  │              │  │              │
+│  拦：无凭据 │  │  state：只是 DB 查找键（客户端生成，不校验）   │  │  拦：伪造/    │  │  拦：冒用     │
+│  人/冒用   │  │  SSO_BINDING Cookie：保证同一浏览器上下文       │  │  篡改/过期   │  │  他人账号     │
+│  IdP 凭据  │  │  PKCE verifier：code 被盗后的最后一道防线       │  │              │  │              │
+│             │  │  同源限制：阻止跨站 AJAX 调用 /connect/token   │  │              │  │              │
+└─────────────┘  └──────────────────────────────────────────────┘  └──────────────┘  └──────────────┘
+       │                              │                                       │                  │
+       ▼                              ▼                                       ▼                  ▼
+  需要攻破 IdP              需同时突破：state 可知 +                          需要攻破 IdP       需要 IdP 返回
+  本身或拿到                Cookie 可伪造 + verifier 可获取                    签名私钥或        受害者邮箱且
+  受害者凭据                                                                   配置不当           验证通过
 ```
 
-**核心结论**：`sso_token` 和 authorize 阶段多数参数的不校验确实让攻击者可以"少走一步路"（跳过 prevalidate、随便传参数），但**并不直接通向账号接管**。真正决定能否登录他人账号的是最后三道防线的组合——浏览器绑定 Cookie 保证了回调的浏览器上下文一致性，Id Token 校验保证了身份来源可信，账号映射决定了身份到 Vaultwarden 用户的归属关系。
+**核心结论**：`sso_token` 和 authorize 阶段多数参数的不校验确实让攻击者可以"少走一步路"（跳过 prevalidate、随便传参数），但**并不直接通向账号接管**。state 本身只是数据库查找键，不单独承担安全防护职责；真正构成"攻击者无法冒充受害者"的，是 state + SSO_BINDING Cookie + PKCE verifier + 同源限制的**联合防线**——state 让回调能定位到正确会话，Cookie 保证发起授权和接收回调的是同一浏览器，PKCE 保证即使 code 泄露也无法兑换 Token，同源限制让跨站攻击者无法直接调用 Token 端点。最后 Id Token 校验保证身份来源可信，账号映射决定身份到 Vaultwarden 用户的归属关系。
 
-### 四个需要特别关注的事实校准点
+### 五个需要特别关注的事实校准点
 
 1. **Id Token 校验分层**：签名/issuer/audience/nonce/exp 由 `openidconnect = "4.0.1"` crate 在 `id_token.claims(&verifier, &nonce)` 调用时统一校验；`sso.rs` 中的 `decode_token_claims` 仅对 **access_token/refresh_token** 做粗粒度的 exp + iss 校验（用 `dangerous::insecure_decode` 跳过签名），目的是提取 Token 生命周期，并非 Id Token 的安全校验。
 
-2. **HttpOnly 的真实边界**：只能阻止 JS 读取 Cookie 明文值，**无法阻止 XSS 上下文中的即时请求**——攻击者若已获得 XSS，仍可通过 `fetch()` 发起请求让浏览器自动带上 SSO_BINDING Cookie，只是需要同时知道当前会话的 `state` 值才能完成回调。
+2. **HttpOnly 的真实边界**：只能阻止 JS 通过 `document.cookie` 读取 Cookie 明文值，**无法阻止 XSS 上下文中的即时请求**——攻击者若已获得 XSS，仍可通过 `fetch()` 发起请求让浏览器自动带上 SSO_BINDING Cookie，只是需要同时知道当前会话的 `state` 值才能完成回调；后续兑换 Token 还需要 PKCE code_verifier。
 
-3. **CSRF 防护的真实机制**：`/connect/oidc-signin` 的 CSRF 防护主要依赖 OAuth2 标准的 `state` 参数（未知 state 无法定位 DB 中 sso_auth 记录），SSO_BINDING Cookie 是在此之上额外增加的浏览器上下文绑定层，并非 Vaultwarden 专门实现了"CSRF Token 机制"。
+3. **state 与 CSRF 防护的真实机制**：
+   - `state` 是**客户端生成并传入** authorize 的参数（[identity.rs](src/api/identity.rs#L1247-L1268)），Vaultwarden 对其不做任何校验（不检查长度、格式、随机性、唯一性冲突），只是把它当作 `SsoAuth` 的主键保存，回调时用它回查 DB。
+   - 因此 `state` **本身不直接承担 CSRF 防护职责**，它只是让 Vaultwarden 能找到对应会话的"索引"。真正的防护来自 state + SSO_BINDING Cookie 的组合：即使攻击者通过某种渠道知道了 state 值，也无法让受害者浏览器携带正确的 SSO_BINDING Cookie（攻击者的 state 对应攻击者自己的 binding_hash，与受害者浏览器的 Cookie 哈希不匹配）。
+   - `/connect/token` 端点的跨站 AJAX 调用则被浏览器**同源策略**（CORS）拦截，这是浏览器默认行为，Vaultwarden 没有额外实现"CSRF Token 机制"。
 
-4. **SSO 自动注册独立于 `signups_allowed`**：SSO 新用户创建走 `CONFIG.is_email_domain_allowed()`（只检查域名白名单），普通注册走 `CONFIG.is_signup_allowed()`（同时检查 `signups_allowed` 和白名单）。因此：
+4. **PKCE 的关键作用**：PKCE verifier 由 Bitwarden 客户端在本地生成并保存在内存中，**从不经过网络传输到 Vaultwarden**（直到第 9 步 `/connect/token` 才通过 HTTPS POST 发送）。因此即使攻击者通过 Referer 泄露、URL 分享等方式拿到了 code 和 state，没有 verifier 也无法兑换到 Token——这是 code 被盗场景下的最后一道防线。
+
+5. **SSO 自动注册独立于 `signups_allowed`**：SSO 新用户创建走 `CONFIG.is_email_domain_allowed()`（只检查域名白名单），普通注册走 `CONFIG.is_signup_allowed()`（同时检查 `signups_allowed` 和白名单）。因此：
    - `signups_allowed=false` 只禁用普通邮箱+密码注册，**不会阻止 SSO 用户自动创建账号**
    - 白名单为空时，**任何邮箱域名都能通过 SSO 自动注册**
    - 要完全禁止 SSO 新用户注册，必须通过 `signups_domains_whitelist` 明确限制允许的域名
