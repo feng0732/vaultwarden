@@ -396,3 +396,175 @@ pub fn invalidate() {
     // 缓存禁用时此函数为 no-op
 }
 ```
+
+---
+
+## 六、忽略 sso_token 与 authorize 参数后的安全影响边界
+
+本章的核心问题：既然 `sso_token` 完全未校验，且 `/connect/authorize` 中 6/10 的参数被 `#[allow(unused)]` 直接忽略，那么攻击者能走多远？后续的五道防线（IdP 登录、PKCE、浏览器绑定 Cookie、Id Token 校验、账号映射）各自能拦住什么、拦不住什么？
+
+### 6.1 攻击者能直接跳过的环节
+
+由于 Vaultwarden 服务端对以下内容不做任何校验：
+
+| 被忽略项 | 攻击者可做的操作 |
+|----------|-----------------|
+| `sso_token` | 完全跳过 `/sso/prevalidate`，直接请求 `/connect/authorize`；传任意值或不传都不影响 |
+| `response_type` | 不传或传任意值（IdP 侧仍会校验，但 Vaultwarden 不关心） |
+| `scope`（authorize 阶段） | 不传或传任意值；真正传给 IdP 的 scope 来自 `CONFIG.sso_scopes`（默认 `"email profile"`，`openid` 隐式） |
+| `response_mode` | 不传或传任意值 |
+| `domain_hint` | 不传或传任意值 |
+| `state` | 传任意字符串；虽然是必填的 newtype，但仅作为 DB 主键，不校验长度/格式/随机性（极端情况可被暴力猜解） |
+| `code_challenge` | 传任意字符串；虽然是必填的 newtype，但不校验 Base64URL 格式或长度 |
+
+此外 `redirect_uri` 在 web/browser/desktop/mobile 模式下也被忽略（直接用硬编码值），仅 CLI 模式会提取端口号。
+
+**注意**：`client_id` 和 `code_challenge_method` 不在此列——前者有白名单校验，后者必须为 `"S256"`。
+
+### 6.2 防线一：IdP 登录（用户在 IdP 侧输入凭据）
+
+**防线位置**：完全发生在 IdP 侧，Vaultwarden 仅重定向引导。
+
+**能拦住**：
+- ❌ 没有 IdP 合法账号凭据的攻击者（即使绕过 Vaultwarden 的所有前置检查，IdP 登录页会挡住）
+- ❌ 想冒用他人 IdP 账号但无法通过其 MFA/密码的攻击者
+
+**拦不住**：
+- ✅ 攻击者拥有 IdP 的合法账号（哪怕是同组织内的一个低权限普通员工账号）
+- ✅ IdP 本身存在漏洞（如会话固定、弱密码、未启用 MFA、开放注册等）
+- ✅ IdP 配置了错误的 scope 导致返回了过多用户信息
+- ✅ 攻击者先让**受害者**在 IdP 完成登录授权（再结合后续防线分析能否劫持到受害者的 code）
+
+### 6.3 防线二：PKCE 校验
+
+**实现有两条分支**（[sso_client.rs](src/sso_client.rs#L216-L225)）：
+
+```
+sso_pkce=true（默认）:  verifier 直接发给 IdP Token 端点，由 IdP 校验
+sso_pkce=false:         Vaultwarden 本地计算 SHA256(verifier) == sso_auth.client_challenge
+```
+
+**能拦住**：
+- ❌ 纯授权码劫持攻击：攻击者通过某种渠道（恶意 App、网络中间人、恶意浏览器扩展）截获了 IdP 返回的 `code`，但不知道对应的 `code_verifier` → `/connect/token` 兑换时 PKCE 校验失败
+- ❌ 攻击者在 `/connect/authorize` 中填入自己的 `code_challenge`，但在 `/connect/token` 时不知道对应 `verifier` 的情况
+
+**拦不住**：
+- ✅ 攻击者完整走完自己的授权流程：自己发起 `/connect/authorize`（填入自己的 challenge）→ 自己在 IdP 登录 → 自己收到 code → 用自己知道的 verifier 兑换 token。此时 PKCE 是"自己校验自己"，不起防护作用
+- ✅ 攻击者能同时控制授权发起和 code 兑换两个阶段（例如同一恶意客户端）
+- ✅ `sso_pkce=false` 且攻击者能读数据库：直接从 `sso_auth.client_challenge` 字段反推是不可能的（SHA256 不可逆），但如果攻击者能写入数据库另当别论
+
+### 6.4 防线三：浏览器绑定 Cookie（`VW_SSO_BINDING`）
+
+**校验点**：仅在 `/connect/oidc-signin`（IdP 回调 Vaultwarden 时）执行一次（[identity.rs](src/api/identity.rs#L1214-L1223)）。
+
+Cookie 属性（[identity.rs](src/api/identity.rs#L1294-L1302)）：
+- `Path=/identity/connect/`（仅在该路径及其子路径下发送）
+- `SameSite=Lax`（跨站 POST 不发送，但跨站 GET 顶级导航会发送）
+- `HttpOnly`（JS 无法读取，缓解 XSS）
+- `Secure`（仅 HTTPS 下发送，取决于当前请求是否 https）
+
+校验逻辑：
+```
+Cookie 中的明文 binding_token → SHA-256 → 必须等于 DB 中 sso_auth.binding_hash
+```
+
+**能拦住**：
+- ❌ **纯 CSRF 攻击**：第三方网站诱导受害者浏览器访问 `GET /connect/oidc-signin?code=X&state=Y`（注意这是 GET）。
+  - SameSite=Lax 在跨站顶级 GET 导航时**会发送 Cookie**，此场景下不能直接拦截。
+  - 但攻击者无法预先知道受害者的 `state` 值（因为 `state` 是在发起授权时生成的，且必须和 DB 中的 `sso_auth` 对应），因此仍然无法构造有效请求。
+- ❌ **跨设备/跨浏览器会话劫持**：攻击者在自己的浏览器发起授权（得到自己的 SSO_BINDING Cookie 和 state），然后诱导受害者浏览器回调 `/connect/oidc-signin?code=...&state=攻击者的state`。
+  - 受害者浏览器不会携带攻击者浏览器的 SSO_BINDING Cookie → 哈希不匹配 → 被拦截。
+- ❌ **攻击者只拿到 code 但拿不到 Cookie**：例如通过 Referer 泄露、日志泄露等方式拿到 code，但无法读取受害者浏览器的 Cookie。
+
+**拦不住**：
+- ✅ **同一浏览器内的攻击**：攻击者在受害者的同一浏览器中（比如通过 XSS 尽管 HttpOnly 缓解，或通过恶意浏览器扩展），能读取 SSO_BINDING Cookie → 可构造通过校验的回调请求。
+- ✅ **攻击者自己完整走完流程**：在自己的浏览器中发起授权，自己携带 Cookie 完成回调 → 校验当然通过。
+- ✅ **Path  bypass 理论可能**：Cookie 的 Path 限制为 `/identity/connect/`，虽然目前回调端点就在该路径下，但如果将来有其他 SSO 相关端点不在此路径下可能有风险（当前版本不存在）。
+- ✅ **SameSite=Lax 的固有局限性**：在顶级跨站导航（如点击 `<a href="...">`）时 Cookie 仍会发送，结合 `state` 泄露才能构成攻击。
+
+### 6.5 防线四：Id Token 校验
+
+**校验内容**（[sso_client.rs](src/sso_client.rs#L243-L249) 调用 `id_token.claims(&verifier, &nonce)` 一次性完成）：
+
+| 校验项 | 说明 | 代码/配置来源 |
+|--------|------|--------------|
+| **签名** | 必须是 IdP 私钥签发，公钥从 Discovery 的 JWKS 端点获取 | `openidconnect` 内置 + `CoreProviderMetadata` |
+| **issuer (iss)** | 必须精确等于 `CONFIG.sso_authority` | [sso.rs](src/sso.rs#L161) |
+| **audience (aud)** | 必须包含 `sso_client_id`，或匹配 `SSO_AUDIENCE_TRUSTED` 正则 | [sso_client.rs](src/sso_client.rs#L273-L286) |
+| **nonce** | 必须等于 `sso_auth.nonce`（授权发起时随机生成并保存在 DB） | [sso_client.rs](src/sso_client.rs#L230-L231) |
+| **过期时间 (exp)** | JWT 标准校验，默认 60 秒 leeway | [sso.rs](src/sso.rs#L158) |
+
+**能拦住**：
+- ❌ 攻击者自己伪造的 Id Token（没有 IdP 私钥签名）
+- ❌ 其他 IdP 签发的合法 Token（issuer 不匹配）
+- ❌ 过期的 Id Token
+- ❌ audience 不包含 `sso_client_id` 且不匹配信任正则的 Token
+- ❌ nonce 不匹配的 Token（防止 Token 重放到另一个会话）
+- ❌ 没有 `id_token` 字段的 token_response（[sso_client.rs](src/sso_client.rs#L232-L234) 显式检查）
+
+**拦不住**：
+- ✅ IdP 为攻击者本人签发的**合法** Id Token（issuer/audience/nonce/signature/exp 全部合法）
+- ✅ IdP 签发的 audience 虽然不是 `sso_client_id`，但恰好匹配 `SSO_AUDIENCE_TRUSTED` 正则的 Token（如果正则配置过宽，如 `.*`，则等同于信任所有 audience）
+- ✅ IdP 存在漏洞（如 Token 注入、签名绕过、混淆 alg:none 等）签发的任意 Token（这属于 IdP 自身漏洞，不是 Vaultwarden 的防线）
+
+### 6.6 防线五：账号映射
+
+**执行位置**：`sso_login()` 中 `SsoUser::find_by_identifier` → `SsoUser::find_by_mail` 的两级查找（[identity.rs](src/api/identity.rs#L208-L264)），再加上后续 redeem 时的关联写入。
+
+**能拦住**：
+- ❌ **Identifier 精确匹配不命中 + Email 也不命中**：攻击者 IdP 账号的邮箱在 Vaultwarden 中完全不存在，且不允许新用户注册（域名白名单拦截）→ 登录失败
+- ❌ **想冒用他人邮箱但 IdP 返回的邮箱不匹配**：攻击者的 IdP 账号只能返回自己的邮箱，无法通过映射跳到其他用户
+- ❌ **已有 SSO 用户同邮箱**：攻击者的 IdP identifier 是新的，但邮箱已被另一个 SSO identifier 占用 → 报错"Existing SSO user with same email"，防止两个 OIDC 账号共享一个 Vaultwarden 账号
+- ❌ **`sso_signups_match_email=false`**：即使邮箱匹配，也不允许关联已有非 SSO 用户
+- ❌ **IdP 不返回 `email_verified=true`**：默认情况下 `sso_allow_unknown_email_verification=false`，邮箱验证状态不明或明确为 false 都拒绝关联
+
+**拦不住**：
+- ✅ **Identifier 精确命中**（正常合法用户场景）：攻击者此前已用自己的 IdP 账号注册过，直接登录自己的账号
+- ✅ **Email 匹配 + 邮箱已验证 + 允许关联**：攻击者的 IdP 账号邮箱恰好就是目标 Vaultwarden 用户的邮箱，且 IdP 返回 `email_verified=true` → 成功关联到目标用户账号并登录
+  - 这在 IdP 与 Vaultwarden 使用同一套企业邮箱体系时通常是期望行为，但如果 IdP 允许用户任意自定义邮箱（且未强制验证）就会构成账号接管风险
+- ✅ **两级都不命中 + 允许注册**：攻击者的 IdP 邮箱在白名单域名内且 email_verified 合规 → 自动创建新 Vaultwarden 账号（合法注册场景，除非配置 `signups_allowed=false`）
+- ✅ **目标用户是被邀请的 Stub 用户**（`private_key.is_none()`）：邮箱匹配后会直接补齐 verified_at 和 name 并继续
+
+### 6.7 综合攻击路径评估
+
+基于以上分析，对常见攻击场景逐一判定：
+
+| 攻击场景 | 是否可行 | 在哪一道防线被拦截 |
+|----------|----------|-------------------|
+| 攻击者完全没有 IdP 账号，想直接登录 Vaultwarden | ❌ 不可行 | 防线一（IdP 登录）：没有凭据拿不到 code |
+| 攻击者有自己的合法 IdP 账号，想登录**自己的** Vaultwarden 账号 | ✅ 可行 | 全部防线正常放行（预期行为） |
+| 攻击者有自己的合法 IdP 账号，想登录**他人的** Vaultwarden 账号（邮箱不同） | ❌ 不可行 | 防线五（账号映射）：identifier 和 email 都不匹配目标用户 |
+| 攻击者有自己的合法 IdP 账号，IdP 返回的邮箱恰好等于目标用户邮箱且 email_verified=true | ✅ 可行（风险） | 防线五可能放行（取决于 `sso_signups_match_email` 配置）；这是 IdP 身份与 Vaultwarden 账号的信任边界 |
+| 攻击者通过某种渠道截获了受害者的 `code`，但没有其他上下文 | ❌ 不可行 | 防线三（需要 SSO_BINDING Cookie 才能写入 DB 的 code_response）+ 防线二（需要 verifier 才能兑换 token） |
+| 攻击者在受害者浏览器中发起 SSO 授权（XSS/CSRF），想获取受害者的 code | ❌ 极难 | 防线三（需要控制 Cookie 和 state 同时匹配，且 CSRF Token 机制 / SameSite Cookie 提供额外保护） |
+| 攻击者伪造 Id Token | ❌ 不可行 | 防线四（签名校验不通过） |
+| 攻击者用另一个 IdP 签发的合法 Token | ❌ 不可行 | 防线四（issuer 校验不通过） |
+| 攻击者跳过 `/sso/prevalidate`，不传 `ssoToken` | ✅ 可行（无影响） | 该参数本来就不校验，不影响任何后续防线 |
+
+### 6.8 总结：各防线的职责分工
+
+```
+                    ┌──────────────────────────────────────────────────┐
+                    │  sso_token / authorize 参数不校验的影响区域       │
+                    │  仅限于"授权发起前"，不影响以下任何防线            │
+                    └──────────────────────────────────────────────────┘
+                                               │
+                                               ▼
+┌─────────────┐  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│  防线一     │  │  防线二     │  │  防线三       │  │  防线四       │  │  防线五       │
+│  IdP 登录   │─▶│  PKCE       │─▶│  浏览器绑定   │─▶│  Id Token 校验│─▶│  账号映射     │
+│             │  │             │  │  Cookie      │  │              │  │              │
+│  拦：无凭据 │  │  拦：code   │  │  拦：跨设备   │  │  拦：伪造/    │  │  拦：冒用     │
+│  人/冒用   │  │  劫持       │  │  /CSRF 回调  │  │  篡改/过期   │  │  他人账号     │
+│  IdP 凭据  │  │             │  │              │  │              │  │              │
+└─────────────┘  └─────────────┘  └──────────────┘  └──────────────┘  └──────────────┘
+       │                │                  │                 │                  │
+       ▼                ▼                  ▼                 ▼                  ▼
+  需要攻破 IdP    需要同时拿到       需要读/写受害者       需要攻破 IdP       需要 IdP 返回
+  本身或拿到      code 和 verifier   浏览器 Cookie         签名私钥或        受害者邮箱且
+  受害者凭据                                             配置不当           验证通过
+```
+
+**核心结论**：`sso_token` 和 authorize 阶段多数参数的不校验确实让攻击者可以"少走一步路"（跳过 prevalidate、随便传参数），但**并不直接通向账号接管**。真正决定能否登录他人账号的是最后三道防线的组合——浏览器绑定 Cookie 保证了回调的浏览器上下文一致性，Id Token 校验保证了身份来源可信，账号映射决定了身份到 Vaultwarden 用户的归属关系。
+
+剩余风险集中在 IdP 侧：如果 IdP 允许攻击者控制返回的 email 字段且标记为已验证，或者 `SSO_AUDIENCE_TRUSTED` 正则配置过宽，才可能造成实质安全问题。
