@@ -258,9 +258,13 @@ if let Some(org_id) = data.organization_id {
 
 ## 错误处理机制
 
-### 前置验证（Pre-validation）
+导入流程的错误处理分 **两个阶段**，处理方式有本质区别：
+- **第一阶段：前置验证** — 在任何数据写入前执行，严格拦截所有不合法的 Cipher
+- **第二阶段：逐项写入** — 通过前置验证后，逐条写入数据库，此时出错不再"全有或全无"
 
-导入采用 **"全有或全无"** 策略：在写入任何数据之前，先对所有 Cipher 进行验证，任何一项不合法则整体失败。
+### 第一阶段：前置验证（写入前拦截）
+
+在写入任何数据之前，调用 `Cipher::validate_cipher_data()` 对所有 Cipher 做批量检查。此阶段的检查是"全有或全无"——任何一项不合法则整体中止，此时还没有任何数据写入数据库。
 
 ```rust
 Cipher::validate_cipher_data(&data.ciphers)?;
@@ -268,11 +272,11 @@ Cipher::validate_cipher_data(&data.ciphers)?;
 位置：[src/api/core/ciphers.rs#L605](src/api/core/ciphers.rs#L605)
 和 [src/api/core/organizations.rs#L1800](src/api/core/organizations.rs#L1800)
 
-### 验证规则
+#### validate_cipher_data 的检查范围
 
-`Cipher::validate_cipher_data()` 检查以下内容：
+**`validate_cipher_data()` 仅拦截两类错误：**
 
-#### 1. Notes 字段长度限制
+##### 1. Notes 字段长度超限
 
 ```rust
 if let Some(note) = &cipher.notes
@@ -288,10 +292,10 @@ if let Some(note) = &cipher.notes
 - 默认限制：**10,000 字符**
 - 配置 `increase_note_size_limit=true` 时：**100,000 字符**（警告：可能导致客户端问题，且导出不兼容 Bitwarden 官方服务端）
 
-位置：[src/db/models/cipher.rs#L97-L140](src/db/models/cipher.rs#L97-L140)
+位置：[src/db/models/cipher.rs#L97-L109](src/db/models/cipher.rs#L97-L109)
 和 [src/config.rs#L782-L786](src/config.rs#L782-L786)
 
-#### 2. 密码历史 null 值检查
+##### 2. 密码历史 password 值为 null（非字符串）
 
 ```rust
 if let Some(Value::Array(password_history)) = &cipher.password_history {
@@ -313,9 +317,17 @@ if let Some(Value::Array(password_history)) = &cipher.password_history {
 
 位置：[src/db/models/cipher.rs#L111-L127](src/db/models/cipher.rs#L111-L127)
 
-### 验证失败响应格式
+#### validate_cipher_data 不检查的内容
 
-验证失败时返回结构化错误 JSON（Bitwarden 标准格式）：
+以下错误在前置验证阶段不会被拦截，只能在写入阶段被发现：
+- Cipher 类型无效（非 1-5）
+- 类型数据缺失
+- 权限错误（组织不匹配、无法管理集合等）
+- 其他运行时错误
+
+### 前置验证失败响应格式
+
+验证失败时返回结构化错误 JSON（Bitwarden 标准格式），此时未写入任何数据：
 
 ```json
 {
@@ -328,9 +340,109 @@ if let Some(Value::Array(password_history)) = &cipher.password_history {
 }
 ```
 
-### 过程中错误处理
+### 第二阶段：写入过程中的错误处理
 
-#### 1. 权限错误
+通过前置验证后，数据开始逐项写入数据库。此阶段 **不存在全有或全无的事务保证**，错误处理方式在个人导入和组织导入之间有显著差异。
+
+---
+
+## 数据写入边界与约束
+
+### 事务边界
+
+**重要**：Vaultwarden 导入流程 **不在单个数据库事务** 中执行，且没有任何回滚机制。
+
+写入顺序：
+1. 前置验证通过后开始写入
+2. 文件夹/集合逐个创建或复用（写入数据库）
+3. Cipher 逐个写入（写入数据库）
+4. 关联关系逐个建立（写入数据库）
+5. 用户修订日期更新
+
+如果中途出错，步骤 2 或步骤 3 中已成功写入的数据 **不会被回滚**。
+
+### 个人导入：使用 `?` 中止，但不回滚已写入数据
+
+个人导入在多处使用 `?` 传播错误，一旦出错立即中止整个导入函数：
+
+| 写入环节 | 错误传播方式 | 出错时已写入数据的状态 |
+|---------|------------|---------------------|
+| 个人所有权策略检查 | `.await?` | 无数据写入（中止在最前面） |
+| 文件夹创建循环 | `.await?` | 此前已创建的文件夹保留，不回滚 |
+| Cipher 写入循环 | `.await?` | 此前已创建的文件夹和已写入的 Cipher 保留，不回滚 |
+| 用户修订更新 | `.await?` | 所有 Cipher 已写入 |
+
+关键代码（Cipher 写入循环）：
+
+```rust
+for (index, mut cipher_data) in data.ciphers.into_iter().enumerate() {
+    ...
+    let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
+    update_cipher_from_data(
+        &mut cipher, cipher_data, &headers, None, &conn, &nt, UpdateType::None
+    ).await?;  // 使用 ? 立即中止，但不回滚已写入的数据
+}
+```
+位置：[src/api/core/ciphers.rs#L631-L637](src/api/core/ciphers.rs#L631-L637)
+
+文件夹创建循环同样使用 `?`：
+
+```rust
+for folder in data.folders {
+    ...
+    let mut new_folder = Folder::new(headers.user.uuid.clone(), folder.name);
+    new_folder.save(&conn).await?;  // 出错立即中止，已创建的文件夹不回滚
+    ...
+}
+```
+位置：[src/api/core/ciphers.rs#L611-L621](src/api/core/ciphers.rs#L611-L621)
+
+### 组织导入：使用 `.ok()` 忽略单个 Cipher 的写入错误
+
+组织导入在不同环节的错误处理策略不同：
+
+| 写入环节 | 错误传播方式 | 行为 |
+|---------|------------|------|
+| 组织 ID 检查 | `err!` 宏 | 立即中止 |
+| 已有集合权限检查 | `err!` 宏 | 立即中止 |
+| 新集合创建权限检查 | `err!` 宏 | 立即中止 |
+| 集合创建保存 | `.await?` | 立即中止，已创建的集合不回滚 |
+| **Cipher 写入循环** | `.await.ok()` | **忽略单个错误，继续处理后续 Cipher** |
+| 集合-条目关联保存 | `.await?` | 立即中止，已保存的关联不回滚 |
+
+关键代码（Cipher 写入循环）：
+
+```rust
+for mut cipher_data in data.ciphers {
+    cipher_data.folder_id = None;
+    let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
+    update_cipher_from_data(
+        &mut cipher, cipher_data, &headers,
+        Some(collections.clone()), &conn, &nt, UpdateType::None,
+    )
+    .await
+    .ok();  // 使用 .ok() 忽略 Result 的 Err 变体，继续下一个 Cipher
+    ciphers.push(cipher.uuid);  // 无论成功失败，uuid 都被推入列表
+}
+```
+位置：[src/api/core/organizations.rs#L1839-L1855](src/api/core/organizations.rs#L1839-L1855)
+
+**注意一个边界问题**：即使 `update_cipher_from_data` 返回 Err（Cipher 未成功写入数据库），`cipher.uuid` 仍然被推入 `ciphers` 向量。后续在建立集合-条目关联时：
+
+```rust
+for (cipher_index, col_index) in relations {
+    let cipher_id = &ciphers[cipher_index];
+    let col_id = &collections[col_index];
+    CollectionCipher::save(cipher_id, col_id, &conn).await?;
+}
+```
+位置：[src/api/core/organizations.rs#L1858-L1862](src/api/core/organizations.rs#L1858-L1862)
+
+这意味着如果某个 Cipher 写入失败但 uuid 仍在列表中，`CollectionCipher::save` 可能因外键约束而失败，此时会通过 `?` 中止整个导入。
+
+### 写入过程中可能出现的错误类型
+
+#### 权限错误
 
 | 场景 | 错误消息 |
 |------|---------|
@@ -340,7 +452,7 @@ if let Some(Value::Array(password_history)) = &cipher.password_history {
 | 无集合管理权限 | `"The current user isn't allowed to manage this collection"` |
 | 文件夹不存在 | `"Invalid folder", "Folder does not exist or belongs to another user"` |
 
-#### 2. 数据错误
+#### 数据错误
 
 | 场景 | 错误消息 |
 |------|---------|
@@ -349,7 +461,7 @@ if let Some(Value::Array(password_history)) = &cipher.password_history {
 | 组织 ID 不匹配 | `"Organization mismatch. Please resync the client before updating the cipher"` |
 | 客户端数据过期 | `"The client copy of this cipher is out of date. Resync the client and try again."` |
 
-#### 3. 导入时的特殊处理
+#### 导入时的特殊豁免
 
 在导入流程中（`UpdateType::None`），**跳过** 修订日期检查（`last_known_revision_date`），避免因日期不一致导致导入失败：
 
@@ -357,46 +469,10 @@ if let Some(Value::Array(password_history)) = &cipher.password_history {
 if ut != UpdateType::None
     && let Some(dt) = data.last_known_revision_date
 {
-    // 仅在非导入时检查
+    // 仅在非导入时检查客户端修订日期是否过期
 }
 ```
 位置：[src/api/core/ciphers.rs#L420-L433](src/api/core/ciphers.rs#L420-L433)
-
----
-
-## 数据写入边界与约束
-
-### 事务边界
-
-**重要**：Vaultwarden 导入流程 **不在单个数据库事务** 中执行。
-
-1. 前置验证通过后开始写入
-2. 文件夹/集合逐个创建或复用
-3. Cipher 逐个写入
-4. 关联关系逐个建立
-
-**风险**：如果中途某个 Cipher 写入失败，已写入的部分不会回滚。但前置验证会拦截绝大多数数据错误。
-
-### 组织导入中的容错
-
-在组织导入流程中，单个 Cipher 写入失败不会中断整体导入：
-
-```rust
-update_cipher_from_data(
-    &mut cipher, cipher_data, &headers,
-    Some(collections.clone()), &conn, &nt, UpdateType::None
-).await.ok();  // 使用 .ok() 忽略错误
-```
-位置：[src/api/core/organizations.rs#L1843-L1853](src/api/core/organizations.rs#L1843-L1853)
-
-相比之下，个人导入遇到错误会立即中止：
-
-```rust
-update_cipher_from_data(
-    &mut cipher, cipher_data, &headers, None, &conn, &nt, UpdateType::None
-).await?;  // 使用 ? 传播错误
-```
-位置：[src/api/core/ciphers.rs#L636](src/api/core/ciphers.rs#L636)
 
 ### 权限边界
 
@@ -413,8 +489,9 @@ update_cipher_from_data(
 
 | 约束项 | 限制值 | 说明 |
 |--------|--------|------|
-| Notes 最大长度 | 10,000 / 100,000 | 可配置，默认 10KB |
-| Cipher 类型范围 | 1-5 | Login=1, SecureNote=2, Card=3, Identity=4, SshKey=5 |
+| Notes 最大长度 | 10,000 / 100,000 | 可配置，默认 10KB，在 validate_cipher_data 中前置拦截 |
+| Cipher 类型范围 | 1-5 | Login=1, SecureNote=2, Card=3, Identity=4, SshKey=5，写入阶段检查 |
+| 密码历史 password | 必须为字符串 | null 值在 validate_cipher_data 中前置拦截 |
 | Reprompt 有效值 | 0, 1 | 0=None, 1=Password，其他值被过滤为 None |
 | 单 Cipher 文件夹数 | 1 | Cipher 只能属于一个 Folder |
 | 单 Cipher 集合数 | N | 可属于多个 Collection |
