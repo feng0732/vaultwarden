@@ -105,8 +105,200 @@ if !headers.user.check_valid_password(&data.old_master_key_authentication_hash) 
 **Step 4：更新 Emergency Access Keys** — [accounts.rs:848-858](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L848-L858)
 - 更新 `key_encrypted` 字段
 
+#### 3.2.3 紧急访问密钥（Emergency Access）的轮换范围与同步界限
+
+**紧急访问的角色模型**
+
+紧急访问涉及两个角色：
+- **Grantor（授权人）**：发起密钥轮换的当前用户，将自己的 User Key 加密后授予他人紧急访问
+- **Grantee（受让人）**：被授权可以紧急访问 grantor 账户的联系人
+
+`key_encrypted` 字段存储的是 **Grantor 的 User Key 用 Grantee 的公钥加密后的密文** — [emergency_access.rs:24](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/emergency_access.rs#L24)。密钥轮换时，Grantor 的 User Key 发生变化，因此所有相关的 `key_encrypted` 都必须用新 User Key 重新加密。
+
+**参与轮换的状态过滤（哪些条目参与轮换）**
+
+加载现有紧急访问记录时使用了严格的状态过滤 — [accounts.rs:818](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L818)：
+```rust
+let mut existing_emergency_access =
+    EmergencyAccess::find_all_confirmed_by_grantor_uuid(user_id, &conn).await;
+```
+
+[find_all_confirmed_by_grantor_uuid](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/emergency_access.rs#L363-L372) 的过滤条件：
+```rust
+.filter(emergency_access::status.ge(EmergencyAccessStatus::Confirmed as i32))
+// status >= 2
+```
+
+**EmergencyAccessStatus 枚举** — [emergency_access.rs:133-139](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/emergency_access.rs#L133-L139)：
+
+| 状态 | 值 | 是否参与轮换 | 原因 |
+|------|---|------------|------|
+| Invited | 0 | ❌ 不参与 | 仅发送了邀请，尚未被 grantee 接受，没有有效的 `key_encrypted` |
+| Accepted | 1 | ❌ 不参与 | Grantee 已接受但 grantor 尚未确认，没有设置 `key_encrypted` |
+| Confirmed | 2 | ✅ 参与 | 完整建立，`key_encrypted` 已设置 |
+| RecoveryInitiated | 3 | ✅ 参与 | Grantee 发起了紧急恢复请求，`key_encrypted` 仍然有效 |
+| RecoveryApproved | 4 | ✅ 参与 | 紧急恢复已批准，`key_encrypted` 仍然有效 |
+
+**轮换时的字段更新范围**
+
+[accounts.rs:856-857](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L856-L857)：
+```rust
+saved_emergency_access.key_encrypted = Some(emergency_access_data.key_encrypted);
+saved_emergency_access.save(&conn).await?;
+```
+
+轮换时只更新一个字段：
+- ✅ `key_encrypted`：用新 User Key 重新加密的密文
+
+**明确不更新的字段**（保持原值）：
+- ❌ `status`：轮换不会改变紧急访问的状态
+- ❌ `wait_time_days`：等待时间不变
+- ❌ `atype`：类型（View/Takeover）不变
+- ❌ `grantee_uuid` / `email`：受让人不变
+- ❌ `recovery_initiated_at` / `last_notification_at`：恢复相关时间戳不变
+- ❌ `created_at`：创建时间不变
+
+**同步界限：哪些用户的修订版本会被更新**
+
+[EmergencyAccess::save](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/emergency_access.rs#L144-L146)：
+```rust
+pub async fn save(&mut self, conn: &DbConn) -> EmptyResult {
+    User::update_uuid_revision(&self.grantor_uuid, conn).await;  // 只更新 grantor
+    self.updated_at = Utc::now().naive_utc();
+    ...
+}
+```
+
+关键发现：**只更新 Grantor（授权人）的 `User.updated_at`，完全不更新 Grantee（受让人）的修订版本。**
+
+```
+Grantor User.updated_at  → ✅ 被更新（触发 grantor 自己其他设备的增量同步感知）
+Grantee User.updated_at  → ❌ 不被更新
+```
+
+**关于 Grantee 端的同步缺失**
+
+紧急访问密钥轮换时，Grantee 端不会收到任何通知：
+- 没有 WebSocket 推送（`nt` 参数未传入 save，且 save 内不触发推送）
+- Grantee 的 `User.updated_at` 不更新，增量同步也感知不到
+- 没有 Push 通知
+
+**Grantee 如何感知到变更？**
+
+实际生效时机是在 Grantee 端发起紧急访问恢复时：
+1. Grantee 从服务端拉取紧急访问记录
+2. 使用自己的私钥解密 `key_encrypted` 获取 Grantor 的新 User Key
+3. 用新 User Key 解密 Grantor 的密码条目
+
+由于 `EmergencyAccess.updated_at` 自己在 save 时会被更新，Grantee 下次进入紧急访问页面时会拉到最新的 `key_encrypted`。但在 Grantee 的个人账户同步层面，这个变更不可见。
+
 **Step 5：更新 Organization Reset Password Keys** — [accounts.rs:860-870](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L860-L870)
 - 按 organization_id 匹配并更新 `reset_password_key`
+
+#### 3.2.4 组织恢复密钥（Organization Reset Password）的轮换范围与同步界限
+
+**组织恢复密钥的作用**
+
+组织管理员（Admin/Owner）可以启用"账户恢复"功能。启用后，用户的 User Key 会用组织的公钥加密，存储在 `users_organizations.reset_password_key` 字段中 — [organization.rs:48](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/organization.rs#L48)。当用户遗忘主密码时，组织管理员可以协助恢复。
+
+密钥轮换时，User Key 发生变化，因此每个启用了恢复功能的组织成员关系都必须重新加密 `reset_password_key`。
+
+**参与轮换的过滤条件（哪些成员关系参与轮换）**
+
+两步过滤 — [accounts.rs:819-821](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L819-L821)：
+```rust
+let mut existing_memberships = Membership::find_by_user(user_id, &conn).await;
+// We only rotate the reset password key if it is set.
+existing_memberships.retain(|m| m.reset_password_key.is_some());
+```
+
+**第一步：find_by_user 的隐式过滤** — [organization.rs:1014-1022](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/organization.rs#L1014-L1022)：
+```rust
+pub async fn find_by_user(user_uuid: &UserId, conn: &DbConn) -> Vec<Self> {
+    conn.run(move |conn| {
+        users_organizations::table
+            .filter(users_organizations::user_uuid.eq(user_uuid))
+            .load::<Self>(conn)  // 注意：没有按 status 过滤！
+    }).await
+}
+```
+
+`find_by_user` **不过滤状态**，意味着 Revoked(-1) 的成员关系也会被加载。
+
+**第二步：retain 显式过滤**：
+```rust
+existing_memberships.retain(|m| m.reset_password_key.is_some());
+```
+
+只保留 `reset_password_key` 非 None 的成员关系。
+
+**最终参与轮换的组合矩阵**：
+
+| Membership 状态 | reset_password_key 存在 | 是否参与轮换 |
+|----------------|----------------------|------------|
+| Revoked (-1) | Yes | ✅ 参与 |
+| Revoked (-1) | No | ❌ 不参与 |
+| Invited (0) | Yes | ✅ 参与 |
+| Invited (0) | No | ❌ 不参与 |
+| Accepted (1) | Yes | ✅ 参与 |
+| Accepted (1) | No | ❌ 不参与 |
+| Confirmed (2) | Yes | ✅ 参与 |
+| Confirmed (2) | No | ❌ 不参与 |
+
+**反直觉之处**：已被组织 Revoked（撤销）的用户，如果 `reset_password_key` 仍然存在于数据库中，该字段仍然会参与密钥轮换并被重新加密。理论上被撤销的用户不应继续持有组织的恢复能力，但数据库层面没有在 revoke 时清理该字段。
+
+**轮换时的字段更新范围**
+
+[accounts.rs:868-869](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L868-L869)：
+```rust
+membership.reset_password_key = Some(reset_password_data.reset_password_key);
+membership.save(&conn).await?;
+```
+
+轮换时只更新一个字段：
+- ✅ `reset_password_key`：用新 User Key 重新加密的密文
+
+**明确不更新的字段**（保持原值）：
+- ❌ `status`：成员状态不变
+- ❌ `atype`：成员类型（Owner/Admin/User/Manager）不变
+- ❌ `access_all`：访问权限不变
+- ❌ `akey`：组织密钥加密的成员密钥不变（组织密钥没有变化）
+- ❌ `external_id`：外部 ID 不变
+- ❌ `groups` / `collections`：关联关系不变
+
+**同步界限：哪些用户的修订版本会被更新**
+
+[Membership::save](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/organization.rs#L739-L741)：
+```rust
+pub async fn save(&self, conn: &DbConn) -> EmptyResult {
+    User::update_uuid_revision(&self.user_uuid, conn).await;  // 只更新当前用户自己
+    ...
+}
+```
+
+只更新 `self.user_uuid` — 也就是**发起密钥轮换的当前用户**的修订版本。
+
+**不被更新的用户/实体**：
+- ❌ 组织所有者（Owner）的修订版本
+- ❌ 组织管理员（Admin）的修订版本
+- ❌ 组织的 `Organization.revision_date`
+- ❌ 其他组织成员的修订版本
+
+```
+Organization.revision_date       → ❌ 不更新
+Organization Owner User.updated_at → ❌ 不更新
+Organization Admin User.updated_at → ❌ 不更新
+当前用户（轮换发起者）User.updated_at → ✅ 更新
+```
+
+**组织管理员如何感知到恢复密钥变更**：
+
+组织管理员端不会自动感知到某个用户的恢复密钥发生了变化。当管理员真正发起账户恢复操作时：
+1. 从服务端拉取该用户的 Membership
+2. 使用组织私钥解密 `reset_password_key` 获取用户的新 User Key
+3. 为用户重置主密码
+
+由于 `membership.save()` 会更新用户自己的 `User.updated_at`，但不会更新组织或组织管理员的修订版本，因此组织侧的同步不会被触发。
 
 **Step 6：更新 Sends** — [accounts.rs:872-879](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs#L872-L879)
 - 通过 [update_send_from_data](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs#L609-L665) 更新 send 的 `akey` 和加密数据
@@ -736,3 +928,15 @@ Ciphers 更新循环也直接对 `cipher_data.id.as_ref().unwrap()` 做匹配。
 | update_send_from_data 限制字段处理 | [sends.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs) | L643-L654 |
 | NumberOrString 类型兼容定义 | [util.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/util.rs) | L645-L674 |
 | SendFileData 文件元数据结构 | [sends.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/sends.rs) | L365-L371 |
+| EmergencyAccess 模型（含 key_encrypted 字段） | [emergency_access.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/emergency_access.rs) | L19-L32 |
+| EmergencyAccessStatus 状态枚举 | [emergency_access.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/emergency_access.rs) | L133-L139 |
+| EmergencyAccess.save() 仅更新 grantor 修订版 | [emergency_access.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/emergency_access.rs) | L144-L146 |
+| EmergencyAccess.find_all_confirmed_by_grantor_uuid | [emergency_access.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/emergency_access.rs) | L363-L372 |
+| 轮换中 Emergency Access 更新循环 | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L848-L858 |
+| Membership 模型（含 reset_password_key 字段） | [organization.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/organization.rs) | L35-L61 |
+| MembershipStatus 状态枚举 | [organization.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/organization.rs) | L74-L80 |
+| Membership.save() 仅更新当前用户修订版 | [organization.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/organization.rs) | L739-L741 |
+| Membership.find_by_user（不过滤 status） | [organization.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/organization.rs) | L1014-L1022 |
+| 轮换中 Organization Reset Password 更新循环 | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L860-L870 |
+| 轮换中 membership.retain 过滤（仅保留有 reset_password_key 的） | [accounts.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/api/core/accounts.rs) | L819-L821 |
+| User::update_uuid_revision（全局修订更新函数） | [user.rs](file:///d:/fz/0601/solo-dogfeeding/code/129-vaultwarden/src/db/models/user.rs) | L351-L355 |
