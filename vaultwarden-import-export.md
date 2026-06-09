@@ -3,18 +3,55 @@
 ## 目录
 
 1. [概述](#概述)
-2. [格式识别与导入端点](#格式识别与导入端点)
-3. [字段映射关系](#字段映射关系)
-4. [错误处理机制](#错误处理机制)
-5. [数据写入边界与约束](#数据写入边界与约束)
-6. [导出格式](#导出格式)
-7. [代码参考](#代码参考)
+2. [后端仅支持 Bitwarden JSON 格式](#后端仅支持-bitwarden-json-格式)
+3. [格式识别与导入端点](#格式识别与导入端点)
+4. [字段映射关系](#字段映射关系)
+5. [错误处理机制](#错误处理机制)
+6. [数据写入边界与约束](#数据写入边界与约束)
+7. [导出格式](#导出格式)
+8. [代码参考](#代码参考)
 
 ---
 
 ## 概述
 
 Vaultwarden 作为 Bitwarden 的兼容服务端实现，提供了完整的个人保险箱和组织保险箱导入导出功能。导入导出基于 Bitwarden 官方 JSON 格式，涉及 Cipher（密码条目）、Folder（文件夹）、Collection（集合）及其关联关系。
+
+---
+
+## 后端仅支持 Bitwarden JSON 格式
+
+### 服务端解析格式的唯一性
+
+**Vaultwarden 服务端仅接受 Bitwarden 标准 JSON 格式的导入数据**，不提供 CSV、LastPass、1Password、KeePass 等其他密码管理器格式的解析逻辑。
+
+#### 证据
+
+对整个 Rust 源码进行全局搜索：
+
+| 搜索关键词 | 匹配文件数 | 结论 |
+|-----------|----------|------|
+| `csv` / `Csv` / `CSV` | 0 个文件 | 服务端无任何 CSV 解析代码 |
+| `format.*import` / `import.*format` | 0 个文件 | 无多格式导入分派逻辑 |
+| `lastpass` / `1password` / `keepass` | 仅 2 个无关匹配 | 无非 Bitwarden 格式的导入适配器 |
+
+相关源码搜索范围：`src/` 目录下所有 `*.rs` 文件。
+
+### 客户端-服务端分工
+
+| 角色 | 职责 |
+|------|------|
+| **客户端（Web Vault / 桌面 / 移动端）** | 解析 CSV、LastPass、1Password、KeePass 等格式 → 在本地转换为 Bitwarden JSON 结构 → 调用后端导入 API |
+| **Vaultwarden 服务端** | 仅接收已转换好的 Bitwarden JSON → 验证 → 写入数据库 |
+
+这与 Bitwarden 官方服务端的架构完全一致：导入格式的识别和转换是客户端的职责，服务端只负责处理规范化后的 Bitwarden JSON。
+
+### 服务端接收的数据结构
+
+两个导入端点均通过 `Json<ImportData>` 直接反序列化 JSON 请求体，没有任何格式检测或多格式分派：
+
+- 个人导入：`data: Json<ImportData>` → 定义于 [src/api/core/ciphers.rs#L596](src/api/core/ciphers.rs#L595-L596)
+- 组织导入：`data: Json<ImportData>` → 定义于 [src/api/core/organizations.rs#L1785](src/api/core/organizations.rs#L1783-L1786)
 
 ---
 
@@ -26,8 +63,8 @@ Vaultwarden 支持两种导入场景，分别对应两个独立的 API 端点：
 
 | 端点 | 用途 | 代码位置 |
 |------|------|----------|
-| `POST /ciphers/import` | 个人保险箱导入 | [ciphers.rs#L595](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/ciphers.rs#L595-L644) |
-| `POST /ciphers/import-organization` | 组织保险箱导入 | [organizations.rs#L1782](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/organizations.rs#L1782-L1866) |
+| `POST /ciphers/import` | 个人保险箱导入 | [src/api/core/ciphers.rs#L595-L644](src/api/core/ciphers.rs#L595-L644) |
+| `POST /ciphers/import-organization` | 组织保险箱导入 | [src/api/core/organizations.rs#L1782-L1866](src/api/core/organizations.rs#L1782-L1866) |
 
 ### 导入数据结构
 
@@ -40,7 +77,7 @@ struct ImportData {
     folder_relationships: Vec<RelationsData>,  // 条目-文件夹关系
 }
 ```
-位置：[ciphers.rs#L578-L594](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/ciphers.rs#L578-L594)
+位置：[src/api/core/ciphers.rs#L578-L594](src/api/core/ciphers.rs#L578-L594)
 
 #### 组织导入结构 (`ImportData`)
 
@@ -51,7 +88,7 @@ struct ImportData {
     collection_relationships: Vec<RelationsData>, // 条目-集合关系
 }
 ```
-位置：[organizations.rs#L1764-L1780](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/organizations.rs#L1764-L1780)
+位置：[src/api/core/organizations.rs#L1764-L1780](src/api/core/organizations.rs#L1764-L1780)
 
 #### 关联关系结构 (`RelationsData`)
 
@@ -79,7 +116,7 @@ struct RelationsData {
 | 4 | Identity（身份） | `identity` |
 | 5 | SshKey（SSH 密钥） | `ssh_key` |
 
-映射代码位置：[ciphers.rs#L505-L524](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/ciphers.rs#L505-L524)
+映射代码位置：[src/api/core/ciphers.rs#L505-L524](src/api/core/ciphers.rs#L505-L524)
 
 ---
 
@@ -104,7 +141,7 @@ struct RelationsData {
 | `favorite` | - | 通过 Favorite 关联表存储 |
 | `archived_date` | - | 通过 Archive 关联表存储 |
 
-映射核心代码：[ciphers.rs#L395-L576](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/ciphers.rs#L395-L576)
+映射核心代码：[src/api/core/ciphers.rs#L395-L576](src/api/core/ciphers.rs#L395-L576)
 
 ### CipherData 结构详情
 
@@ -139,12 +176,12 @@ pub struct CipherData {
     archived_date: Option<String>,
 }
 ```
-位置：[ciphers.rs#L249-L301](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/ciphers.rs#L249-L301)
+位置：[src/api/core/ciphers.rs#L249-L301](src/api/core/ciphers.rs#L249-L301)
 
 **字段反序列化兼容处理**：
 
 1. **`folder_id` 的空字符串兼容**：使用 `deser_opt_nonempty_str` 反序列化器，将空字符串 `""` 转换为 `None`，避免无效的空 ID。
-   位置：[util.rs#L630-L643](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/util.rs#L630-L643)
+   位置：[src/util.rs#L630-L643](src/util.rs#L630-L643)
 
 2. **`organization_id` 的大小写兼容**：通过 `#[serde(alias = "organizationID")]` 同时支持 `organizationId` 和 `organizationID` 两种 JSON 键名。
 
@@ -165,7 +202,7 @@ fn clean_cipher_data(mut json_data: Value) -> Value {
 
 **目的**：移除 JavaScript 客户端产生的冗余 `"response"` 键。该键由客户端 JS 生成，不属于 Bitwarden 标准数据格式，需要在保存前剔除。
 
-清洗代码位置：[ciphers.rs#L409-L416](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/ciphers.rs#L409-L416)
+清洗代码位置：[src/api/core/ciphers.rs#L409-L416](src/api/core/ciphers.rs#L409-L416)
 
 ### 文件夹与集合映射
 
@@ -179,7 +216,7 @@ pub struct FolderData {
     pub id: Option<FolderId>,
 }
 ```
-位置：[folders.rs#L39-L45](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/folders.rs#L39-L45)
+位置：[src/api/core/folders.rs#L39-L45](src/api/core/folders.rs#L39-L45)
 
 **匹配逻辑**：
 - 若 `id` 存在于用户现有文件夹集合中 → 复用现有文件夹
@@ -197,7 +234,7 @@ struct FullCollectionData {
     external_id: Option<String>,
 }
 ```
-位置：[organizations.rs#L128-L136](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/organizations.rs#L128-L136)
+位置：[src/api/core/organizations.rs#L128-L136](src/api/core/organizations.rs#L128-L136)
 
 **匹配逻辑**：
 - 若 `id` 存在于组织现有集合中 → 复用现有集合（需权限验证）
@@ -215,7 +252,7 @@ if let Some(org_id) = data.organization_id {
     cipher.user_uuid = Some(headers.user.uuid.clone());
 }
 ```
-位置：[ciphers.rs#L449-L471](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/ciphers.rs#L449-L471)
+位置：[src/api/core/ciphers.rs#L449-L471](src/api/core/ciphers.rs#L449-L471)
 
 ---
 
@@ -228,8 +265,8 @@ if let Some(org_id) = data.organization_id {
 ```rust
 Cipher::validate_cipher_data(&data.ciphers)?;
 ```
-位置：[ciphers.rs#L605](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/ciphers.rs#L605)
-和 [organizations.rs#L1800](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/organizations.rs#L1800)
+位置：[src/api/core/ciphers.rs#L605](src/api/core/ciphers.rs#L605)
+和 [src/api/core/organizations.rs#L1800](src/api/core/organizations.rs#L1800)
 
 ### 验证规则
 
@@ -251,8 +288,8 @@ if let Some(note) = &cipher.notes
 - 默认限制：**10,000 字符**
 - 配置 `increase_note_size_limit=true` 时：**100,000 字符**（警告：可能导致客户端问题，且导出不兼容 Bitwarden 官方服务端）
 
-位置：[cipher.rs#L97-L140](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/db/models/cipher.rs#L97-L140)
-和 [config.rs#L782-L786](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/config.rs#L782-L786)
+位置：[src/db/models/cipher.rs#L97-L140](src/db/models/cipher.rs#L97-L140)
+和 [src/config.rs#L782-L786](src/config.rs#L782-L786)
 
 #### 2. 密码历史 null 值检查
 
@@ -274,7 +311,7 @@ if let Some(Value::Array(password_history)) = &cipher.password_history {
 
 **注意**：这里有一个已知的键名 bug —— 错误键名写为 `"Ciphers[{index}].Notes"` 而非 `"Ciphers[{index}].PasswordHistory"`。
 
-位置：[cipher.rs#L111-L127](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/db/models/cipher.rs#L111-L127)
+位置：[src/db/models/cipher.rs#L111-L127](src/db/models/cipher.rs#L111-L127)
 
 ### 验证失败响应格式
 
@@ -323,7 +360,7 @@ if ut != UpdateType::None
     // 仅在非导入时检查
 }
 ```
-位置：[ciphers.rs#L420-L433](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/ciphers.rs#L420-L433)
+位置：[src/api/core/ciphers.rs#L420-L433](src/api/core/ciphers.rs#L420-L433)
 
 ---
 
@@ -350,7 +387,7 @@ update_cipher_from_data(
     Some(collections.clone()), &conn, &nt, UpdateType::None
 ).await.ok();  // 使用 .ok() 忽略错误
 ```
-位置：[organizations.rs#L1843-L1853](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/organizations.rs#L1843-L1853)
+位置：[src/api/core/organizations.rs#L1843-L1853](src/api/core/organizations.rs#L1843-L1853)
 
 相比之下，个人导入遇到错误会立即中止：
 
@@ -359,7 +396,7 @@ update_cipher_from_data(
     &mut cipher, cipher_data, &headers, None, &conn, &nt, UpdateType::None
 ).await?;  // 使用 ? 传播错误
 ```
-位置：[ciphers.rs#L636](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/ciphers.rs#L636)
+位置：[src/api/core/ciphers.rs#L636](src/api/core/ciphers.rs#L636)
 
 ### 权限边界
 
@@ -392,7 +429,7 @@ cipher.reprompt = data.reprompt.filter(
 ```
 只有值为 0 或 1 时才会保存，其他值被静默丢弃。
 
-位置：[ciphers.rs#L532](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/ciphers.rs#L532)
+位置：[src/api/core/ciphers.rs#L532](src/api/core/ciphers.rs#L532)
 
 ### 修订日期更新
 
@@ -405,14 +442,51 @@ cipher.reprompt = data.reprompt.filter(
 
 ## 导出格式
 
-### 两个导出端点
+### /sync 同步接口 vs 组织导出接口：关键区别
 
-| 端点 | 用途 | 代码位置 |
-|------|------|----------|
-| `GET /sync` | 个人完整数据同步（含导出所需全部数据） | [ciphers.rs#L121](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/ciphers.rs#L121-L204) |
-| `GET /organizations/<org_id>/export` | 组织保险箱导出 | [organizations.rs#L3101](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/organizations.rs#L3101-L3111) |
+Vaultwarden 有两个与"导出"相关的核心接口，但它们的用途、调用方和返回数据结构有本质区别：
 
-### 组织导出格式
+| 对比维度 | `GET /sync` | `GET /organizations/<org_id>/export` |
+|---------|-------------|-------------------------------------|
+| **设计用途** | 客户端日常同步，保持本地数据与服务端一致 | 专门的组织数据归档导出 |
+| **调用方** | 所有 Bitwarden 客户端（浏览器/桌面/移动/CLI） | Web Vault 的组织导出功能 |
+| **数据范围** | 用户可见的全部数据（个人 + 所属组织） | 仅指定组织的数据 |
+| **权限** | 任何已登录用户 | 仅组织 Admin/Owner |
+| **SyncType** | `CipherSyncType::User` | `CipherSyncType::Organization` |
+| **文件夹/收藏/归档** | 包含（folders, favorite, archivedDate） | 不包含 |
+| **返回顶层字段** | profile, folders, collections, policies, ciphers, domains, sends, userDecryption | collections, ciphers |
+| **JSON Key 处理** | 原样返回 PascalCase | 递归转换为 camelCase（首字母小写） |
+| **代码位置** | [src/api/core/ciphers.rs#L121-L204](src/api/core/ciphers.rs#L121-L204) | [src/api/core/organizations.rs#L3101-L3111](src/api/core/organizations.rs#L3101-L3111) |
+
+### /sync 同步接口格式（用户侧）
+
+客户端每次打开或定时同步时调用，返回完整的用户视图数据：
+
+```json
+{
+    "profile": { /* 用户信息 */ },
+    "folders": [
+        {"id": "...", "revisionDate": "...", "name": "...", "object": "folder"}
+    ],
+    "collections": [
+        {"id": "...", "organizationId": "...", "name": "...", "object": "collection", ...}
+    ],
+    "policies": [],
+    "ciphers": [
+        // CipherDetails 格式
+    ],
+    "domains": { /* 等价域名 */ },
+    "sends": [ /* Bitwarden Send */ ],
+    "userDecryption": {
+        "masterPasswordUnlock": { /* KDF 配置 */ }
+    },
+    "object": "sync"
+}
+```
+
+**关键点**：`CipherSyncType::User` 模式下，每个 Cipher 返回时会附加 `folderId`、`favorite`、`archivedDate`、`edit`、`viewPassword`、`permissions` 等用户专属字段。
+
+### 组织导出接口格式
 
 ```json
 {
@@ -426,33 +500,70 @@ cipher.reprompt = data.reprompt.filter(
         }
     ],
     "ciphers": [
-        // CipherDetails 格式
+        // CipherDetails 格式（不含 folderId/favorite/archivedDate）
     ]
 }
 ```
 
-**关键兼容处理**：导出时所有 JSON key 的首字母会被转换为小写（`convert_json_key_lcase_first`），因为客户端无法处理大写首字母的 key。
+**关键兼容处理**：导出时所有 JSON key 的首字母会被递归转换为小写（`convert_json_key_lcase_first`），因为 Bitwarden 客户端的组织导入代码无法处理大写首字母的 key。
 
-位置：[organizations.rs#L3095-L3110](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/organizations.rs#L3095-L3110)
+位置：[src/api/core/organizations.rs#L3095-L3110](src/api/core/organizations.rs#L3095-L3110)
+
+### CipherSyncType 对导出数据的影响
+
+两种同步类型在 `Cipher::to_json()` 中走不同分支：
+
+```rust
+// User Sync 支持 Folders, Favorites, and Archives
+// Organization Sync 不支持这些，如果设置会导致 web-vault 问题
+match sync_type {
+    CipherSyncType::User => {
+        cipher_folders = FolderCipher::find_by_user(...);
+        cipher_favorites = Favorite::get_all_cipher_uuid_by_user(...);
+        cipher_archives = Archive::find_by_user(...);
+    }
+    CipherSyncType::Organization => {
+        cipher_folders = HashMap::with_capacity(0);
+        cipher_favorites = HashSet::with_capacity(0);
+        cipher_archives = HashMap::with_capacity(0);
+    }
+}
+```
+位置：[src/api/core/ciphers.rs#L2123-L2142](src/api/core/ciphers.rs#L2123-L2142)
+
+同时在 `to_json()` 中：
+
+```rust
+if sync_type == CipherSyncType::User {
+    json_object["folderId"] = ...;
+    json_object["favorite"] = ...;
+    json_object["archivedDate"] = ...;
+    json_object["edit"] = ...;
+    json_object["viewPassword"] = ...;
+    json_object["permissions"] = ...;
+}
+// 否则不添加以上字段
+```
+位置：[src/db/models/cipher.rs#L373-L399](src/db/models/cipher.rs#L373-L399)
 
 ### Key 大小写转换规则
 
-`convert_json_key_lcase_first()` 递归遍历整个 JSON 结构：
+组织导出时，`convert_json_key_lcase_first()` 递归遍历整个 JSON 结构：
 
 ```rust
 fn process_json_key(key: &str) -> String {
     match key.to_lowercase().as_ref() {
-        "ssn" => "ssn".into(),   // 特殊处理：SSN 保持全小写
-        _ => lcase_first(key),   // 其余首字母小写
+        "ssn" => "ssn".into(),   // 特殊处理：SSN（社会安全号）保持全小写
+        _ => lcase_first(key),   // 其余首字母小写（PascalCase → camelCase）
     }
 }
 ```
 
-位置：[util.rs#L621-L628](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/util.rs#L621-L628)
+位置：[src/util.rs#L621-L628](src/util.rs#L621-L628)
 
 ### Cipher 导出格式（CipherDetails）
 
-`Cipher::to_json()` 生成完整的 CipherDetails 响应，包含向后兼容处理：
+`Cipher::to_json()` 生成完整的 CipherDetails 响应，包含大量向后兼容处理：
 
 | 兼容项 | 处理方式 |
 |--------|---------|
@@ -464,7 +575,7 @@ fn process_json_key(key: &str) -> String {
 | Fields type 字段 | 字符串转数字，默认值 1（隐藏类型） |
 | Password History | 过滤 null 密码值，修正 lastUsedDate 格式 |
 
-位置：[cipher.rs#L145-L412](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/db/models/cipher.rs#L145-L412)
+位置：[src/db/models/cipher.rs#L145-L412](src/db/models/cipher.rs#L145-L412)
 
 ### Cipher 导出响应字段
 
@@ -490,46 +601,25 @@ fn process_json_key(key: &str) -> String {
         "name": "名称",
         "notes": "备注",
         "passwordHistory": [],
-        // 类型特定字段
         "uris": [],
         "username": "...",
         "password": "..."
     },
     "passwordHistory": [],
-    "login": { /* 类型数据 */ },
+    "login": { /* 类型数据，与 type 匹配 */ },
     "secureNote": null,
     "card": null,
     "identity": null,
     "sshKey": null,
-    "folderId": null,
-    "favorite": false,
-    "archivedDate": null,
-    "edit": true,
-    "viewPassword": true,
-    "permissions": {
+    "folderId": null,      // 仅 User Sync 出现
+    "favorite": false,     // 仅 User Sync 出现
+    "archivedDate": null,  // 仅 User Sync 出现
+    "edit": true,          // 仅 User Sync 出现
+    "viewPassword": true,  // 仅 User Sync 出现
+    "permissions": {       // 仅 User Sync 出现
         "delete": true,
         "restore": true
     }
-}
-```
-
-### 用户同步格式（/sync）
-
-个人同步返回更完整的数据结构，客户端可直接用于本地导出：
-
-```json
-{
-    "profile": { /* 用户信息 */ },
-    "folders": [],
-    "collections": [],
-    "policies": [],
-    "ciphers": [],
-    "domains": {},
-    "sends": [],
-    "userDecryption": {
-        "masterPasswordUnlock": { /* KDF 配置 */ }
-    },
-    "object": "sync"
 }
 ```
 
@@ -550,7 +640,7 @@ if !show_ssh_keys {
 
 客户端版本低于 2024.12.0 时，SSH 密钥类型条目（type=5）在同步中被过滤掉，不返回给客户端。
 
-位置：[ciphers.rs#L128-L137](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/ciphers.rs#L128-L137)
+位置：[src/api/core/ciphers.rs#L128-L137](src/api/core/ciphers.rs#L128-L137)
 
 ---
 
@@ -560,25 +650,25 @@ if !show_ssh_keys {
 
 | 文件 | 作用 |
 |------|------|
-| [ciphers.rs](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/ciphers.rs) | 个人导入端点、CipherData 结构、字段映射、同步逻辑 |
-| [organizations.rs](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/organizations.rs) | 组织导入/导出端点、集合结构、集合关系处理 |
-| [cipher.rs](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/db/models/cipher.rs) | Cipher 数据模型、验证逻辑、序列化导出 |
-| [folders.rs](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/folders.rs) | FolderData 结构、文件夹操作 |
-| [collection.rs](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/db/models/collection.rs) | Collection 数据模型、序列化 |
-| [folder.rs](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/db/models/folder.rs) | Folder 数据模型、序列化 |
-| [error.rs](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/error.rs) | 错误类型、宏定义、API 错误响应序列化 |
-| [util.rs](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/util.rs) | JSON Key 大小写转换、反序列化辅助函数 |
-| [config.rs](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/config.rs) | 配置项（note 大小限制等） |
+| [src/api/core/ciphers.rs](src/api/core/ciphers.rs) | 个人导入端点、CipherData 结构、字段映射、同步逻辑 |
+| [src/api/core/organizations.rs](src/api/core/organizations.rs) | 组织导入/导出端点、集合结构、集合关系处理 |
+| [src/db/models/cipher.rs](src/db/models/cipher.rs) | Cipher 数据模型、验证逻辑、序列化导出 |
+| [src/api/core/folders.rs](src/api/core/folders.rs) | FolderData 结构、文件夹操作 |
+| [src/db/models/collection.rs](src/db/models/collection.rs) | Collection 数据模型、序列化 |
+| [src/db/models/folder.rs](src/db/models/folder.rs) | Folder 数据模型、序列化 |
+| [src/error.rs](src/error.rs) | 错误类型、宏定义、API 错误响应序列化 |
+| [src/util.rs](src/util.rs) | JSON Key 大小写转换、反序列化辅助函数 |
+| [src/config.rs](src/config.rs) | 配置项（note 大小限制等） |
 
 ### 核心函数速查
 
 | 函数 | 位置 | 作用 |
 |------|------|------|
-| `post_ciphers_import` | [ciphers.rs#L595-L644](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/ciphers.rs#L595-L644) | 个人导入入口 |
-| `post_org_import` | [organizations.rs#L1782-L1866](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/organizations.rs#L1782-L1866) | 组织导入入口 |
-| `update_cipher_from_data` | [ciphers.rs#L395-L576](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/ciphers.rs#L395-L576) | CipherData → Cipher 映射写入 |
-| `Cipher::validate_cipher_data` | [cipher.rs#L97-L140](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/db/models/cipher.rs#L97-L140) | 导入前置验证 |
-| `Cipher::to_json` | [cipher.rs#L145-L412](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/db/models/cipher.rs#L145-L412) | Cipher 序列化导出 |
-| `get_org_export` | [organizations.rs#L3101-L3111](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/organizations.rs#L3101-L3111) | 组织导出入口 |
-| `convert_json_key_lcase_first` | [util.rs#L739-L778](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/util.rs#L739-L778) | 导出时 JSON Key 大小写转换 |
-| `sync` | [ciphers.rs#L121-L204](file:///d:/fz/0601/solo-dogfeeding/code/132-vaultwarden/src/api/core/ciphers.rs#L121-L204) | 个人完整数据同步 |
+| `post_ciphers_import` | [src/api/core/ciphers.rs#L595-L644](src/api/core/ciphers.rs#L595-L644) | 个人导入入口 |
+| `post_org_import` | [src/api/core/organizations.rs#L1782-L1866](src/api/core/organizations.rs#L1782-L1866) | 组织导入入口 |
+| `update_cipher_from_data` | [src/api/core/ciphers.rs#L395-L576](src/api/core/ciphers.rs#L395-L576) | CipherData → Cipher 映射写入 |
+| `Cipher::validate_cipher_data` | [src/db/models/cipher.rs#L97-L140](src/db/models/cipher.rs#L97-L140) | 导入前置验证 |
+| `Cipher::to_json` | [src/db/models/cipher.rs#L145-L412](src/db/models/cipher.rs#L145-L412) | Cipher 序列化导出 |
+| `get_org_export` | [src/api/core/organizations.rs#L3101-L3111](src/api/core/organizations.rs#L3101-L3111) | 组织导出入口 |
+| `convert_json_key_lcase_first` | [src/util.rs#L739-L778](src/util.rs#L739-L778) | 导出时 JSON Key 大小写转换 |
+| `sync` | [src/api/core/ciphers.rs#L121-L204](src/api/core/ciphers.rs#L121-L204) | 个人完整数据同步 |
